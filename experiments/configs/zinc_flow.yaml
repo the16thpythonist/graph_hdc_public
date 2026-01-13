@@ -1,0 +1,24 @@
+# ZINC Real NVP V3 Flow Configuration
+# Best hyperparameters from HPO
+
+model:
+  hv_dim: 256
+  num_flows: 8
+  hidden_dim: 1536
+  num_hidden_layers: 2
+  smax_initial: 2.5
+  smax_final: 7.0
+  smax_warmup_epochs: 17
+  use_act_norm: true
+  per_term_standardization: true
+
+training:
+  epochs: 800
+  batch_size: 224
+  lr: 0.000539
+  weight_decay: 0.001
+  precision: "bf16-mixed"
+
+dataset:
+  name: "ZINC_SMILES_HRR_256_F64_5G1NG4"
+  base_dataset: "zinc"

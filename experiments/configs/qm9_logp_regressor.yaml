@@ -1,0 +1,21 @@
+# QM9 LogP Regressor Configuration
+# Best hyperparameters from HPO
+
+model:
+  input_dim: 256
+  hidden_dims: [256, 256]
+  activation: "gelu"
+  norm: "none"
+  dropout: 0.061
+
+training:
+  epochs: 200
+  batch_size: 192
+  lr: 0.000863
+  weight_decay: 0.0000945
+
+target_property: "logp"
+
+dataset:
+  name: "QM9_SMILES_HRR_256_F64_G1NG3"
+  base_dataset: "qm9"

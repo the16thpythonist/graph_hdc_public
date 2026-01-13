@@ -1,0 +1,21 @@
+# QM9 QED Regressor Configuration
+# Best hyperparameters from HPO
+
+model:
+  input_dim: 256
+  hidden_dims: [512, 256, 128, 32]
+  activation: "silu"
+  norm: "lay_norm"
+  dropout: 0.049
+
+training:
+  epochs: 200
+  batch_size: 64
+  lr: 0.000635
+  weight_decay: 0.000223
+
+target_property: "qed"
+
+dataset:
+  name: "QM9_SMILES_HRR_256_F64_G1NG3"
+  base_dataset: "qm9"

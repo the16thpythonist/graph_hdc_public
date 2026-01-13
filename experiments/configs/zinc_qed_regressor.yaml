@@ -1,0 +1,21 @@
+# ZINC QED Regressor Configuration
+# Best hyperparameters from HPO
+
+model:
+  input_dim: 256
+  hidden_dims: [1536, 768, 128]
+  activation: "silu"
+  norm: "lay_norm"
+  dropout: 0.178
+
+training:
+  epochs: 200
+  batch_size: 224
+  lr: 0.000536
+  weight_decay: 0.00000136
+
+target_property: "qed"
+
+dataset:
+  name: "ZINC_SMILES_HRR_256_F64_5G1NG4"
+  base_dataset: "zinc"

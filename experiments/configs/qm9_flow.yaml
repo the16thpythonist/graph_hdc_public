@@ -1,0 +1,24 @@
+# QM9 Real NVP V3 Flow Configuration
+# Best hyperparameters from HPO
+
+model:
+  hv_dim: 256
+  num_flows: 16
+  hidden_dim: 1792
+  num_hidden_layers: 3
+  smax_initial: 2.2
+  smax_final: 6.5
+  smax_warmup_epochs: 16
+  use_act_norm: true
+  per_term_standardization: true
+
+training:
+  epochs: 800
+  batch_size: 96
+  lr: 0.000191
+  weight_decay: 0.000349
+  precision: "bf16-mixed"
+
+dataset:
+  name: "QM9_SMILES_HRR_256_F64_G1NG3"
+  base_dataset: "qm9"

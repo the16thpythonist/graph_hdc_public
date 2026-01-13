@@ -1,0 +1,21 @@
+# ZINC LogP Regressor Configuration
+# Best hyperparameters from HPO
+
+model:
+  input_dim: 256
+  hidden_dims: [1536, 896, 128]
+  activation: "silu"
+  norm: "none"
+  dropout: 0.127
+
+training:
+  epochs: 200
+  batch_size: 352
+  lr: 0.0000864
+  weight_decay: 0.0000280
+
+target_property: "logp"
+
+dataset:
+  name: "ZINC_SMILES_HRR_256_F64_5G1NG4"
+  base_dataset: "zinc"
