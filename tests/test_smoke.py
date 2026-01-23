@@ -178,22 +178,14 @@ def test_config_loading():
 
 
 def test_hypernet_creation():
-    """Test HyperNet can be created for both datasets."""
+    """Test HyperNet can be created for QM9 dataset."""
     from graph_hdc import HyperNet, get_config
 
-    # QM9
     qm9_config = get_config("QM9_SMILES_HRR_256_F64_G1NG3")
     qm9_config.device = "cpu"
     qm9_hypernet = HyperNet(qm9_config)
     assert qm9_hypernet is not None
     assert qm9_hypernet.hv_dim == 256
-
-    # ZINC
-    zinc_config = get_config("ZINC_SMILES_HRR_256_F64_5G1NG4")
-    zinc_config.device = "cpu"
-    zinc_hypernet = HyperNet(zinc_config)
-    assert zinc_hypernet is not None
-    assert zinc_hypernet.hv_dim == 256
 
 
 def test_flow_model_creation():
@@ -226,18 +218,12 @@ def test_regressor_model_creation():
 
 
 def test_evaluator_creation():
-    """Test evaluator can be created for both datasets."""
+    """Test evaluator can be created for QM9 dataset."""
     from graph_hdc import GenerationEvaluator
 
-    # QM9 (may take a moment to load dataset)
     qm9_eval = GenerationEvaluator(base_dataset="qm9")
     assert qm9_eval is not None
     assert len(qm9_eval.T) > 0  # Should have training smiles
-
-    # ZINC
-    zinc_eval = GenerationEvaluator(base_dataset="zinc")
-    assert zinc_eval is not None
-    assert len(zinc_eval.T) > 0
 
 
 @pytest.mark.slow

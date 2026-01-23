@@ -37,10 +37,12 @@ tests/                  # Unit tests
 ## Key Commands
 
 ```bash
-# Installation (uses Pixi package manager)
-pixi install
-pixi shell -e local      # CPU
-pixi shell -e local-gpu  # GPU
+# Installation (uses uv package manager)
+uv sync --extra cpu --extra dev      # CPU version
+uv sync --extra cuda --extra dev     # GPU version (CUDA 12.6)
+
+# Activate the virtual environment
+source .venv/bin/activate
 
 # Training
 python experiments/scripts/train_flow.py --dataset qm9
@@ -53,6 +55,8 @@ python experiments/scripts/run_optimization.py --mode qed_max --flow_ckpt <path>
 # Tests
 pytest tests/
 ```
+
+**Note**: This project uses `.venv` as the virtual environment directory. Always activate it before running scripts.
 
 ## Quick Usage
 
@@ -93,6 +97,14 @@ This project uses **PyComex** for experiment management. See [PYCOMEX.md](PYCOME
 - Parameter tracking and data storage APIs
 - Artifact management (figures, checkpoints, logs)
 - Experiment inheritance for creating variations
+
+## Related: DeFoG
+
+**DeFoG** (Discrete Flow Matching for Graph Generation) is a related graph generation model. See [DEFOG.md](DEFOG.md) for:
+- Core interface usage and API
+- Sampling parameters (eta, omega, time_distortion)
+- Data format and conversion utilities
+- Training and inference workflows
 
 ## Metadata
 

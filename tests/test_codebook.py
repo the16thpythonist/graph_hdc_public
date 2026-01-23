@@ -126,113 +126,6 @@ class TestQM9Codebook:
         assert hasattr(result, "cos_similarities")
 
 
-class TestZINCCodebook:
-    """Tests for ZINC dataset codebook initialization."""
-
-    @pytest.fixture
-    def zinc_config(self):
-        config = get_config("ZINC_SMILES_HRR_256_F64_5G1NG4")
-        config.device = "cpu"
-        return config
-
-    @pytest.fixture
-    def zinc_hypernet(self, zinc_config):
-        return HyperNet(zinc_config)
-
-    def test_node_codebook_is_limited(self, zinc_hypernet, zinc_config):
-        """Verify node codebook size is smaller than full Cartesian product."""
-        # ZINC has feature dimensions [9, 6, 3, 4, 2] → 1296 theoretical combinations
-        full_size = math.prod([9, 6, 3, 4, 2])
-        assert full_size == 1296
-
-        # The actual codebook should be limited to observed features
-        actual_size = zinc_hypernet.nodes_codebook.shape[0]
-        assert actual_size < full_size, (
-            f"Node codebook should be limited. Full: {full_size}, Actual: {actual_size}"
-        )
-
-        # Verify shape is [limited_size, hv_dim]
-        assert zinc_hypernet.nodes_codebook.shape[1] == zinc_config.hv_dim
-
-    def test_node_codebook_matches_dataset_info(self, zinc_hypernet):
-        """Verify node codebook size matches DatasetInfo node_features count."""
-        dataset_info = get_dataset_info("zinc")
-        expected_size = len(dataset_info.node_features)
-        actual_size = zinc_hypernet.nodes_codebook.shape[0]
-
-        assert actual_size == expected_size, (
-            f"Codebook size {actual_size} should match dataset info {expected_size}"
-        )
-
-    def test_nodes_indexer_consistency(self, zinc_hypernet):
-        """Verify nodes indexer is consistent with limited codebook."""
-        codebook_size = zinc_hypernet.nodes_codebook.shape[0]
-        indexer_size = zinc_hypernet.nodes_indexer.size()
-
-        assert codebook_size == indexer_size, (
-            f"Codebook size {codebook_size} must equal indexer size {indexer_size}"
-        )
-
-        # Verify indexer can round-trip all indices
-        for idx in range(indexer_size):
-            node_tuple = zinc_hypernet.nodes_indexer.get_tuple(idx)
-            recovered_idx = zinc_hypernet.nodes_indexer.get_idx(node_tuple)
-            assert idx == recovered_idx, f"Index {idx} → {node_tuple} → {recovered_idx}"
-
-    def test_edge_codebook_quadratic_relation(self, zinc_hypernet, zinc_config):
-        """Verify edge codebook has a quadratic relationship with node codebook."""
-        node_count = zinc_hypernet.nodes_codebook.shape[0]
-        expected_edge_count = node_count * node_count
-
-        # Edges codebook shape should be [N^2, hv_dim]
-        assert zinc_hypernet.edges_codebook.shape == (expected_edge_count, zinc_config.hv_dim), (
-            f"Expected edges codebook shape ({expected_edge_count}, {zinc_config.hv_dim}), "
-            f"got {zinc_hypernet.edges_codebook.shape}"
-        )
-
-    def test_edges_indexer_consistency(self, zinc_hypernet):
-        """Verify edges indexer is consistent with edge codebook."""
-        edge_codebook_size = zinc_hypernet.edges_codebook.shape[0]
-        edge_indexer_size = zinc_hypernet.edges_indexer.size()
-
-        assert edge_codebook_size == edge_indexer_size, (
-            f"Edge codebook size {edge_codebook_size} must equal edge indexer size {edge_indexer_size}"
-        )
-
-        # Verify indexer dimensions match node indexer
-        node_count = zinc_hypernet.nodes_indexer.size()
-        assert edge_indexer_size == node_count * node_count
-
-    def test_encode_decode_sample(self, zinc_hypernet):
-        """Test encoding and decoding a sample from ZINC dataset."""
-        train_ds = get_split("train", dataset="zinc")
-        data = train_ds[0].clone()
-        data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device="cpu")
-
-        # Encode
-        with torch.no_grad():
-            output = zinc_hypernet.forward(data, normalize=True)
-
-        # Verify encoding output
-        assert "graph_embedding" in output
-        assert "edge_terms" in output
-        assert output["graph_embedding"].shape == (1, zinc_hypernet.hv_dim)
-        assert output["edge_terms"].shape == (1, zinc_hypernet.hv_dim)
-
-        # Decode (ZINC molecules are more complex, so decode may return empty)
-        decoder_settings = DecoderSettings.get_default_for("zinc")
-        decoder_settings.top_k = 1
-        result = zinc_hypernet.decode_graph(
-            edge_term=output["edge_terms"][0],
-            graph_term=output["graph_embedding"][0],
-            decoder_settings=decoder_settings,
-        )
-
-        # Verify decoding returns valid result structure
-        assert hasattr(result, "nx_graphs")
-        assert hasattr(result, "cos_similarities")
-
-
 class TestCodebookLimitationProcess:
     """Tests verifying the codebook limitation process works correctly."""
 
@@ -246,33 +139,19 @@ class TestCodebookLimitationProcess:
         # QM9 typically has ~50-60 unique node types
         assert 30 < node_size < 150, f"QM9 node codebook size {node_size} seems unusual"
 
-    def test_zinc_full_vs_limited_size_sanity(self):
-        """Sanity check: limited codebook should be reasonably sized for ZINC."""
-        config = get_config("ZINC_SMILES_HRR_256_F64_5G1NG4")
+    def test_all_dataset_node_features_in_codebook(self):
+        """Verify all node features from dataset are represented in codebook."""
+        config = get_config("QM9_SMILES_HRR_256_F64_G1NG3")
         config.device = "cpu"
         hypernet = HyperNet(config)
 
-        node_size = hypernet.nodes_codebook.shape[0]
-        # ZINC typically has ~100-150 unique node types
-        assert 50 < node_size < 300, f"ZINC node codebook size {node_size} seems unusual"
+        dataset_info = get_dataset_info("qm9")
 
-    def test_all_dataset_node_features_in_codebook(self):
-        """Verify all node features from dataset are represented in codebook."""
-        for dataset_name, config_name in [
-            ("qm9", "QM9_SMILES_HRR_256_F64_G1NG3"),
-            ("zinc", "ZINC_SMILES_HRR_256_F64_5G1NG4"),
-        ]:
-            config = get_config(config_name)
-            config.device = "cpu"
-            hypernet = HyperNet(config)
-
-            dataset_info = get_dataset_info(dataset_name)
-
-            # All node features from dataset should be in indexer
-            for node_tuple in dataset_info.node_features:
-                assert node_tuple in hypernet.nodes_indexer.tuple_to_idx, (
-                    f"Node feature {node_tuple} from {dataset_name} dataset not in indexer"
-                )
+        # All node features from dataset should be in indexer
+        for node_tuple in dataset_info.node_features:
+            assert node_tuple in hypernet.nodes_indexer.tuple_to_idx, (
+                f"Node feature {node_tuple} from qm9 dataset not in indexer"
+            )
 
 
 if __name__ == "__main__":

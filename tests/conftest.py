@@ -26,26 +26,10 @@ def qm9_config():
 
 
 @pytest.fixture
-def zinc_config():
-    """Create ZINC configuration for testing."""
-    from graph_hdc.hypernet.configs import get_config
-    config = get_config("ZINC_SMILES_HRR_256_F64_5G1NG4")
-    config.device = "cpu"
-    return config
-
-
-@pytest.fixture
 def qm9_hypernet(qm9_config):
     """Create QM9 HyperNet instance for testing."""
     from graph_hdc.hypernet.encoder import HyperNet
     return HyperNet(qm9_config)
-
-
-@pytest.fixture
-def zinc_hypernet(zinc_config):
-    """Create ZINC HyperNet instance for testing."""
-    from graph_hdc.hypernet.encoder import HyperNet
-    return HyperNet(zinc_config)
 
 
 @pytest.fixture

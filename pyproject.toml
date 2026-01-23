@@ -3,75 +3,81 @@ name = "graph_hdc"
 version = "0.1.0"
 requires-python = ">=3.10"
 description = "Graph HDC"
-authors = [{ name = "Arvand Kaveh <arvand.kaveh@tuta.com>" }, { name = "Jonas Teufel <jonseb1998@gmail.com>" }]
+authors = [
+    { name = "Arvand Kaveh", email = "arvand.kaveh@tuta.com" },
+    { name = "Jonas Teufel", email = "jonseb1998@gmail.com" },
+]
 license = { text = "MIT" }
 readme = "README.md"
 
-[tool.setuptools.packages.find]
-include = ["graph_hdc*"]
-exclude = ["tests*", "experiments*", "data*"]
+dependencies = [
+    "pytorch-lightning>=2.5.5",
+    "torch-geometric>=2.6.0",
+    "numpy>=1.26.4,<2",
+    "matplotlib>=3.9.1",
+    "networkx>=3.5,<4",
+    "scikit-learn",
+    "seaborn>=0.13.2",
+    "torch-hd==5.8.4",
+    "normflows>=1.7.3",
+    "fcd-torch>=1.0.7",
+    "rdkit>=2024.0.0",
+]
 
-[tool.pixi.workspace]
-channels = ["conda-forge", "nvidia", "pyg", "pytorch"]
-platforms = ["linux-64"]
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.5.1",
+    "torchvision>=0.20.0",
+]
+cuda = [
+    "torch>=2.5.1",
+    "torchvision>=0.20.0",
+]
+dev = [
+    "ruff>=0.12.0",
+    "pytest>=8.4.0",
+]
 
-[tool.pixi.environments.cluster]
-features = ["base"]
-solve-group = "cpu"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.pixi.environments.local]
-features = ["base"]
-solve-group = "cpu"
+[tool.hatch.build.targets.wheel]
+packages = ["graph_hdc"]
 
-[tool.pixi.environments.local-gpu]
-features = ["gpu"]
-solve-group = "gpu"
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "tests/",
+    "experiments/",
+    "data/",
+]
 
-# Base dependencies (CPU environment)
-[tool.pixi.feature.base.dependencies]
-python = "3.11.*"
-pytorch = ">=2.5.1"
-pytorch-lightning = ">=2.5.5"
-numpy = ">=1.26.4,<2"
-matplotlib = ">=3.9.1"
-networkx = ">=3.5,<4"
-scikit-learn = "*"
-seaborn = ">=0.13.2"
-ruff = ">=0.12.12,<0.13"
-pytest = ">=8.4.2,<9"
-torch-geometric = "*"
-# Note: rdkit from pip (includes Contrib/SA_Score, conda version doesn't)
+# uv configuration for PyTorch CPU/CUDA handling
+# Install with: uv sync --extra cpu   OR   uv sync --extra cuda
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+    ],
+]
 
-# Base feature pypi dependencies
-[tool.pixi.feature.base.pypi-dependencies]
-torch-hd = "==5.8.4"
-normflows = ">=1.7.3"
-fcd-torch = ">=1.0.7"
-rdkit = ">=2024.0.0"
-graph-hdc = { path = ".", editable = true }
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cuda" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cuda" },
+]
 
-# GPU feature: minimal conda deps, pytorch from pip
-[tool.pixi.feature.gpu.dependencies]
-python = "3.11.*"
-pip = "*"
-numpy = ">=1.26.4,<2"
-matplotlib = ">=3.9.1"
-networkx = ">=3.5,<4"
-scikit-learn = "*"
-seaborn = ">=0.13.2"
-ruff = ">=0.12.12,<0.13"
-pytest = ">=8.4.2,<9"
-# Note: rdkit installed via pip in setup-gpu (pip version includes Contrib/SA_Score)
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
-# GPU feature pypi dependencies - graph-hdc only (others installed via setup-gpu)
-[tool.pixi.feature.gpu.pypi-dependencies]
-graph-hdc = { path = ".", editable = true }
-
-# GPU setup task - installs pytorch and all dependencies with CUDA 13.0
-[tool.pixi.feature.gpu.tasks]
-setup-gpu = """
-pip install torch==2.9.0+cu130 torchvision==0.24.0+cu130 --index-url https://download.pytorch.org/whl/cu130 && \
-pip install torch-geometric==2.6.1 pytorch-lightning==2.5.5 torchmetrics==1.8.2 && \
-pip install torch-hd==5.8.4 normflows fcd-torch rdkit && \
-echo 'GPU setup complete!'
-"""
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
