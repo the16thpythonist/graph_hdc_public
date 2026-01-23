@@ -54,6 +54,9 @@ htmlcov/
 
 # Experiments results and checkpoints
 experiments/results/
+experiments/**/results/
+experiments/**/debug/
+experiments/**/*__*/
 experiments/checkpoints/*.ckpt
 experiments/checkpoints/*.pt
 *.ckpt

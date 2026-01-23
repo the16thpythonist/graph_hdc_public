@@ -199,6 +199,94 @@ def custom_processing(e, data):
 experiment.run_if_main()
 ```
 
+## Caching
+
+PyComex provides a caching system for expensive computations that don't need to be repeated across runs. **Use with care** - cached data can become stale if preprocessing logic changes but the cache scope remains the same.
+
+### Basic Usage
+
+```python
+@experiment
+def experiment(e: Experiment):
+    # The @e.cache.cached decorator caches function results to disk
+    @e.cache.cached(name="heavy_computation", scope=("preprocessing",))
+    def heavy_computation(data):
+        # Expensive operation - only runs once, then loads from cache
+        return processed_data
+
+    result = heavy_computation(my_data)  # First call: computes and caches
+    result = heavy_computation(my_data)  # Subsequent calls: loads from cache
+```
+
+### Cache Scope
+
+The `scope` parameter defines the folder structure for cached files. Use it to organize cache by parameters that affect the computation:
+
+```python
+# Static scope
+@e.cache.cached("model", scope=("models", "transformer"))
+
+# Dynamic scope based on experiment parameters
+def get_scope(e):
+    return ("data", e.DATASET, f"dim_{e.HDC_DIM}")
+
+@e.cache.cached("embeddings", scope=get_scope)
+def compute_embeddings():
+    ...
+```
+
+### Cache Backends
+
+```python
+from pycomex.functional.cache import CacheBackend
+
+# Pickle (default) - general Python objects
+@e.cache.cached("data", backend=CacheBackend.PICKLE)
+
+# Joblib - optimized for NumPy arrays and large data
+@e.cache.cached("arrays", backend=CacheBackend.JOBLIB)
+
+# JSON - human-readable, limited to JSON-serializable types
+@e.cache.cached("config", backend=CacheBackend.JSON)
+```
+
+### Disabling Cache
+
+```python
+# Disable for a fresh run (no loading or saving)
+e.cache.set_enabled(False)
+
+# Or use __CACHING__ parameter
+__CACHING__: bool = False  # Disables caching when set
+```
+
+### Direct Save/Load API
+
+```python
+# Save directly (without decorator)
+e.cache.save(data, name="my_data", scope=("preprocessing",))
+
+# Load directly
+data = e.cache.load(name="my_data", scope=("preprocessing",))
+```
+
+### Cache Location
+
+Cached files are stored in `<experiment_path>/cache/` with folder structure matching the scope:
+
+```
+results/my_experiment/debug/
+└── cache/
+    └── preprocessing/
+        └── heavy_computation.pkl.gz
+```
+
+### Caution
+
+- **Stale cache**: If you change preprocessing logic but keep the same scope, the cache will return outdated results. Either change the scope or delete the cache folder.
+- **Large objects**: Caching large datasets (e.g., processed PyG Data lists) can consume significant disk space.
+- **Reproducibility**: Cache bypasses computation, which may hide bugs introduced in later code changes.
+
 ## Running Experiments
 
 ```bash

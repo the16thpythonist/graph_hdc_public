@@ -22,6 +22,8 @@ dependencies = [
     "normflows>=1.7.3",
     "fcd-torch>=1.0.7",
     "rdkit>=2024.0.0",
+    "defog",
+    "pycomex",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +73,8 @@ torchvision = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu126", extra = "cuda" },
 ]
+defog = { git = "https://github.com/the16thpythonist/DeFoG" }
+pycomex = { git = "https://github.com/the16thpythonist/pycomex" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

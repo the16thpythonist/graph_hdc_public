@@ -9,7 +9,7 @@ The `src/core` module in `/tmp/DeFoG` provides a standalone, clean API.
 ## Quick Start
 
 ```python
-from src.core import DeFoGModel
+from defog.core import DeFoGModel
 from torch_geometric.loader import DataLoader
 import pytorch_lightning as pl
 
@@ -141,7 +141,7 @@ Returns `List[Data]` with the same format as input.
 ### Dense Conversion Utilities
 
 ```python
-from src.core import to_dense, dense_to_pyg
+from defog.core import to_dense, dense_to_pyg
 
 # PyG batch to dense tensors
 dense_data, node_mask = to_dense(
@@ -169,7 +169,7 @@ model = DeFoGModel.load("my_model.ckpt", device="cpu")
 ## Noise Types
 
 ```python
-from src.core import LimitDistribution
+from defog.core import LimitDistribution
 
 # Uniform: equal probability for all classes
 limit_dist = LimitDistribution(
@@ -198,7 +198,7 @@ limit_dist = LimitDistribution(
 ## Dataset Statistics
 
 ```python
-from src.core import compute_dataset_statistics
+from defog.core import compute_dataset_statistics
 
 stats = compute_dataset_statistics(dataloader)
 # Returns: num_node_classes, num_edge_classes, max_nodes,
@@ -231,7 +231,7 @@ stats = compute_dataset_statistics(dataloader)
 ## Public API
 
 ```python
-from src.core import (
+from defog.core import (
     # Main model
     DeFoGModel,
 
