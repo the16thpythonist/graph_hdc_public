@@ -99,6 +99,91 @@ def test_decode_order_zero():
     assert isinstance(decoded_nodes, torch.Tensor)
 
 
+def test_decode_order_zero_iterative():
+    """Test order-zero iterative decoding (node retrieval via unbinding)."""
+    from collections import Counter
+    from graph_hdc.utils.helpers import scatter_hd
+
+    config = get_config("QM9_SMILES_HRR_256_F64_G1NG3")
+    config.device = "cpu"
+    hypernet = HyperNet(config)
+
+    # Ethane: C-C
+    # Two carbons with degree 1, each with 3 hydrogens
+    # Features: [atom_type, degree-1, formal_charge, total_Hs]
+    x = torch.tensor([
+        [0.0, 0.0, 0.0, 3.0],  # C with degree 1 (degree_idx=0), 3 H
+        [0.0, 0.0, 0.0, 3.0],  # C with degree 1 (degree_idx=0), 3 H
+    ], device="cpu")
+    edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long, device="cpu")
+
+    data = Data(x=x, edge_index=edge_index)
+    data.batch = torch.zeros(2, dtype=torch.long, device="cpu")
+
+    with torch.no_grad():
+        # Encode node features to hypervectors (without message passing)
+        data = hypernet.encode_properties(data)
+        # Compute pure order-0 embedding (bundled nodes, no message passing)
+        order_zero_embedding = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
+
+        # Decode using iterative method
+        decoded_nodes = hypernet.decode_order_zero_iterative(order_zero_embedding[0])
+
+    # Should decode exactly 2 carbon nodes
+    assert len(decoded_nodes) == 2, f"Expected 2 nodes, got {len(decoded_nodes)}"
+
+    # Both should be the same node type: (atom=0, degree=0, charge=0, H=3)
+    expected_tuple = (0, 0, 0, 3)
+    node_counter = Counter(decoded_nodes)
+    assert node_counter[expected_tuple] == 2, f"Expected 2 carbons with features {expected_tuple}, got {node_counter}"
+
+
+def test_decode_order_zero_iterative_counter():
+    """Test order-zero iterative counter decoding matches original method."""
+    from collections import Counter
+    from graph_hdc.utils.helpers import scatter_hd
+
+    config = get_config("QM9_SMILES_HRR_256_F64_G1NG3")
+    config.device = "cpu"
+    hypernet = HyperNet(config)
+
+    # Ethane: C-C (use same molecule as other tests since node types are limited)
+    # Two carbons with degree 1, each with 3 hydrogens
+    # Features: [atom_type, degree-1, formal_charge, total_Hs]
+    x = torch.tensor([
+        [0.0, 0.0, 0.0, 3.0],  # C with degree 1 (degree_idx=0), 3 H
+        [0.0, 0.0, 0.0, 3.0],  # C with degree 1 (degree_idx=0), 3 H
+    ], device="cpu")
+    edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long, device="cpu")
+
+    data = Data(x=x, edge_index=edge_index)
+    data.batch = torch.zeros(2, dtype=torch.long, device="cpu")
+
+    with torch.no_grad():
+        # Encode node features to hypervectors (without message passing)
+        data = hypernet.encode_properties(data)
+        # Compute pure order-0 embedding (bundled nodes, no message passing)
+        order_zero_embedding = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
+
+        # Decode using both methods
+        original_counter = hypernet.decode_order_zero_counter(order_zero_embedding)
+        iterative_counter = hypernet.decode_order_zero_counter_iterative(order_zero_embedding)
+
+    # Both methods should produce results for batch index 0
+    assert 0 in original_counter, "Original method should have batch 0"
+    assert 0 in iterative_counter, "Iterative method should have batch 0"
+
+    # Ground truth: {(0, 0, 0, 3): 2} - two carbons with same features
+    expected = Counter({(0, 0, 0, 3): 2})
+
+    # Both methods should match ground truth
+    original_result = original_counter[0]
+    iterative_result = iterative_counter[0]
+
+    assert original_result == expected, f"Original: expected {expected}, got {original_result}"
+    assert iterative_result == expected, f"Iterative: expected {expected}, got {iterative_result}"
+
+
 
 def test_hypernet_save_load():
     """Test HyperNet save and load preserves all codebooks exactly."""

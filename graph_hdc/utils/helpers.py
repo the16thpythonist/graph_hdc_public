@@ -86,6 +86,22 @@ def scatter_hd(
     """
     index = index.to(src.device, dtype=torch.long, non_blocking=True)
 
+    # Handle empty index tensor (e.g., graphs with no edges)
+    if index.numel() == 0:
+        if dim_size is None:
+            dim_size = 1  # Default to single bucket if not specified
+        # Return identity vectors for all buckets
+        from graph_hdc.hypernet.types import VSAModel
+        vsa = VSAModel.HRR
+        if isinstance(src, MAPTensor) or (src.numel() > 0 and VSAModel.MAP.value in repr(type(src))):
+            vsa = VSAModel.MAP
+        return torchhd.identity(
+            num_vectors=dim_size,
+            dimensions=src.shape[-1],
+            vsa=vsa.value,
+            device=src.device,
+        )
+
     if dim_size is None:
         dim_size = int(index.max().item()) + 1
 

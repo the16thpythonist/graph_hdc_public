@@ -333,6 +333,10 @@ class HyperNet(pl.LightningModule):
         edge_index = torch.cat([data.edge_index, data.edge_index[[1, 0]]], dim=1) if bidirectional else data.edge_index
         srcs, dsts = edge_index
 
+        # Ensure node_hv is on the same device as edge_index (codebooks might be on CPU)
+        if data.node_hv.device != edge_index.device:
+            data.node_hv = data.node_hv.to(edge_index.device)
+
         node_dim = data.x.size(0)
         node_hv_stack = data.node_hv.new_zeros(size=(self.depth + 1, node_dim, self.hv_dim))
         node_hv_stack[0] = data.node_hv
@@ -372,10 +376,116 @@ class HyperNet(pl.LightningModule):
             d = d / self.hv_dim
         return torch.round(d).int().clamp(min=0)
 
+    def decode_order_zero_iterative(
+        self, embedding: torch.Tensor, debug: bool = False
+    ) -> list[tuple[int, ...]] | tuple[list[tuple[int, ...]], list[float], list[float]]:
+        """
+        Decode node types from embedding via iterative unbinding.
+
+        This method uses the same iterative approach as edge decoding:
+        1. Compute cosine similarity against nodes codebook
+        2. Find best matching node type
+        3. Subtract that node's hypervector from the residual
+        4. Repeat until residual norm is negligible
+
+        Parameters
+        ----------
+        embedding : torch.Tensor
+            Order-0 graph embedding (bundled node hypervectors)
+        debug : bool
+            If True, also return norms and similarities for analysis
+
+        Returns
+        -------
+        list[tuple[int, ...]]
+            List of decoded node tuples (one entry per node instance)
+        If debug=True, also returns (norms, similarities)
+        """
+        # Calculate epsilon threshold based on minimum node hypervector norm
+        if not hasattr(self, "_min_node_delta"):
+            norms = [hv.norm().item() for hv in self.nodes_codebook]
+            self._min_node_delta = min(norms) if norms else 1.0
+
+        eps = self._min_node_delta * 0.01
+
+        # Get decoding limit based on dataset
+        if self.base_dataset == "qm9":
+            max_nodes = MAX_ALLOWED_DECODING_NODES_QM9
+        else:
+            max_nodes = MAX_ALLOWED_DECODING_NODES_ZINC
+
+        decoded_nodes: list[tuple[int, ...]] = []
+        norms_history: list[float] = []
+        similarities: list[float] = []
+        residual = embedding.clone()
+        prev_norm = residual.norm().item()
+
+        while len(decoded_nodes) < max_nodes:
+            curr_norm = residual.norm().item()
+            norms_history.append(curr_norm)
+
+            if curr_norm <= eps:
+                break
+
+            # Compute cosine similarity against all node types
+            sims = torchhd.cos(residual, self.nodes_codebook)
+            idx_max = torch.argmax(sims).item()
+            max_sim = sims[idx_max].item()
+            similarities.append(max_sim)
+
+            # Get the best matching node hypervector
+            hv_found: VSATensor = self.nodes_codebook[idx_max]
+
+            # Unbind (subtract) the found node from residual
+            residual = residual - hv_found
+
+            # Check if norm is still decreasing (stop if corrupted)
+            new_norm = residual.norm().item()
+            if new_norm > prev_norm:
+                break
+            prev_norm = new_norm
+
+            # Record the decoded node
+            node_tuple = self.nodes_indexer.get_tuple(idx_max)
+            decoded_nodes.append(node_tuple)
+
+        if debug:
+            return decoded_nodes, norms_history, similarities
+        return decoded_nodes
+
     def decode_order_zero_counter(self, embedding: torch.Tensor) -> dict[int, Counter]:
         """Decode node counts as Counter dict."""
         dot_products_rounded = self.decode_order_zero(embedding)
         return self._convert_to_counter(similarities=dot_products_rounded, indexer=self.nodes_indexer)
+
+    def decode_order_zero_counter_iterative(self, embedding: torch.Tensor) -> dict[int, Counter]:
+        """
+        Decode node counts as Counter dict using iterative unbinding.
+
+        This is the iterative version of decode_order_zero_counter that uses
+        the same approach as edge decoding (cosine similarity + unbinding).
+
+        Parameters
+        ----------
+        embedding : torch.Tensor
+            Order-0 graph embedding(s). Shape [hv_dim] or [batch_size, hv_dim]
+
+        Returns
+        -------
+        dict[int, Counter]
+            Dictionary mapping batch index to Counter of node tuples
+        """
+        if embedding.dim() == 1:
+            embedding = embedding.unsqueeze(0)
+
+        counters: dict[int, Counter] = defaultdict(Counter)
+
+        for b_idx in range(embedding.size(0)):
+            decoded_nodes = self.decode_order_zero_iterative(embedding[b_idx])
+            for node_tuple in decoded_nodes:
+                counters[b_idx][node_tuple] += 1
+
+        return dict(counters)
 
     @staticmethod
     def _convert_to_counter(similarities: torch.Tensor, indexer: TupleIndexer) -> dict[int, Counter]:

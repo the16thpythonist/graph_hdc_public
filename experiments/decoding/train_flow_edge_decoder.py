@@ -5,434 +5,249 @@ Train FlowEdgeDecoder - Edge-only DeFoG decoder conditioned on HDC vectors.
 This experiment trains a discrete flow matching model that generates molecular
 edges given:
 1. Pre-computed HDC vectors as conditioning
-2. Fixed node types (7 atom classes: C, N, O, F, S, Cl, Br)
+2. Fixed node features (24-dim one-hot: atom type, degree, charge, Hs, ring)
 
 The model learns to predict edges (5 classes: no-edge, single, double, triple,
 aromatic) through a denoising process while keeping nodes fixed.
+
+This is the BASE EXPERIMENT. Child experiments can inherit via Experiment.extend()
+and override hooks for custom data loading behavior.
 
 Usage:
     # Quick test
     python train_flow_edge_decoder.py --__TESTING__ True
 
-    # Full training on QM9 with new encoder
+    # Full training with new encoder
     python train_flow_edge_decoder.py --__DEBUG__ False --EPOCHS 100
 
     # Train with existing encoder checkpoint
     python train_flow_edge_decoder.py --HDC_CONFIG_PATH /path/to/encoder.ckpt
-
-    # Train on ZINC
-    python train_flow_edge_decoder.py --DATASET zinc --__DEBUG__ False
 """
 
 from __future__ import annotations
 
-import math
 import os
 import random
 import tempfile
-from collections import Counter, OrderedDict
+import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
-import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from rdkit import Chem
-from rdkit.Chem import Draw
+from torch import Tensor
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-from defog.core import to_dense
 from graph_hdc.datasets.utils import get_split
-from graph_hdc.hypernet.configs import (
-    DSHDCConfig,
-    FeatureConfig,
-    Features,
-    IndexRange,
-)
 from graph_hdc.hypernet.encoder import HyperNet
-from graph_hdc.hypernet.feature_encoders import CombinatoricIntegerEncoder
-from graph_hdc.hypernet.types import VSAModel
 from graph_hdc.models.flow_edge_decoder import (
-    FLOW_ATOM_TYPES,
-    NUM_ATOM_CLASSES,
-    NUM_EDGE_CLASSES,
-    QM9_TO_7CLASS,
-    ZINC_TO_7CLASS,
+    NODE_FEATURE_DIM,
     FlowEdgeDecoder,
     compute_edge_marginals,
     compute_node_counts,
     preprocess_dataset,
+    node_tuples_to_onehot,
 )
+from graph_hdc.utils.experiment_helpers import (
+    GracefulInterruptHandler,
+    LossTrackingCallback,
+    ReconstructionVisualizationCallback,
+    create_reconstruction_plot,
+    decode_nodes_from_hdc,
+    get_canonical_smiles,
+    is_valid_mol,
+    load_or_create_encoder,
+    pyg_to_mol,
+)
+from graph_hdc.utils.helpers import scatter_hd
 
 # =============================================================================
 # PARAMETERS
 # =============================================================================
 
-# Dataset configuration
-DATASET: str = "qm9"  # "qm9" or "zinc"
+# :param DATASET:
+#     Dataset name for training. Currently only "zinc" is supported.
+DATASET: str = "zinc"
 
-# HDC Encoder configuration
-# If HDC_CONFIG_PATH is provided, load encoder from checkpoint
-# Otherwise, create a new encoder with the parameters below
-HDC_CONFIG_PATH: str = ""  # Path to saved HyperNet checkpoint (.ckpt)
-HDC_DIM: int = 512  # Hypervector dimension (used if HDC_CONFIG_PATH is empty)
-HDC_DEPTH: int = 3  # Message passing depth (used if HDC_CONFIG_PATH is empty)
+# -----------------------------------------------------------------------------
+# HDC Encoder Configuration
+# -----------------------------------------------------------------------------
 
-# Model architecture
+# :param HDC_CONFIG_PATH:
+#     Path to saved HyperNet encoder checkpoint (.ckpt). If empty, creates a new
+#     encoder with HDC_DIM and HDC_DEPTH parameters.
+HDC_CONFIG_PATH: str = ""
+
+# :param HDC_DIM:
+#     Hypervector dimension for the HyperNet encoder. Only used if HDC_CONFIG_PATH
+#     is empty. Typical values: 256, 512, 1024.
+HDC_DIM: int = 1024
+
+# :param HDC_DEPTH:
+#     Message passing depth for the HyperNet encoder. Only used if HDC_CONFIG_PATH
+#     is empty. Higher values capture longer-range structural information.
+HDC_DEPTH: int = 6
+
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
+
+# :param N_LAYERS:
+#     Number of transformer layers in the FlowEdgeDecoder.
 N_LAYERS: int = 6
-HIDDEN_DIM: int = 256
-HIDDEN_MLP_DIM: int = 512
-N_HEADS: int = 8
-DROPOUT: float = 0.1
 
-# Training hyperparameters
-EPOCHS: int = 100
+# :param HIDDEN_DIM:
+#     Hidden dimension for transformer layers.
+HIDDEN_DIM: int = 256
+
+# :param HIDDEN_MLP_DIM:
+#     Hidden dimension for MLP blocks in transformer.
+HIDDEN_MLP_DIM: int = 256
+
+# :param N_HEADS:
+#     Number of attention heads in transformer layers.
+N_HEADS: int = 8
+
+# :param DROPOUT:
+#     Dropout probability in transformer layers.
+DROPOUT: float = 0.0
+
+# :param CONDITION_DIM:
+#     Dimension for HDC conditioning after MLP projection.
+CONDITION_DIM: int = 256
+
+# :param TIME_EMBED_DIM:
+#     Dimension for sinusoidal time embedding.
+TIME_EMBED_DIM: int = 256
+
+# -----------------------------------------------------------------------------
+# Training Hyperparameters
+# -----------------------------------------------------------------------------
+
+# :param EPOCHS:
+#     Number of training epochs.
+EPOCHS: int = 50
+
+# :param BATCH_SIZE:
+#     Batch size for training and validation.
 BATCH_SIZE: int = 32
+
+# :param LEARNING_RATE:
+#     Initial learning rate for Adam optimizer.
 LEARNING_RATE: float = 1e-4
+
+# :param WEIGHT_DECAY:
+#     Weight decay (L2 regularization) for optimizer.
 WEIGHT_DECAY: float = 1e-5
+
+# :param TRAIN_TIME_DISTORTION:
+#     Time distortion type during training. Options: "identity", "polydec".
 TRAIN_TIME_DISTORTION: str = "identity"
+
+# :param GRADIENT_CLIP_VAL:
+#     Gradient clipping value. Set to 0.0 to disable.
 GRADIENT_CLIP_VAL: float = 1.0
 
-# Sampling configuration
-SAMPLE_STEPS: int = 100
+# -----------------------------------------------------------------------------
+# Sampling Configuration
+# -----------------------------------------------------------------------------
+
+# :param SAMPLE_STEPS:
+#     Number of denoising steps during sampling.
+SAMPLE_STEPS: int = 1000
+
+# :param ETA:
+#     Stochasticity parameter for sampling. 0.0 = deterministic.
 ETA: float = 0.0
+
+# :param OMEGA:
+#     Target guidance strength parameter.
 OMEGA: float = 0.0
+
+# :param SAMPLE_TIME_DISTORTION:
+#     Time distortion type during sampling. Options: "identity", "polydec".
 SAMPLE_TIME_DISTORTION: str = "polydec"
 
-# Extra features
+# -----------------------------------------------------------------------------
+# Extra Features
+# -----------------------------------------------------------------------------
+
+# :param EXTRA_FEATURES_TYPE:
+#     Type of extra positional features. Options: "rrwp", "none".
 EXTRA_FEATURES_TYPE: str = "rrwp"
+
+# :param RRWP_STEPS:
+#     Number of random walk steps for RRWP positional encoding.
 RRWP_STEPS: int = 10
 
-# Noise distribution
-NOISE_TYPE: str = "marginal"
+# -----------------------------------------------------------------------------
+# Noise Distribution
+# -----------------------------------------------------------------------------
 
-# System configuration
-SEED: int = 42
-NUM_WORKERS: int = 0  # Set to 0 to avoid AF_UNIX path too long errors with multiprocessing
+# :param NOISE_TYPE:
+#     Noise distribution type. Options: "uniform", "marginal".
+NOISE_TYPE: str = "uniform"
+
+# -----------------------------------------------------------------------------
+# System Configuration
+# -----------------------------------------------------------------------------
+
+# :param SEED:
+#     Random seed for reproducibility.
+SEED: int = 1
+
+# :param NUM_WORKERS:
+#     Number of data loader workers. Set to 0 to avoid multiprocessing issues.
+NUM_WORKERS: int = 0
+
+# :param PRECISION:
+#     Training precision. Options: "32", "16", "bf16".
 PRECISION: str = "32"
 
-# Reconstruction evaluation
-NUM_RECONSTRUCTION_SAMPLES: int = 10  # Number of molecules to reconstruct and visualize
+# -----------------------------------------------------------------------------
+# Reconstruction Evaluation
+# -----------------------------------------------------------------------------
 
-# Debug/Testing modes
+# :param NUM_RECONSTRUCTION_SAMPLES:
+#     Number of molecules to reconstruct and visualize after training.
+NUM_RECONSTRUCTION_SAMPLES: int = 100
+
+# :param NUM_VALIDATION_VISUALIZATIONS:
+#     Number of molecules to visualize during each validation epoch.
+NUM_VALIDATION_VISUALIZATIONS: int = 5
+
+# -----------------------------------------------------------------------------
+# Resume Training
+# -----------------------------------------------------------------------------
+
+# :param RESUME_CHECKPOINT_PATH:
+#     Path to PyTorch Lightning checkpoint (.ckpt) to resume training from.
+#     If set, RESUME_ENCODER_PATH must also be provided.
+RESUME_CHECKPOINT_PATH: Optional[str] = None
+
+# :param RESUME_ENCODER_PATH:
+#     Path to HyperNet encoder checkpoint when resuming training.
+#     Required if RESUME_CHECKPOINT_PATH is set.
+RESUME_ENCODER_PATH: Optional[str] = None
+
+# -----------------------------------------------------------------------------
+# Debug/Testing Modes
+# -----------------------------------------------------------------------------
+
+# :param __DEBUG__:
+#     Debug mode - reuses same output folder during development.
 __DEBUG__: bool = True
+
+# :param __TESTING__:
+#     Testing mode - runs with minimal iterations for validation.
 __TESTING__: bool = False
-
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-
-def create_hdc_config(
-    dataset: str,
-    hv_dim: int,
-    depth: int,
-    device: str = "cpu",
-) -> DSHDCConfig:
-    """
-    Create a HyperNet configuration from parameters.
-
-    Args:
-        dataset: Dataset name ("qm9" or "zinc")
-        hv_dim: Hypervector dimension
-        depth: Message passing depth
-        device: Device string
-
-    Returns:
-        DSHDCConfig for HyperNet initialization
-    """
-    dataset = dataset.lower()
-
-    if dataset == "qm9":
-        # QM9: 4 atom types, 5 degrees, 3 charges, 5 hydrogens
-        node_feature_config = FeatureConfig(
-            count=math.prod([4, 5, 3, 5]),  # 300 combinations
-            encoder_cls=CombinatoricIntegerEncoder,
-            index_range=IndexRange((0, 4)),
-            bins=[4, 5, 3, 5],
-        )
-        base_dataset = "qm9"
-    elif dataset == "zinc":
-        # ZINC: 9 atom types, 6 degrees, 3 charges, 4 hydrogens, 2 ring flags
-        node_feature_config = FeatureConfig(
-            count=math.prod([9, 6, 3, 4, 2]),  # 1296 combinations
-            encoder_cls=CombinatoricIntegerEncoder,
-            index_range=IndexRange((0, 5)),
-            bins=[9, 6, 3, 4, 2],
-        )
-        base_dataset = "zinc"
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}. Supported: qm9, zinc")
-
-    return DSHDCConfig(
-        name=f"{dataset.upper()}_HRR_{hv_dim}_depth{depth}",
-        hv_dim=hv_dim,
-        vsa=VSAModel.HRR,
-        base_dataset=base_dataset,
-        hypernet_depth=depth,
-        device=device,
-        seed=42,
-        normalize=True,
-        dtype="float64",
-        node_feature_configs=OrderedDict([
-            (Features.NODE_FEATURES, node_feature_config),
-        ]),
-    )
-
-
-def load_or_create_encoder(
-    config_path: str,
-    dataset: str,
-    hv_dim: int,
-    depth: int,
-    device: torch.device,
-) -> HyperNet:
-    """
-    Load encoder from checkpoint or create a new one.
-
-    Args:
-        config_path: Path to saved encoder checkpoint (empty string to create new)
-        dataset: Dataset name
-        hv_dim: Hypervector dimension
-        depth: Message passing depth
-        device: Device to load to
-
-    Returns:
-        HyperNet encoder instance
-    """
-    if config_path and Path(config_path).exists():
-        # Load from checkpoint
-        return HyperNet.load(config_path, device=str(device))
-    else:
-        # Create new encoder from parameters
-        config = create_hdc_config(dataset, hv_dim, depth, device=str(device))
-        return HyperNet(config)
-
-
-def decode_nodes_from_hdc(
-    hypernet: HyperNet,
-    graph_embedding: torch.Tensor,
-    dataset: str,
-) -> tuple[list[int], int]:
-    """
-    Decode node types from HDC graph embedding.
-
-    Args:
-        hypernet: HyperNet encoder instance
-        graph_embedding: HDC graph embedding tensor (hv_dim,)
-        dataset: Dataset name ("qm9" or "zinc")
-
-    Returns:
-        Tuple of (list of 7-class atom type indices, number of nodes)
-    """
-    # Get the atom type mapping for this dataset
-    if dataset.lower() == "qm9":
-        dataset_to_7class = QM9_TO_7CLASS
-    else:
-        dataset_to_7class = ZINC_TO_7CLASS
-
-    # Decode node counts from HDC embedding
-    # Returns dict: {batch_idx: Counter({node_tuple: count, ...})}
-    node_counter_dict = hypernet.decode_order_zero_counter(graph_embedding)
-
-    # Get counter for batch 0 (single embedding)
-    node_counter = node_counter_dict.get(0, Counter())
-
-    # Convert to list of 7-class atom types
-    atom_types_7class = []
-    for node_tuple, count in node_counter.items():
-        # node_tuple[0] is the atom type index in the dataset's encoding
-        dataset_atom_idx = node_tuple[0]
-
-        # Map to 7-class
-        if dataset_atom_idx in dataset_to_7class:
-            atom_7class = dataset_to_7class[dataset_atom_idx]
-            atom_types_7class.extend([atom_7class] * count)
-
-    return atom_types_7class, len(atom_types_7class)
-
-
-def pyg_to_mol(data: Data) -> Optional[Chem.Mol]:
-    """
-    Convert FlowEdgeDecoder output (PyG Data) to RDKit Mol.
-
-    The Data object has:
-    - x: node types as class indices (n,) in 7-class format
-    - edge_index: edge connectivity (2, num_edges)
-    - edge_attr: edge types as class indices (num_edges,) in 5-class format
-
-    Edge classes: 0=no-edge, 1=single, 2=double, 3=triple, 4=aromatic
-
-    Args:
-        data: PyG Data from FlowEdgeDecoder.sample()
-
-    Returns:
-        RDKit Mol or None if conversion fails
-    """
-    try:
-        # Create editable mol
-        mol = Chem.RWMol()
-
-        # Get node types (class indices)
-        if data.x.dim() > 1:
-            node_types = data.x.argmax(dim=-1).cpu().numpy()
-        else:
-            node_types = data.x.cpu().numpy()
-
-        # Add atoms
-        atom_map = {}  # PyG node idx -> RDKit atom idx
-        for i, atom_type_idx in enumerate(node_types):
-            atom_symbol = FLOW_ATOM_TYPES[int(atom_type_idx)]
-            atom = Chem.Atom(atom_symbol)
-            rdkit_idx = mol.AddAtom(atom)
-            atom_map[i] = rdkit_idx
-
-        # Get edge info
-        if data.edge_index is None or data.edge_index.numel() == 0:
-            # No edges - return mol with just atoms
-            mol = mol.GetMol()
-            return mol
-
-        edge_index = data.edge_index.cpu().numpy()
-        if data.edge_attr is not None:
-            if data.edge_attr.dim() > 1:
-                edge_types = data.edge_attr.argmax(dim=-1).cpu().numpy()
-            else:
-                edge_types = data.edge_attr.cpu().numpy()
-        else:
-            # Default to single bonds
-            edge_types = [1] * edge_index.shape[1]
-
-        # Bond type mapping: 0=no-edge, 1=single, 2=double, 3=triple, 4=aromatic
-        bond_type_map = {
-            1: Chem.BondType.SINGLE,
-            2: Chem.BondType.DOUBLE,
-            3: Chem.BondType.TRIPLE,
-            4: Chem.BondType.AROMATIC,
-        }
-
-        # Add bonds (only process upper triangle to avoid duplicates)
-        added_bonds = set()
-        for k in range(edge_index.shape[1]):
-            i, j = int(edge_index[0, k]), int(edge_index[1, k])
-            edge_type = int(edge_types[k])
-
-            # Skip no-edge and self-loops
-            if edge_type == 0 or i == j:
-                continue
-
-            # Skip if already added (since edges are bidirectional)
-            bond_key = (min(i, j), max(i, j))
-            if bond_key in added_bonds:
-                continue
-            added_bonds.add(bond_key)
-
-            # Add bond
-            if edge_type in bond_type_map:
-                mol.AddBond(atom_map[i], atom_map[j], bond_type_map[edge_type])
-
-        # Convert to regular mol and try to sanitize
-        mol = mol.GetMol()
-
-        try:
-            Chem.SanitizeMol(mol)
-        except Exception:
-            # Try without sanitization
-            pass
-
-        return mol
-
-    except Exception:
-        return None
-
-
-def is_valid_mol(mol: Optional[Chem.Mol]) -> bool:
-    """Check if molecule is valid."""
-    if mol is None:
-        return False
-    try:
-        smiles = Chem.MolToSmiles(mol)
-        return smiles is not None and len(smiles) > 0
-    except Exception:
-        return False
-
-
-def get_canonical_smiles(mol: Optional[Chem.Mol]) -> Optional[str]:
-    """Get canonical SMILES from molecule."""
-    if mol is None:
-        return None
-    try:
-        return Chem.MolToSmiles(mol, canonical=True)
-    except Exception:
-        return None
-
-
-def create_reconstruction_plot(
-    original_mol: Chem.Mol,
-    generated_mol: Optional[Chem.Mol],
-    original_smiles: str,
-    generated_smiles: Optional[str],
-    is_valid: bool,
-    is_match: bool,
-    sample_idx: int,
-    save_path: Path,
-) -> None:
-    """
-    Create side-by-side plot of original vs generated molecule.
-
-    Args:
-        original_mol: Original RDKit molecule
-        generated_mol: Generated RDKit molecule (can be None)
-        original_smiles: Original SMILES string
-        generated_smiles: Generated SMILES string (can be None)
-        is_valid: Whether generated molecule is valid
-        is_match: Whether SMILES match
-        sample_idx: Sample index for labeling
-        save_path: Path to save the plot
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-
-    # Plot original molecule
-    try:
-        img_original = Draw.MolToImage(original_mol, size=(400, 400))
-        axes[0].imshow(img_original)
-    except Exception:
-        axes[0].text(0.5, 0.5, "Failed to draw", ha="center", va="center", fontsize=14)
-    axes[0].set_title(f"Original\n{original_smiles[:50]}{'...' if len(original_smiles) > 50 else ''}", fontsize=10)
-    axes[0].axis("off")
-
-    # Plot generated molecule
-    if generated_mol is not None:
-        try:
-            img_generated = Draw.MolToImage(generated_mol, size=(400, 400))
-            axes[1].imshow(img_generated)
-        except Exception:
-            axes[1].text(0.5, 0.5, "Failed to draw", ha="center", va="center", fontsize=14)
-    else:
-        axes[1].text(0.5, 0.5, "Generation failed", ha="center", va="center", fontsize=14)
-
-    gen_smiles_display = generated_smiles or "N/A"
-    if len(gen_smiles_display) > 50:
-        gen_smiles_display = gen_smiles_display[:50] + "..."
-    axes[1].set_title(f"Generated\n{gen_smiles_display}", fontsize=10)
-    axes[1].axis("off")
-
-    # Add status information
-    status_color = "green" if is_match else ("orange" if is_valid else "red")
-    status_text = "MATCH" if is_match else ("Valid" if is_valid else "Invalid")
-    fig.suptitle(f"Sample {sample_idx + 1}: {status_text}", fontsize=14, color=status_color, fontweight="bold")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 # =============================================================================
@@ -461,8 +276,25 @@ def experiment(e: Experiment) -> None:
     # Set seed
     pl.seed_everything(e.SEED)
 
+    # Validate resume configuration
+    resuming = bool(e.RESUME_CHECKPOINT_PATH)
+    if resuming:
+        resume_ckpt_path = Path(e.RESUME_CHECKPOINT_PATH)
+        if not resume_ckpt_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_ckpt_path}")
+
+        if not e.RESUME_ENCODER_PATH:
+            raise ValueError("RESUME_ENCODER_PATH is required when RESUME_CHECKPOINT_PATH is set")
+
+        resume_encoder_path = Path(e.RESUME_ENCODER_PATH)
+        if not resume_encoder_path.exists():
+            raise FileNotFoundError(f"Resume encoder not found: {resume_encoder_path}")
+
     e.log("=" * 60)
-    e.log("FlowEdgeDecoder Training")
+    if resuming:
+        e.log("FlowEdgeDecoder Training (RESUMING from checkpoint)")
+    else:
+        e.log("FlowEdgeDecoder Training")
     e.log("=" * 60)
     e.log(f"Dataset: {e.DATASET.upper()}")
     e.log(f"HDC config path: {e.HDC_CONFIG_PATH or '(creating new)'}")
@@ -470,6 +302,9 @@ def experiment(e: Experiment) -> None:
     e.log(f"Architecture: {e.N_LAYERS} layers, {e.HIDDEN_DIM} hidden dim")
     e.log(f"Training: {e.EPOCHS} epochs, batch size {e.BATCH_SIZE}")
     e.log(f"Debug mode: {e.__DEBUG__}")
+    if resuming:
+        e.log(f"Resuming from: {e.RESUME_CHECKPOINT_PATH}")
+        e.log(f"Using encoder: {e.RESUME_ENCODER_PATH}")
     e.log("=" * 60)
 
     # Store config
@@ -482,6 +317,7 @@ def experiment(e: Experiment) -> None:
     e["config/epochs"] = e.EPOCHS
     e["config/batch_size"] = e.BATCH_SIZE
     e["config/lr"] = e.LEARNING_RATE
+    e["config/resuming"] = resuming
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -494,14 +330,17 @@ def experiment(e: Experiment) -> None:
 
     e.log("\nLoading/Creating HyperNet encoder...")
 
-    hypernet = load_or_create_encoder(
-        config_path=e.HDC_CONFIG_PATH,
-        dataset=e.DATASET,
-        hv_dim=e.HDC_DIM,
-        depth=e.HDC_DEPTH,
-        device=device,
-    )
-    hypernet.eval()
+    if resuming:
+        hypernet = HyperNet.load(str(resume_encoder_path), device=str(device))
+        hypernet.eval()
+    else:
+        hypernet = load_or_create_encoder(
+            config_path=e.HDC_CONFIG_PATH,
+            dataset=e.DATASET,
+            hv_dim=e.HDC_DIM,
+            depth=e.HDC_DEPTH,
+            device=device,
+        )
 
     actual_hdc_dim = hypernet.hv_dim
     e.log(f"HyperNet initialized: hv_dim={actual_hdc_dim}, depth={hypernet.depth}")
@@ -509,82 +348,40 @@ def experiment(e: Experiment) -> None:
     e["config/actual_hdc_depth"] = hypernet.depth
 
     # Save the encoder if we created a new one
-    if not e.HDC_CONFIG_PATH:
+    if not e.HDC_CONFIG_PATH and not resuming:
         encoder_path = Path(e.path) / "hypernet_encoder.ckpt"
         hypernet.save(encoder_path)
         e.log(f"Saved new encoder to: {encoder_path}")
         e["results/encoder_path"] = str(encoder_path)
 
     # =========================================================================
-    # Load and Preprocess Datasets
+    # Apply Hooks for Data Loading
     # =========================================================================
 
-    e.log("\nLoading datasets...")
-    train_ds = get_split("train", dataset=e.DATASET.lower())
-    valid_ds = get_split("valid", dataset=e.DATASET.lower())
-
-    e.log(f"Raw train: {len(train_ds)}, valid: {len(valid_ds)}")
-
-    e.log("\nPreprocessing datasets for FlowEdgeDecoder...")
-    e.log("(Computing HDC embeddings and converting features...)")
-
-    train_data = preprocess_dataset(
-        train_ds,
-        hypernet,
-        e.DATASET.lower(),
+    train_loader, train_data = e.apply_hook(
+        "load_train_data",
+        hypernet=hypernet,
         device=device,
-        show_progress=True,
-    )
-    valid_data = preprocess_dataset(
-        valid_ds,
-        hypernet,
-        e.DATASET.lower(),
-        device=device,
-        show_progress=True,
     )
 
-    e.log(f"Processed train: {len(train_data)}, valid: {len(valid_data)}")
-    e["data/train_size"] = len(train_data)
-    e["data/valid_size"] = len(valid_data)
+    valid_data, valid_loader, vis_samples = e.apply_hook(
+        "load_valid_data",
+        hypernet=hypernet,
+        device=device,
+    )
 
-    if len(train_data) == 0:
-        e.log("ERROR: No training data after preprocessing!")
-        return
+    edge_marginals, node_counts, max_nodes = e.apply_hook(
+        "compute_statistics",
+        train_data=train_data,
+        hypernet=hypernet,
+        device=device,
+    )
 
-    # =========================================================================
-    # Compute Statistics
-    # =========================================================================
-
-    e.log("\nComputing edge marginals...")
-    edge_marginals = compute_edge_marginals(train_data)
-    e.log(f"Edge marginals: {edge_marginals.tolist()}")
+    # Store statistics
     e["data/edge_marginals"] = edge_marginals.tolist()
-
-    node_counts = compute_node_counts(train_data)
-    max_nodes = int(node_counts.nonzero()[-1].item()) if node_counts.sum() > 0 else 50
-    e.log(f"Max nodes: {max_nodes}")
     e["data/max_nodes"] = max_nodes
-
-    # =========================================================================
-    # Create Data Loaders
-    # =========================================================================
-
-    train_loader = DataLoader(
-        train_data,
-        batch_size=e.BATCH_SIZE,
-        shuffle=True,
-        num_workers=e.NUM_WORKERS,
-        pin_memory=(e.NUM_WORKERS > 0),  # Only pin memory if using workers
-    )
-    valid_loader = DataLoader(
-        valid_data,
-        batch_size=e.BATCH_SIZE,
-        shuffle=False,
-        num_workers=e.NUM_WORKERS,
-        pin_memory=(e.NUM_WORKERS > 0),
-    )
-
-    e.log(f"Train batches: {len(train_loader)}, Valid batches: {len(valid_loader)}")
+    e["data/train_size"] = len(train_data) if train_data else "streaming"
+    e["data/valid_size"] = len(valid_data)
 
     # =========================================================================
     # Create Model
@@ -592,10 +389,21 @@ def experiment(e: Experiment) -> None:
 
     e.log("\nCreating FlowEdgeDecoder model...")
 
+    # HDC vector dimension is 2 * base_dim (concatenation of order_0 and order_N)
+    concat_hdc_dim = 2 * actual_hdc_dim
+    e.log(f"Concatenated HDC dim: {concat_hdc_dim} (order_0 + order_N)")
+    e.log(f"Condition dim after MLP: {e.CONDITION_DIM}")
+    e.log(f"Time embedding dim: {e.TIME_EMBED_DIM}")
+    e["config/concat_hdc_dim"] = concat_hdc_dim
+    e["config/condition_dim"] = e.CONDITION_DIM
+    e["config/time_embed_dim"] = e.TIME_EMBED_DIM
+
     model = FlowEdgeDecoder(
-        num_node_classes=7,
+        num_node_classes=NODE_FEATURE_DIM,  # 24-dim: atom + degree + charge + Hs + ring
         num_edge_classes=5,
-        hdc_dim=actual_hdc_dim,
+        hdc_dim=concat_hdc_dim,  # Input dim is 2x base (concatenated)
+        condition_dim=e.CONDITION_DIM,  # Reduced dim after MLP
+        time_embed_dim=e.TIME_EMBED_DIM,  # Dimension for time embedding
         n_layers=e.N_LAYERS,
         hidden_dim=e.HIDDEN_DIM,
         hidden_mlp_dim=e.HIDDEN_MLP_DIM,
@@ -616,17 +424,30 @@ def experiment(e: Experiment) -> None:
         sample_time_distortion=e.SAMPLE_TIME_DISTORTION,
     )
 
+    # Load weights if resuming
+    if resuming:
+        e.log(f"\nLoading model weights from checkpoint...")
+        checkpoint = torch.load(resume_ckpt_path, map_location=device)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        model.load_state_dict(state_dict, strict=True)
+        e.log("Model weights loaded successfully!")
+        if "epoch" in checkpoint:
+            e.log(f"  (Checkpoint was from epoch {checkpoint['epoch']})")
+            e["config/resume_from_epoch"] = checkpoint["epoch"]
+
     e.log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     e["model/num_parameters"] = sum(p.numel() for p in model.parameters())
 
     # =========================================================================
-    # Setup Training
+    # Create Standard Callbacks
     # =========================================================================
 
-    e.log("\nSetting up training...")
+    # Checkpoint directory for latest checkpoint
+    checkpoint_dir = Path(e.path) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Callbacks (no EarlyStopping)
     callbacks = [
+        # Best model checkpoint (based on validation loss)
         ModelCheckpoint(
             dirpath=e.path,
             filename="best-{epoch:03d}-{val/loss:.4f}",
@@ -635,8 +456,39 @@ def experiment(e: Experiment) -> None:
             save_top_k=1,
             save_last=True,
         ),
+        # Save checkpoint after every epoch (overwrites previous)
+        ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="latest",
+            save_top_k=1,
+            every_n_epochs=1,
+            save_on_train_epoch_end=True,
+            enable_version_counter=False,
+        ),
         LearningRateMonitor(logging_interval="epoch"),
+        LossTrackingCallback(experiment=e),
+        ReconstructionVisualizationCallback(
+            experiment=e,
+            vis_samples=vis_samples,
+            sample_steps=e.SAMPLE_STEPS,
+            eta=e.ETA,
+            omega=e.OMEGA,
+            time_distortion=e.SAMPLE_TIME_DISTORTION,
+        ),
     ]
+
+    # Allow child experiments to modify callbacks (add, remove, or change)
+    callbacks = e.apply_hook(
+        "modify_callbacks",
+        callbacks=callbacks,
+        train_loader=train_loader,
+    )
+
+    # =========================================================================
+    # Setup Training
+    # =========================================================================
+
+    e.log("\nSetting up training...")
 
     # Logger
     logger = CSVLogger(e.path, name="logs")
@@ -656,16 +508,28 @@ def experiment(e: Experiment) -> None:
     )
 
     # =========================================================================
-    # Train
+    # Train with Graceful Interrupt Handling
     # =========================================================================
 
     e.log("\nStarting training...")
+    e.log("(Press CTRL+C to gracefully stop)")
     e.log("-" * 40)
 
-    trainer.fit(model, train_loader, valid_loader)
+    interrupted = False
+    with GracefulInterruptHandler() as handler:
+        handler.set_trainer(trainer)
+        try:
+            trainer.fit(model, train_loader, valid_loader)
+        except KeyboardInterrupt:
+            interrupted = True
+            e.log("\nTraining interrupted by user (force quit)")
 
-    e.log("-" * 40)
-    e.log("Training complete!")
+    if trainer.should_stop and not interrupted:
+        e.log("-" * 40)
+        e.log("Training gracefully stopped by user")
+    elif not interrupted:
+        e.log("-" * 40)
+        e.log("Training complete!")
 
     # =========================================================================
     # Save Results
@@ -691,58 +555,6 @@ def experiment(e: Experiment) -> None:
         e["results/best_checkpoint"] = str(best_ckpt)
 
     # =========================================================================
-    # Verification
-    # =========================================================================
-
-    e.log("\nRunning verification...")
-
-    try:
-        # Load best model
-        if best_ckpts:
-            loaded_model = FlowEdgeDecoder.load(str(best_ckpts[0]), device=device)
-        else:
-            loaded_model = model
-
-        loaded_model.eval()
-        loaded_model.to(device)
-
-        # Get a sample batch for verification
-        sample_batch = next(iter(valid_loader))
-        sample_batch = sample_batch.to(device)
-
-        # Extract HDC vectors and node features for sampling
-        with torch.no_grad():
-            # Get dense representation
-            dense_data, node_mask = to_dense(
-                sample_batch.x,
-                sample_batch.edge_index,
-                sample_batch.edge_attr,
-                sample_batch.batch,
-            )
-
-            # Get HDC vectors
-            hdc_vectors = loaded_model._get_hdc_vectors_from_batch(sample_batch)
-
-            # Sample edges
-            num_test = min(5, hdc_vectors.size(0))
-            samples = loaded_model.sample(
-                hdc_vectors=hdc_vectors[:num_test],
-                node_features=dense_data.X[:num_test],
-                node_mask=node_mask[:num_test],
-                sample_steps=20,  # Quick sampling for verification
-                show_progress=False,
-            )
-
-            e.log(f"Generated {len(samples)} samples successfully")
-            e["verification/num_samples"] = len(samples)
-            e["verification/status"] = "passed"
-
-    except Exception as ex:
-        e.log(f"Verification failed: {ex}")
-        e["verification/status"] = "failed"
-        e["verification/error"] = str(ex)
-
-    # =========================================================================
     # Reconstruction Evaluation
     # =========================================================================
 
@@ -751,11 +563,8 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
 
     try:
-        # Load best model for reconstruction
-        if best_ckpts:
-            recon_model = FlowEdgeDecoder.load(str(best_ckpts[0]), device=device)
-        else:
-            recon_model = model
+        # Use final model for reconstruction
+        recon_model = model
         recon_model.eval()
         recon_model.to(device)
 
@@ -777,6 +586,9 @@ def experiment(e: Experiment) -> None:
         match_count = 0
         results = []
 
+        # Start timing
+        sampling_start_time = time.time()
+
         for idx, sample_idx in enumerate(sample_indices):
             e.log(f"\nSample {idx + 1}/{num_samples}:")
 
@@ -787,8 +599,7 @@ def experiment(e: Experiment) -> None:
 
             e.log(f"  Original SMILES: {original_smiles}")
 
-            # Encode with HyperNet
-            # Need to add batch attribute for single graph
+            # Encode with HyperNet - compute concatenated [order_0 | order_N]
             data_for_encoding = original_data.clone()
             data_for_encoding = data_for_encoding.to(device)
             if not hasattr(data_for_encoding, "batch") or data_for_encoding.batch is None:
@@ -797,15 +608,29 @@ def experiment(e: Experiment) -> None:
                 )
 
             with torch.no_grad():
-                encoder_output = hypernet.forward(data_for_encoding, normalize=True)
-                graph_embedding = encoder_output["graph_embedding"].squeeze(0)  # (hv_dim,)
+                # Encode node properties
+                data_for_encoding = hypernet.encode_properties(data_for_encoding)
 
-            # Decode nodes from HDC embedding
-            atom_types_7class, num_nodes = decode_nodes_from_hdc(
-                hypernet, graph_embedding.unsqueeze(0), e.DATASET
+                # Order-0: Bundle node hypervectors (no message passing)
+                order_zero = scatter_hd(
+                    src=data_for_encoding.node_hv,
+                    index=data_for_encoding.batch,
+                    op="bundle"
+                )
+
+                # Order-N: Full graph embedding with message passing
+                encoder_output = hypernet.forward(data_for_encoding, normalize=True)
+                order_n = encoder_output["graph_embedding"]
+
+                # Concatenate [order_0 | order_N]
+                graph_embedding = torch.cat([order_zero, order_n], dim=-1).squeeze(0)
+
+            # Decode nodes from HDC embedding (using order_0 part)
+            node_tuples, num_nodes = decode_nodes_from_hdc(
+                hypernet, graph_embedding.unsqueeze(0), actual_hdc_dim
             )
 
-            e.log(f"  Decoded {num_nodes} nodes: {atom_types_7class}")
+            e.log(f"  Decoded {num_nodes} nodes: {node_tuples[:5]}{'...' if num_nodes > 5 else ''}")
 
             # Handle case where no nodes were decoded
             if num_nodes == 0:
@@ -821,16 +646,9 @@ def experiment(e: Experiment) -> None:
                 continue
 
             # Prepare inputs for FlowEdgeDecoder.sample()
-            # node_features: (1, n, 7) one-hot
-            node_features = F.one_hot(
-                torch.tensor(atom_types_7class, dtype=torch.long, device=device),
-                num_classes=NUM_ATOM_CLASSES,
-            ).float().unsqueeze(0)  # (1, n, 7)
-
-            # node_mask: (1, n)
+            node_features = node_tuples_to_onehot(node_tuples, device=device)
+            node_features = node_features.unsqueeze(0)  # (1, n, 24)
             node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=device)
-
-            # hdc_vectors: (1, hdc_dim)
             hdc_vectors = graph_embedding.unsqueeze(0)
 
             # Generate edges
@@ -852,7 +670,14 @@ def experiment(e: Experiment) -> None:
 
             # Check validity and match
             is_valid = is_valid_mol(generated_mol)
-            original_canonical = get_canonical_smiles(original_mol) if original_mol else None
+            original_canonical = None
+            if original_mol is not None:
+                try:
+                    original_mol_no_h = Chem.RemoveAllHs(original_mol)
+                    original_canonical = Chem.MolToSmiles(original_mol_no_h, canonical=True)
+                except Exception:
+                    original_canonical = get_canonical_smiles(original_mol)
+
             is_match = (
                 is_valid
                 and generated_smiles is not None
@@ -891,12 +716,17 @@ def experiment(e: Experiment) -> None:
                 "is_match": is_match,
             })
 
+        # End timing
+        total_sampling_time = time.time() - sampling_start_time
+
         # Log summary
         e.log("\n" + "-" * 40)
         e.log("Reconstruction Summary:")
         e.log(f"  Total samples: {num_samples}")
         e.log(f"  Valid molecules: {valid_count} ({100 * valid_count / num_samples:.1f}%)")
         e.log(f"  Exact matches: {match_count} ({100 * match_count / num_samples:.1f}%)")
+        e.log(f"  Total sampling time: {total_sampling_time:.2f} seconds")
+        e.log(f"  Average time per sample: {total_sampling_time / num_samples:.2f} seconds")
         e.log("-" * 40)
 
         # Store metrics
@@ -905,6 +735,8 @@ def experiment(e: Experiment) -> None:
         e["reconstruction/match_count"] = match_count
         e["reconstruction/valid_rate"] = valid_count / num_samples if num_samples > 0 else 0
         e["reconstruction/match_rate"] = match_count / num_samples if num_samples > 0 else 0
+        e["reconstruction/total_sampling_time_seconds"] = total_sampling_time
+        e["reconstruction/avg_time_per_sample_seconds"] = total_sampling_time / num_samples if num_samples > 0 else 0
         e["reconstruction/results"] = results
 
         # Save results as JSON
@@ -930,16 +762,166 @@ def experiment(e: Experiment) -> None:
 
 
 # =============================================================================
-# Testing Mode
+# HOOKS
 # =============================================================================
 
 
-@experiment.testing
-def testing(e: Experiment):
-    """Quick test mode with reduced parameters."""
-    e.EPOCHS = 2
-    e.BATCH_SIZE = 4
-    e.SAMPLE_STEPS = 10
+@experiment.hook("load_train_data", default=True)
+def load_train_data(
+    e: Experiment,
+    hypernet: HyperNet,
+    device: torch.device,
+) -> Tuple[DataLoader, List[Data]]:
+    """
+    Load and preprocess training data.
+
+    Default implementation loads ZINC training split and preprocesses with HyperNet.
+    Child experiments can override this hook to provide custom data sources.
+
+    Args:
+        e: Experiment instance for accessing parameters
+        hypernet: HyperNet encoder for preprocessing
+        device: Device for HDC computation
+
+    Returns:
+        Tuple of (train_loader, train_data list)
+    """
+    e.log("\nLoading training data...")
+    train_ds = get_split("train", dataset=e.DATASET.lower())
+    e.log(f"Raw train: {len(train_ds)}")
+
+    e.log("Preprocessing training data...")
+    e.log("(Computing HDC embeddings and converting features...)")
+    train_data = preprocess_dataset(
+        train_ds,
+        hypernet,
+        device=device,
+        show_progress=True,
+    )
+    e.log(f"Processed train: {len(train_data)}")
+
+    if len(train_data) == 0:
+        raise ValueError("No training data after preprocessing!")
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=e.BATCH_SIZE,
+        shuffle=True,
+        num_workers=e.NUM_WORKERS,
+        pin_memory=(e.NUM_WORKERS > 0),
+    )
+
+    return train_loader, train_data
+
+
+@experiment.hook("load_valid_data", default=True)
+def load_valid_data(
+    e: Experiment,
+    hypernet: HyperNet,
+    device: torch.device,
+) -> Tuple[List[Data], DataLoader, List[Data]]:
+    """
+    Load and preprocess validation data.
+
+    Default implementation loads ZINC validation split and preprocesses with HyperNet.
+
+    Args:
+        e: Experiment instance
+        hypernet: HyperNet encoder for preprocessing
+        device: Device for HDC computation
+
+    Returns:
+        Tuple of (valid_data list, valid_loader, vis_samples for visualization)
+    """
+    e.log("\nLoading validation data...")
+    valid_ds = get_split("valid", dataset=e.DATASET.lower())
+    e.log(f"Raw valid: {len(valid_ds)}")
+
+    e.log("Preprocessing validation data...")
+    valid_data = preprocess_dataset(
+        valid_ds,
+        hypernet,
+        device=device,
+        show_progress=True,
+    )
+    e.log(f"Processed valid: {len(valid_data)}")
+
+    valid_loader = DataLoader(
+        valid_data,
+        batch_size=e.BATCH_SIZE,
+        shuffle=False,
+        num_workers=e.NUM_WORKERS,
+        pin_memory=(e.NUM_WORKERS > 0),
+    )
+
+    # Select visualization samples
+    num_vis = min(e.NUM_VALIDATION_VISUALIZATIONS, len(valid_data))
+    vis_samples = valid_data[:num_vis]
+    e.log(f"Selected {num_vis} samples for validation visualization")
+
+    return valid_data, valid_loader, vis_samples
+
+
+@experiment.hook("compute_statistics", default=True)
+def compute_statistics(
+    e: Experiment,
+    train_data: Optional[List[Data]],
+    hypernet: HyperNet,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor, int]:
+    """
+    Compute edge marginals and node counts for model initialization.
+
+    Default implementation computes statistics from the training data.
+    Child experiments can override to compute from different data sources.
+
+    Args:
+        e: Experiment instance
+        train_data: Training data (None for streaming)
+        hypernet: HyperNet encoder (needed if train_data is None)
+        device: Device for computation
+
+    Returns:
+        Tuple of (edge_marginals, node_counts, max_nodes)
+    """
+    if train_data is None:
+        raise ValueError("train_data is required for base experiment statistics computation")
+
+    e.log("\nComputing edge marginals...")
+    edge_marginals = compute_edge_marginals(train_data)
+    e.log(f"Edge marginals: {edge_marginals.tolist()}")
+
+    node_counts = compute_node_counts(train_data)
+    max_nodes = int(node_counts.nonzero()[-1].item()) if node_counts.sum() > 0 else 50
+    e.log(f"Max nodes: {max_nodes}")
+
+    return edge_marginals, node_counts, max_nodes
+
+
+@experiment.hook("modify_callbacks", default=True)
+def modify_callbacks(
+    e: Experiment,
+    callbacks: List[Callback],
+    train_loader: DataLoader,
+) -> List[Callback]:
+    """
+    Modify the standard callbacks list.
+
+    Override this hook to add, remove, or modify callbacks. The standard
+    callbacks (ModelCheckpoint, LearningRateMonitor, LossTrackingCallback,
+    ReconstructionVisualizationCallback) are created in the main function.
+
+    The default implementation returns the callbacks unchanged.
+
+    Args:
+        e: Experiment instance
+        callbacks: List of standard callbacks to modify
+        train_loader: Training data loader (useful for cleanup callbacks)
+
+    Returns:
+        Modified list of callbacks
+    """
+    return callbacks
 
 
 # =============================================================================

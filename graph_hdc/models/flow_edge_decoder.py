@@ -4,20 +4,29 @@ FlowEdgeDecoder - Edge-only DeFoG decoder conditioned on HDC vectors.
 This module implements a discrete flow matching model that generates molecular
 edges conditioned on:
 1. Pre-computed HDC vectors (512-dim default)
-2. Fixed node types (7 atom classes)
+2. Fixed node features (24-dim one-hot: atom type, degree, charge, Hs, ring)
 
 The model inherits from DeFoG's DeFoGModel and overrides the training and
 sampling methods to:
 - Keep nodes fixed (no noise applied)
 - Only denoise edges through the flow matching process
 - Use HDC vectors as global conditioning
+
+Node features (ZINC format):
+- atom_type: 9 classes (Br, C, Cl, F, I, N, O, P, S)
+- degree: 6 classes (0-5)
+- formal_charge: 3 classes (0=neutral, 1=+1, 2=-1)
+- total_Hs: 4 classes (0-3)
+- is_in_ring: 2 classes (0, 1)
+Total: 24-dimensional one-hot concatenation
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
@@ -42,15 +51,82 @@ from defog.core import (
     to_dense,
 )
 
+import torchhd
+
+from graph_hdc.utils.helpers import scatter_hd
+
+
+# =============================================================================
+# Time Embedding
+# =============================================================================
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal positional encoding for time, similar to transformer positional encodings."""
+
+    def __init__(self, embed_dim: int, max_period: float = 10000.0):
+        """
+        Args:
+            embed_dim: Output embedding dimension
+            max_period: Maximum period for the sinusoidal encoding
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_period = max_period
+
+    def forward(self, t: Tensor) -> Tensor:
+        """
+        Embed scalar timesteps into sinusoidal encoding.
+
+        Args:
+            t: Timesteps of shape (batch_size, 1) with values in [0, 1]
+
+        Returns:
+            Embeddings of shape (batch_size, embed_dim)
+        """
+        half_dim = self.embed_dim // 2
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half_dim, device=t.device, dtype=t.dtype)
+            / half_dim
+        )
+        # t is (bs, 1), freqs is (half_dim,)
+        # Scale t to a larger range for better frequency coverage
+        args = t * 1000.0 * freqs.unsqueeze(0)  # (bs, half_dim)
+        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (bs, embed_dim)
+        return embedding
+
+
 # =============================================================================
 # Constants
 # =============================================================================
 
-# 7-class atom type mapping (C, N, O, F, S, Cl, Br)
-FLOW_ATOM_TYPES = ["C", "N", "O", "F", "S", "Cl", "Br"]
-FLOW_ATOM_TO_IDX = {atom: idx for idx, atom in enumerate(FLOW_ATOM_TYPES)}
-FLOW_IDX_TO_ATOM = {idx: atom for atom, idx in FLOW_ATOM_TO_IDX.items()}
-NUM_ATOM_CLASSES = 7
+# ZINC atom types (9 classes)
+ZINC_ATOM_TYPES = ["Br", "C", "Cl", "F", "I", "N", "O", "P", "S"]
+ZINC_ATOM_TO_IDX = {atom: idx for idx, atom in enumerate(ZINC_ATOM_TYPES)}
+ZINC_IDX_TO_ATOM = {idx: atom for atom, idx in ZINC_ATOM_TO_IDX.items()}
+
+# Node feature dimensions (ZINC)
+NUM_ATOM_CLASSES = 9
+NUM_DEGREE_CLASSES = 6
+NUM_CHARGE_CLASSES = 3
+NUM_HS_CLASSES = 4
+NUM_RING_CLASSES = 2
+
+# Total one-hot dimension for all node features
+NODE_FEATURE_DIM = (
+    NUM_ATOM_CLASSES + NUM_DEGREE_CLASSES + NUM_CHARGE_CLASSES +
+    NUM_HS_CLASSES + NUM_RING_CLASSES
+)  # 24
+
+# Feature bin sizes (for indexing)
+NODE_FEATURE_BINS = [
+    NUM_ATOM_CLASSES,
+    NUM_DEGREE_CLASSES,
+    NUM_CHARGE_CLASSES,
+    NUM_HS_CLASSES,
+    NUM_RING_CLASSES,
+]
 
 # 5-class edge type mapping
 BOND_TYPES = ["no_edge", "single", "double", "triple", "aromatic"]
@@ -63,19 +139,91 @@ BOND_TYPE_TO_IDX = {
 }
 NUM_EDGE_CLASSES = 5
 
-# Dataset-specific atom mappings to 7-class
-QM9_TO_7CLASS = {0: 0, 1: 1, 2: 2, 3: 3}  # C, N, O, F -> direct
-ZINC_TO_7CLASS = {
-    0: 6,   # Br -> 6
-    1: 0,   # C -> 0
-    2: 5,   # Cl -> 5
-    3: 3,   # F -> 3
-    # 4: I -> skip
-    5: 1,   # N -> 1
-    6: 2,   # O -> 2
-    # 7: P -> skip
-    8: 4,   # S -> 4
-}
+
+# =============================================================================
+# Node Feature Conversion Helpers
+# =============================================================================
+
+
+def node_tuple_to_onehot(
+    node_tuple: Tuple[int, ...],
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """
+    Convert a single node tuple to concatenated one-hot encoding.
+
+    Args:
+        node_tuple: Tuple of (atom_idx, degree, charge, num_hs, is_ring)
+        device: Target device for the tensor
+
+    Returns:
+        One-hot tensor of shape (NODE_FEATURE_DIM,) = (24,)
+    """
+    atom_idx, degree, charge, num_hs, is_ring = node_tuple
+
+    onehot = torch.cat([
+        F.one_hot(torch.tensor(atom_idx), num_classes=NUM_ATOM_CLASSES),
+        F.one_hot(torch.tensor(degree), num_classes=NUM_DEGREE_CLASSES),
+        F.one_hot(torch.tensor(charge), num_classes=NUM_CHARGE_CLASSES),
+        F.one_hot(torch.tensor(num_hs), num_classes=NUM_HS_CLASSES),
+        F.one_hot(torch.tensor(is_ring), num_classes=NUM_RING_CLASSES),
+    ], dim=-1).float()
+
+    if device is not None:
+        onehot = onehot.to(device)
+    return onehot
+
+
+def node_tuples_to_onehot(
+    node_tuples: List[Tuple[int, ...]],
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """
+    Convert list of node tuples to concatenated one-hot tensor.
+
+    Args:
+        node_tuples: List of tuples, each (atom_idx, degree, charge, num_hs, is_ring)
+        device: Target device for the tensor
+
+    Returns:
+        One-hot tensor of shape (n, NODE_FEATURE_DIM) = (n, 24)
+    """
+    if not node_tuples:
+        t = torch.zeros(0, NODE_FEATURE_DIM)
+        return t.to(device) if device is not None else t
+
+    onehots = [node_tuple_to_onehot(t, device) for t in node_tuples]
+    return torch.stack(onehots, dim=0)
+
+
+def raw_features_to_onehot(
+    raw_features: Tensor,
+    device: Optional[torch.device] = None,
+) -> Tensor:
+    """
+    Convert raw node features tensor to concatenated one-hot encoding.
+
+    Args:
+        raw_features: Tensor of shape (n, 5) with integer indices for each feature
+                      Columns: [atom_type, degree, charge, num_hs, is_ring]
+        device: Target device for the tensor
+
+    Returns:
+        One-hot tensor of shape (n, NODE_FEATURE_DIM) = (n, 24)
+    """
+    n_atoms = raw_features.size(0)
+    x_onehot = torch.zeros(n_atoms, NODE_FEATURE_DIM, dtype=torch.float32)
+
+    offset = 0
+    for feat_idx, num_classes in enumerate(NODE_FEATURE_BINS):
+        feat_vals = raw_features[:, feat_idx].long()
+        onehot = F.one_hot(feat_vals, num_classes=num_classes).float()
+        x_onehot[:, offset:offset + num_classes] = onehot
+        offset += num_classes
+
+    if device is not None:
+        x_onehot = x_onehot.to(device)
+    return x_onehot
 
 
 # =============================================================================
@@ -87,9 +235,11 @@ class FlowEdgeDecoderConfig:
     """Configuration for FlowEdgeDecoder model."""
 
     # Data dimensions
-    num_node_classes: int = NUM_ATOM_CLASSES
+    num_node_classes: int = NODE_FEATURE_DIM
     num_edge_classes: int = NUM_EDGE_CLASSES
     hdc_dim: int = 512
+    condition_dim: int = 128  # Reduced dimension after MLP
+    time_embed_dim: int = 64  # Dimension for time embedding
 
     # Architecture
     n_layers: int = 6
@@ -120,13 +270,7 @@ class FlowEdgeDecoderConfig:
     sample_time_distortion: str = "polydec"
 
 
-QM9_EDGE_DECODER_CONFIG = FlowEdgeDecoderConfig(
-    hdc_dim=512,
-    n_layers=6,
-    hidden_dim=256,
-    max_nodes=15,
-)
-
+# Default config for ZINC dataset (24-dim node features)
 ZINC_EDGE_DECODER_CONFIG = FlowEdgeDecoderConfig(
     hdc_dim=512,
     n_layers=8,
@@ -271,9 +415,11 @@ class FlowEdgeDecoder(pl.LightningModule):
 
     def __init__(
         self,
-        num_node_classes: int = NUM_ATOM_CLASSES,
+        num_node_classes: int = NODE_FEATURE_DIM,
         num_edge_classes: int = NUM_EDGE_CLASSES,
         hdc_dim: int = 512,
+        condition_dim: int = 128,
+        time_embed_dim: int = 64,
         n_layers: int = 6,
         hidden_dim: int = 256,
         hidden_mlp_dim: int = 512,
@@ -300,6 +446,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         self.num_node_classes = num_node_classes
         self.num_edge_classes = num_edge_classes
         self.hdc_dim = hdc_dim
+        self.condition_dim = condition_dim
+        self.time_embed_dim = time_embed_dim
         self.max_nodes = max_nodes
 
         # Training config
@@ -341,11 +489,31 @@ class FlowEdgeDecoder(pl.LightningModule):
         )
         extra_dims = self.extra_features.output_dims()
 
-        # Input dimensions: nodes + edges + global (time + HDC)
+        # MLP to reduce HDC conditioning dimension
+        # Input: concatenated [order_0 | order_N] with dim = hdc_dim (which is 2x base_hdc_dim)
+        # Output: condition_dim
+        self.condition_mlp = nn.Sequential(
+            nn.Linear(hdc_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, condition_dim),
+        )
+
+        # Time embedding: sinusoidal encoding + MLP
+        # This gives the time signal more expressive power to match the HDC conditioning
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimeEmbedding(time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        # Input dimensions: nodes + edges + global (time_embed + reduced HDC + extra)
         self.input_dims = {
             "X": num_node_classes + extra_dims["X"],
             "E": num_edge_classes + extra_dims["E"],
-            "y": 1 + extra_dims["y"] + hdc_dim,  # time + extra + HDC
+            "y": time_embed_dim + extra_dims["y"] + condition_dim,  # time_embed + extra + reduced HDC
         }
 
         # Output dimensions
@@ -397,6 +565,47 @@ class FlowEdgeDecoder(pl.LightningModule):
             limit_dist=self.limit_dist,
         )
 
+    def _create_limit_distribution(
+        self,
+        noise_type: str,
+        edge_marginals: Optional[Tensor] = None,
+    ) -> LimitDistribution:
+        """
+        Create a LimitDistribution with the specified noise type.
+
+        This is used to override the noise type at inference time while keeping
+        consistent behavior across initialization and rate matrix computation.
+
+        Args:
+            noise_type: "uniform" or "marginal"
+            edge_marginals: Edge marginals for "marginal" type (uses stored if None)
+
+        Returns:
+            New LimitDistribution instance
+        """
+        if noise_type == "uniform":
+            # Uniform: don't need marginals
+            return LimitDistribution(
+                noise_type="uniform",
+                num_node_classes=self.num_node_classes,
+                num_edge_classes=self.num_edge_classes,
+                node_marginals=None,
+                edge_marginals=None,
+            )
+        elif noise_type == "marginal":
+            # Use stored or provided marginals
+            marginals = edge_marginals if edge_marginals is not None else self.limit_dist.E
+            node_marginals = torch.ones(self.num_node_classes) / self.num_node_classes
+            return LimitDistribution(
+                noise_type="marginal",
+                num_node_classes=self.num_node_classes,
+                num_edge_classes=self.num_edge_classes,
+                node_marginals=node_marginals,
+                edge_marginals=marginals,
+            )
+        else:
+            raise ValueError(f"Unknown noise_type: {noise_type}. Use 'uniform' or 'marginal'.")
+
     def forward(
         self,
         noisy_data: Dict[str, Tensor],
@@ -419,8 +628,9 @@ class FlowEdgeDecoder(pl.LightningModule):
         E = torch.cat([noisy_data["E_t"], extra_data.E], dim=-1)
 
         # Global features: time embedding + HDC vector + extra
-        t = noisy_data["t"].unsqueeze(-1)  # (bs, 1)
-        y = torch.cat([t, noisy_data["y_t"], extra_data.y], dim=-1)
+        t = noisy_data["t"]  # (bs, 1) from time distorter
+        t_embed = self.time_mlp(t)  # (bs, time_embed_dim)
+        y = torch.cat([t_embed, noisy_data["y_t"], extra_data.y], dim=-1)
 
         return self.model(X, E, y, node_mask)
 
@@ -429,19 +639,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         noisy_data: Dict[str, Tensor],
     ) -> PlaceHolder:
         """Compute extra features for the current noisy state."""
-        # Create placeholder for extra features computation
-        X_t = noisy_data["X_t"]
-        E_t = noisy_data["E_t"]
-        node_mask = noisy_data["node_mask"]
-
-        # Create dense placeholder
-        dense = PlaceHolder(
-            X=X_t,
-            E=E_t,
-            y=torch.zeros(X_t.size(0), 0, device=X_t.device),
-        )
-
-        return self.extra_features(dense, node_mask)
+        # ExtraFeatures expects a dict with X_t, E_t, y_t, node_mask
+        return self.extra_features(noisy_data)
 
     def _p_Et_given_E1(
         self,
@@ -529,8 +728,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
         E_t = E_t * edge_mask.unsqueeze(-1).float()
 
-        # Global features: HDC vector
-        y_t = hdc_vectors
+        # Global features: HDC vector reduced through MLP
+        y_t = self.condition_mlp(hdc_vectors)
 
         return {
             "t": t_float,
@@ -583,7 +782,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Compute edge-only loss
         loss = self.train_loss(pred.E, E, node_mask)
 
-        self.log("train/loss", loss, prog_bar=True, batch_size=batch.num_graphs)
+        # Log detached loss to allow deepcopy in checkpoint callback
+        self.log("train/loss", loss.detach(), prog_bar=True, batch_size=batch.num_graphs)
         return {"loss": loss}
 
     def validation_step(
@@ -610,18 +810,23 @@ class FlowEdgeDecoder(pl.LightningModule):
         pred = self.forward(noisy_data, extra_data, node_mask)
 
         loss = self.train_loss(pred.E, E, node_mask)
-        self.log("val/loss", loss, prog_bar=True, batch_size=batch.num_graphs)
-        return {"val_loss": loss}
+
+        # Log and return detached loss to allow deepcopy in checkpoint callback
+        self.log("val/loss", loss.detach(), prog_bar=True, batch_size=batch.num_graphs)
+        return {"val_loss": loss.detach()}
 
     def _get_hdc_vectors_from_batch(self, batch: Batch) -> Tensor:
         """Extract per-graph HDC vectors from batch."""
         # HDC vectors should be stored as batch.hdc_vector with shape (num_graphs, hdc_dim)
+        # Each graph's hdc_vector is stored as (1, hdc_dim) so batching gives (batch_size, hdc_dim)
         if hasattr(batch, "hdc_vector"):
             hdc = batch.hdc_vector
-            if hdc.dim() == 1:
-                # Single graph
+            # Should already be (batch_size, hdc_dim) from proper PyG batching
+            if hdc.dim() == 2:
+                return hdc
+            else:
+                # Fallback for single graph case
                 return hdc.unsqueeze(0)
-            return hdc
         else:
             raise ValueError("Batch does not have 'hdc_vector' attribute. "
                            "Make sure to preprocess data with preprocess_for_flow_edge_decoder().")
@@ -634,7 +839,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         E_t: Tensor,
         y_t: Tensor,
         node_mask: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        deterministic: bool = False,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Sample z_s given z_t - ONLY update edges.
 
@@ -645,11 +851,14 @@ class FlowEdgeDecoder(pl.LightningModule):
             E_t: Current edges one-hot
             y_t: HDC vectors (fixed)
             node_mask: Valid node mask
+            deterministic: If True, use argmax instead of sampling for
+                          fully deterministic trajectories given the same initial noise
 
         Returns:
-            (X_s, E_s, y_s) - X_s = X_t (unchanged), E_s = new edges
+            (X_s, E_s, y_s, pred_E) - X_s = X_t (unchanged), E_s = new edges,
+            pred_E = model's predicted clean edge distribution
         """
-        bs, n, de = E_t.shape[:2], E_t.shape[-1]
+        bs, n, _, de = E_t.shape  # E_t is (bs, n, n, de)
         dt = (s - t)[0]
 
         # Prepare noisy data dict
@@ -667,12 +876,13 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Forward pass
         pred = self.forward(noisy_data, extra_data, node_mask)
 
-        # Get edge predictions
+        # Get node and edge predictions as probability distributions
+        pred_X = F.softmax(pred.X, dim=-1)
         pred_E = F.softmax(pred.E, dim=-1)
 
         # Compute rate matrices for edges only
         R_t_X, R_t_E = self.rate_matrix_designer.compute_rate_matrices(
-            t, node_mask, X_t, E_t, pred.X, pred_E
+            t, node_mask, X_t, E_t, pred_X, pred_E
         )
 
         # Compute step probabilities for edges
@@ -703,10 +913,13 @@ class FlowEdgeDecoder(pl.LightningModule):
         if s[0].item() >= 1.0 - 1e-6:
             step_probs_E = pred_E
 
-        # Sample next edge state
+        # Sample next edge state (or argmax if deterministic)
         prob_E_flat = step_probs_E.reshape(-1, de)
-        E_s_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
-        E_s_label = E_s_label_flat.reshape(bs[0], n, n)
+        if deterministic:
+            E_s_label_flat = torch.argmax(prob_E_flat, dim=-1)
+        else:
+            E_s_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+        E_s_label = E_s_label_flat.reshape(bs, n, n)
 
         # Make symmetric
         E_s_label = torch.triu(E_s_label, diagonal=1)
@@ -722,7 +935,7 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Nodes stay fixed
         X_s = X_t
 
-        return X_s, E_s, y_t
+        return X_s, E_s, y_t, pred_E
 
     @torch.no_grad()
     def sample(
@@ -734,8 +947,11 @@ class FlowEdgeDecoder(pl.LightningModule):
         omega: Optional[float] = None,
         sample_steps: Optional[int] = None,
         time_distortion: Optional[str] = None,
+        noise_type_override: Optional[str] = None,
         device: Optional[torch.device] = None,
         show_progress: bool = True,
+        step_callback: Optional[Callable[[int, float, Tensor, Tensor, Tensor, Optional[Tensor]], None]] = None,
+        deterministic: bool = False,
     ) -> List[Data]:
         """
         Generate edges conditioned on HDC vectors and fixed nodes.
@@ -748,6 +964,433 @@ class FlowEdgeDecoder(pl.LightningModule):
             omega: Target guidance strength (None = use default)
             sample_steps: Number of denoising steps (None = use default)
             time_distortion: Time distortion type (None = use default)
+            noise_type_override: Override noise type for initialization ("uniform" or "marginal").
+                                 If None, uses the model's trained noise type.
+                                 Use "uniform" to test uniform initialization regardless of training.
+            device: Device to run on (defaults to CPU for stability)
+            show_progress: Whether to show progress bar
+            step_callback: Optional callback invoked at each step with
+                          (step, t, X, E, node_mask, pred_E).
+                          pred_E is the model's predicted clean edge distribution (None at t=0).
+                          Use for capturing intermediate states (e.g., GIF animation).
+            deterministic: If True, use argmax instead of sampling at each denoising step
+                          for fully deterministic trajectories given the same initial noise.
+                          Initial noise is still sampled; use torch seeds for reproducibility.
+
+        Returns:
+            List of PyG Data objects with generated edges
+        """
+        self.eval()
+
+        # Use defaults if not specified
+        if eta is None:
+            eta = self.default_eta
+        if omega is None:
+            omega = self.default_omega
+        if sample_steps is None:
+            sample_steps = self.default_sample_steps
+        if time_distortion is None:
+            time_distortion = self.default_sample_time_distortion
+
+        # Update rate matrix designer
+        self.rate_matrix_designer.eta = eta
+        self.rate_matrix_designer.omega = omega
+
+        # Handle noise type override for initialization
+        if noise_type_override is not None:
+            # Create temporary limit distribution with override
+            sampling_limit_dist = self._create_limit_distribution(noise_type_override)
+            # Temporarily swap rate_matrix_designer's limit_dist for consistent behavior
+            original_limit_dist = self.rate_matrix_designer.limit_dist
+            self.rate_matrix_designer.limit_dist = sampling_limit_dist
+        else:
+            sampling_limit_dist = self.limit_dist
+            original_limit_dist = None  # No swap needed
+
+        # Default to CPU for sampling (more stable, easier to debug)
+        device = device or torch.device("cpu")
+        self.to(device)
+        hdc_vectors = hdc_vectors.to(device).float()  # Ensure float32 for model compatibility
+        X = node_features.to(device).float()
+        node_mask = node_mask.to(device)
+
+        num_samples = hdc_vectors.size(0)
+        n_max = X.size(1)
+
+        # Sample initial noise for edges only (using possibly overridden limit dist)
+        e_limit = sampling_limit_dist.E.to(device)
+        e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+            num_samples, n_max, n_max, -1
+        )
+        prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
+        E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+        E_label = E_label_flat.reshape(num_samples, n_max, n_max)
+
+        # Make symmetric
+        E_label = torch.triu(E_label, diagonal=1)
+        E_label = E_label + E_label.transpose(1, 2)
+
+        # Convert to one-hot
+        E = F.one_hot(E_label, num_classes=self.num_edge_classes).float()
+
+        # Apply mask
+        edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
+        E = E * edge_mask.unsqueeze(-1).float()
+
+        # HDC vectors reduced through MLP as y
+        y = self.condition_mlp(hdc_vectors)
+
+        # Sampling loop - only updates edges
+        iterator = range(sample_steps)
+        if show_progress:
+            iterator = tqdm(iterator, desc="Sampling edges")
+
+        # Callback for initial state (t=0, noisy edges, no prediction yet)
+        if step_callback is not None:
+            step_callback(0, 0.0, X.clone(), E.clone(), node_mask, None)
+
+        for t_int in iterator:
+            t_norm = torch.tensor([t_int / sample_steps], device=device)
+            s_norm = torch.tensor([(t_int + 1) / sample_steps], device=device)
+
+            # Apply time distortion
+            t_norm = self.time_distorter.sample_ft(t_norm, time_distortion)
+            s_norm = self.time_distorter.sample_ft(s_norm, time_distortion)
+
+            # Expand to batch size
+            t = t_norm.expand(num_samples, 1)
+            s = s_norm.expand(num_samples, 1)
+
+            # Sample step - X stays fixed, only E changes
+            X, E, y, pred_E = self._sample_step(t, s, X, E, y, node_mask, deterministic)
+
+            # Callback after each step (includes model's prediction)
+            if step_callback is not None:
+                step_callback(t_int + 1, s_norm.item(), X.clone(), E.clone(), node_mask, pred_E.clone())
+
+        # Convert to PyG Data objects
+        n_nodes = node_mask.sum(dim=1).int()
+        samples = dense_to_pyg(X, E, torch.zeros_like(y[:, :0]), node_mask, n_nodes)
+
+        # Restore original limit_dist if it was overridden
+        if original_limit_dist is not None:
+            self.rate_matrix_designer.limit_dist = original_limit_dist
+
+        return samples
+
+    # =========================================================================
+    # HDC-Guided Sampling Methods
+    # =========================================================================
+
+    def _sample_k_candidates(
+        self,
+        pred_E: Tensor,
+        num_candidates: int,
+        node_mask: Tensor,
+    ) -> Tensor:
+        """
+        Sample K candidate edge matrices from predicted distribution.
+
+        Args:
+            pred_E: Predicted edge probabilities (bs, n, n, de)
+            num_candidates: Number of candidates K to sample
+            node_mask: Valid node mask (bs, n)
+
+        Returns:
+            Tensor of shape (K, bs, n, n) with edge class indices
+        """
+        bs, n, _, de = pred_E.shape
+        device = pred_E.device
+
+        candidates = []
+        for _ in range(num_candidates):
+            # Sample from the probability distribution
+            prob_flat = pred_E.reshape(-1, de)
+            E_label_flat = torch.multinomial(prob_flat, 1).squeeze(-1)
+            E_label = E_label_flat.reshape(bs, n, n)
+
+            # Make symmetric (upper triangular + transpose)
+            E_label = torch.triu(E_label, diagonal=1)
+            E_label = E_label + E_label.transpose(1, 2)
+
+            candidates.append(E_label)
+
+        # Stack to (K, bs, n, n)
+        return torch.stack(candidates, dim=0)
+
+    def _encode_candidates_to_order_n(
+        self,
+        candidates: Tensor,
+        original_node_features: Tensor,
+        node_mask: Tensor,
+        hypernet,
+    ) -> Tensor:
+        """
+        Encode each candidate graph to HDC order_N embedding.
+
+        Args:
+            candidates: Edge candidates (K, bs, n, n) class indices
+            original_node_features: Original 4-dim features for HyperNet (bs, n, 4)
+            node_mask: Valid node mask (bs, n)
+            hypernet: HyperNet encoder
+
+        Returns:
+            Tensor of shape (K, bs, hdc_dim) with order_N embeddings
+        """
+        K, bs, n, _ = candidates.shape
+        device = candidates.device
+
+        # Flatten K and bs dimensions for batched processing
+        # Shape: (K*bs, n, n)
+        candidates_flat = candidates.reshape(K * bs, n, n)
+
+        # Expand original_node_features to match: (K*bs, n, 4)
+        original_x_expanded = original_node_features.unsqueeze(0).expand(K, -1, -1, -1)
+        original_x_flat = original_x_expanded.reshape(K * bs, n, -1)
+
+        # Expand node_mask: (K*bs, n)
+        node_mask_expanded = node_mask.unsqueeze(0).expand(K, -1, -1)
+        node_mask_flat = node_mask_expanded.reshape(K * bs, n)
+
+        # Build Data objects for each candidate
+        data_list = []
+        for i in range(K * bs):
+            # Get valid nodes for this sample
+            valid_nodes = node_mask_flat[i]
+            num_valid = valid_nodes.sum().item()
+
+            if num_valid == 0:
+                # Empty graph - create dummy
+                data = Data(
+                    x=torch.zeros(1, original_x_flat.shape[-1], device=device),
+                    edge_index=torch.zeros(2, 0, dtype=torch.long, device=device),
+                )
+                data_list.append(data)
+                continue
+
+            # Get node features for valid nodes
+            x = original_x_flat[i, :num_valid]
+
+            # Get edge labels for valid nodes only
+            E_labels = candidates_flat[i, :num_valid, :num_valid]
+
+            # Build edge_index from non-zero edges (edge label > 0 means bond exists)
+            edge_mask = E_labels > 0
+            src, dst = torch.where(edge_mask)
+
+            if src.numel() == 0:
+                # No edges
+                edge_index = torch.zeros(2, 0, dtype=torch.long, device=device)
+            else:
+                edge_index = torch.stack([src, dst], dim=0)
+
+            data = Data(x=x, edge_index=edge_index)
+            data_list.append(data)
+
+        # Batch all data objects
+        batch = Batch.from_data_list(data_list)
+        batch = batch.to(device)
+
+        # Encode with HyperNet
+        with torch.no_grad():
+            # First encode node properties
+            batch = hypernet.encode_properties(batch)
+            # Ensure node_hv is on the correct device (codebooks might be on CPU)
+            if batch.node_hv.device != device:
+                batch.node_hv = batch.node_hv.to(device)
+
+            # Forward pass to get graph embeddings (order_N)
+            output = hypernet.forward(batch)
+            order_n = output["graph_embedding"]  # (K*bs, hdc_dim)
+
+        # Reshape back to (K, bs, hdc_dim)
+        hdc_dim = order_n.shape[-1]
+        order_n = order_n.reshape(K, bs, hdc_dim)
+
+        return order_n
+
+    def _select_best_candidate(
+        self,
+        candidate_hdcs: Tensor,
+        target_order_n: Tensor,
+        candidates: Tensor,
+    ) -> Tensor:
+        """
+        Select candidate with smallest cosine distance to target.
+
+        Args:
+            candidate_hdcs: Candidate order_N embeddings (K, bs, hdc_dim)
+            target_order_n: Target order_N (bs, hdc_dim)
+            candidates: Edge candidates (K, bs, n, n) class indices
+
+        Returns:
+            E_guide: Best candidate edges as one-hot (bs, n, n, de)
+        """
+        K, bs, hdc_dim = candidate_hdcs.shape
+        n = candidates.shape[2]
+        device = candidates.device
+
+        # Compute element-wise cosine similarity for each candidate
+        # candidate_hdcs: (K, bs, hdc_dim)
+        # target_order_n: (bs, hdc_dim)
+
+        # Normalize for cosine similarity
+        candidate_hdcs_norm = F.normalize(candidate_hdcs, dim=-1)  # (K, bs, hdc_dim)
+        target_norm = F.normalize(target_order_n, dim=-1)  # (bs, hdc_dim)
+
+        # Expand target for broadcasting: (1, bs, hdc_dim)
+        target_expanded = target_norm.unsqueeze(0)
+
+        # Element-wise dot product along hdc_dim: (K, bs)
+        similarities = (candidate_hdcs_norm * target_expanded).sum(dim=-1)
+
+        # Convert to distance (1 - similarity)
+        distances = 1.0 - similarities  # (K, bs)
+
+        # Find best candidate per batch sample (minimum distance)
+        best_indices = torch.argmin(distances, dim=0)  # (bs,)
+
+        # Gather best candidates: (bs, n, n)
+        # best_indices: (bs,) -> need to gather from candidates (K, bs, n, n)
+        best_edges = torch.zeros(bs, n, n, dtype=torch.long, device=device)
+        for b in range(bs):
+            best_edges[b] = candidates[best_indices[b].item(), b]
+
+        # Convert to one-hot
+        E_guide = F.one_hot(best_edges, num_classes=self.num_edge_classes).float()
+
+        return E_guide
+
+    def _compute_Rhdc(
+        self,
+        E_guide: Tensor,
+        E_t_label: Tensor,
+        Z_t_E: Tensor,
+        pt_at_Et: Tensor,
+        gamma: float,
+    ) -> Tensor:
+        """
+        Compute R^HDC rate matrix term.
+
+        Follows R^TG pattern:
+        R^HDC = (gamma / (Z_t_E * pt_at_Et)) * mask * E_guide_onehot
+
+        Where mask = 1 if E_guide != E_t, else 0
+
+        Args:
+            E_guide: Best candidate one-hot (bs, n, n, de)
+            E_t_label: Current state labels (bs, n, n)
+            Z_t_E: Normalization count (bs, n, n)
+            pt_at_Et: p(E_t | E_1) at current state (bs, n, n)
+            gamma: HDC guidance strength
+
+        Returns:
+            R_hdc: (bs, n, n, de) rate matrix contribution
+        """
+        if gamma == 0:
+            return torch.zeros_like(E_guide)
+
+        # Get E_guide labels
+        E_guide_label = torch.argmax(E_guide, dim=-1)  # (bs, n, n)
+
+        # Mask: only add guidance when E_guide != E_t
+        mask = (E_guide_label != E_t_label).float().unsqueeze(-1)  # (bs, n, n, 1)
+
+        # Denominator: Z_t_E * pt_at_Et
+        denom = (Z_t_E * pt_at_Et).unsqueeze(-1)  # (bs, n, n, 1)
+
+        # R^HDC = gamma * E_guide * mask / denom
+        R_hdc = (gamma * E_guide * mask) / (denom + 1e-8)
+
+        return R_hdc
+
+    def _compute_dfm_variables_for_edges(
+        self,
+        t: Tensor,
+        E_t_label: Tensor,
+        E_1_sampled: Tensor,
+    ) -> Dict[str, Tensor]:
+        """
+        Compute discrete flow matching variables for edges.
+
+        This replicates the logic from RateMatrixDesigner._compute_dfm_variables
+        but only for edges, to get Z_t_E and pt_at_Et for R^HDC computation.
+
+        Args:
+            t: Current time (bs, 1)
+            E_t_label: Current edge labels (bs, n, n)
+            E_1_sampled: Sampled clean edge labels (bs, n, n)
+
+        Returns:
+            Dict with pt_vals_at_Et and Z_t_E
+        """
+        device = E_t_label.device
+        bs = E_t_label.shape[0]
+
+        # Get limit distribution
+        limit_E = self.limit_dist.E.to(device)
+        de = len(limit_E)
+
+        # p(E_t | E_1) = t * delta(E_1) + (1-t) * p_0
+        t_time = t.squeeze(-1)[:, None, None, None]  # (bs, 1, 1, 1)
+
+        E1_onehot = F.one_hot(E_1_sampled, num_classes=de).float()  # (bs, n, n, de)
+
+        pt_E = t_time * E1_onehot + (1 - t_time) * limit_E[None, None, None, :]
+        pt_E = pt_E.clamp(0, 1)
+
+        # Gather at current state
+        E_t_label_expanded = E_t_label.unsqueeze(-1)  # (bs, n, n, 1)
+        pt_at_Et = pt_E.gather(-1, E_t_label_expanded).squeeze(-1)  # (bs, n, n)
+
+        # Count non-zero probabilities
+        Z_t_E = (pt_E > 0).sum(dim=-1).float()  # (bs, n, n)
+
+        return {
+            "pt_vals_at_Et": pt_at_Et,
+            "Z_t_E": Z_t_E,
+        }
+
+    @torch.no_grad()
+    def sample_with_hdc_guidance(
+        self,
+        hdc_vectors: Tensor,
+        node_features: Tensor,
+        node_mask: Tensor,
+        original_node_features: Tensor,
+        hypernet,
+        gamma: float = 1.0,
+        num_candidates: int = 4,
+        eta: Optional[float] = None,
+        omega: Optional[float] = None,
+        sample_steps: Optional[int] = None,
+        time_distortion: Optional[str] = None,
+        noise_type_override: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        show_progress: bool = True,
+    ) -> List[Data]:
+        """
+        Generate edges with HDC-guided sampling.
+
+        At each timestep:
+        1. Sample K candidates from pred_E (model's clean graph estimate)
+        2. Encode each candidate with HyperNet to get order_N
+        3. Select candidate with smallest cosine distance to target order_N
+        4. Add R^HDC term to rate matrix (analogous to R^TG with omega)
+
+        Args:
+            hdc_vectors: Full HDC vectors [order_0 | order_N] (num_samples, hdc_dim)
+            node_features: Fixed node types one-hot (num_samples, max_n, num_node_classes)
+            node_mask: Valid node mask (num_samples, max_n)
+            original_node_features: Original node features for HyperNet (num_samples, max_n, feat_dim)
+            hypernet: HyperNet encoder for candidate evaluation
+            gamma: HDC guidance strength (default: 1.0)
+            num_candidates: Number of candidates K to sample (default: 4)
+            eta: Stochasticity parameter (None = use default)
+            omega: Target guidance strength (None = use default)
+            sample_steps: Number of denoising steps (None = use default)
+            time_distortion: Time distortion type (None = use default)
+            noise_type_override: Override noise type for initialization
             device: Device to run on
             show_progress: Whether to show progress bar
 
@@ -770,17 +1413,35 @@ class FlowEdgeDecoder(pl.LightningModule):
         self.rate_matrix_designer.eta = eta
         self.rate_matrix_designer.omega = omega
 
-        # Move to device
-        device = device or self.device
-        hdc_vectors = hdc_vectors.to(device)
+        # Handle noise type override
+        if noise_type_override is not None:
+            sampling_limit_dist = self._create_limit_distribution(noise_type_override)
+            original_limit_dist = self.rate_matrix_designer.limit_dist
+            self.rate_matrix_designer.limit_dist = sampling_limit_dist
+        else:
+            sampling_limit_dist = self.limit_dist
+            original_limit_dist = None
+
+        # Setup device
+        device = device or torch.device("cpu")
+        self.to(device)
+        hypernet = hypernet.to(device)
+        hypernet.eval()
+
+        hdc_vectors = hdc_vectors.to(device).float()
         X = node_features.to(device).float()
         node_mask = node_mask.to(device)
+        original_node_features = original_node_features.to(device).float()
 
         num_samples = hdc_vectors.size(0)
         n_max = X.size(1)
 
-        # Sample initial noise for edges only
-        e_limit = self.limit_dist.E.to(device)
+        # Extract target order_N (second half of HDC vector)
+        hdc_dim = hdc_vectors.shape[-1]
+        target_order_n = hdc_vectors[:, hdc_dim // 2:]  # (num_samples, hdc_dim//2)
+
+        # Sample initial noise for edges
+        e_limit = sampling_limit_dist.E.to(device)
         e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
             num_samples, n_max, n_max, -1
         )
@@ -799,13 +1460,257 @@ class FlowEdgeDecoder(pl.LightningModule):
         edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
         E = E * edge_mask.unsqueeze(-1).float()
 
-        # HDC vectors as y
-        y = hdc_vectors
+        # HDC vectors reduced through MLP as y
+        y = self.condition_mlp(hdc_vectors)
 
-        # Sampling loop - only updates edges
+        # Sampling loop
         iterator = range(sample_steps)
         if show_progress:
-            iterator = tqdm(iterator, desc="Sampling edges")
+            iterator = tqdm(iterator, desc="HDC-guided sampling")
+
+        for t_int in iterator:
+            t_norm = torch.tensor([t_int / sample_steps], device=device)
+            s_norm = torch.tensor([(t_int + 1) / sample_steps], device=device)
+
+            # Apply time distortion
+            t_norm = self.time_distorter.sample_ft(t_norm, time_distortion)
+            s_norm = self.time_distorter.sample_ft(s_norm, time_distortion)
+
+            # Expand to batch size
+            t = t_norm.expand(num_samples, 1)
+            s = s_norm.expand(num_samples, 1)
+            dt = (s - t)[0]
+
+            # Prepare noisy data dict
+            noisy_data = {
+                "t": t,
+                "X_t": X,
+                "E_t": E,
+                "y_t": y,
+                "node_mask": node_mask,
+            }
+
+            # Compute extra features
+            extra_data = self._compute_extra_data(noisy_data)
+
+            # Forward pass
+            pred = self.forward(noisy_data, extra_data, node_mask)
+
+            # Get predictions as probability distributions
+            pred_X = F.softmax(pred.X, dim=-1)
+            pred_E = F.softmax(pred.E, dim=-1)
+
+            # === HDC Guidance ===
+            # 1. Sample K candidates from pred_E
+            candidates = self._sample_k_candidates(pred_E, num_candidates, node_mask)
+
+            # 2. Encode each candidate with HyperNet
+            candidate_hdcs = self._encode_candidates_to_order_n(
+                candidates, original_node_features, node_mask, hypernet
+            )
+
+            # 3. Select best candidate
+            E_guide = self._select_best_candidate(
+                candidate_hdcs, target_order_n, candidates
+            )
+
+            # === Compute Rate Matrices ===
+            E_t_label = torch.argmax(E, dim=-1)
+
+            # Standard rate matrix (R* + R^DB + R^TG)
+            R_t_X, R_t_E = self.rate_matrix_designer.compute_rate_matrices(
+                t, node_mask, X, E, pred_X, pred_E
+            )
+
+            # Sample E_1 for dfm variables (needed for R^HDC denominator)
+            prob_E_flat_sample = pred_E.reshape(-1, self.num_edge_classes)
+            E_1_sampled_flat = torch.multinomial(prob_E_flat_sample, 1).squeeze(-1)
+            E_1_sampled = E_1_sampled_flat.reshape(num_samples, n_max, n_max)
+
+            # Compute dfm variables for R^HDC
+            dfm_vars = self._compute_dfm_variables_for_edges(t, E_t_label, E_1_sampled)
+
+            # 4. Add R^HDC term
+            R_hdc = self._compute_Rhdc(
+                E_guide,
+                E_t_label,
+                dfm_vars["Z_t_E"],
+                dfm_vars["pt_vals_at_Et"],
+                gamma,
+            )
+            R_t_E = R_t_E + R_hdc
+
+            # === Sample Next State ===
+            # Compute step probabilities
+            step_probs_E = R_t_E * dt.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+            # Add diagonal (stay probability)
+            step_probs_E.scatter_(
+                -1,
+                E_t_label.unsqueeze(-1),
+                0.0,
+            )
+            stay_prob = 1.0 - step_probs_E.sum(dim=-1, keepdim=True).clamp(min=0)
+            step_probs_E.scatter_(
+                -1,
+                E_t_label.unsqueeze(-1),
+                stay_prob,
+            )
+
+            # Clamp to valid probabilities
+            step_probs_E = step_probs_E.clamp(min=0)
+            step_probs_E = step_probs_E / step_probs_E.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # At final step, use predicted marginals directly
+            if s[0].item() >= 1.0 - 1e-6:
+                step_probs_E = pred_E
+
+            # Sample next edge state
+            prob_E_flat = step_probs_E.reshape(-1, self.num_edge_classes)
+            E_s_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+            E_s_label = E_s_label_flat.reshape(num_samples, n_max, n_max)
+
+            # Make symmetric
+            E_s_label = torch.triu(E_s_label, diagonal=1)
+            E_s_label = E_s_label + E_s_label.transpose(1, 2)
+
+            # Convert to one-hot
+            E = F.one_hot(E_s_label, num_classes=self.num_edge_classes).float()
+
+            # Apply mask
+            E = E * edge_mask.unsqueeze(-1).float()
+
+        # Convert to PyG Data objects
+        n_nodes = node_mask.sum(dim=1).int()
+        samples = dense_to_pyg(X, E, torch.zeros_like(y[:, :0]), node_mask, n_nodes)
+
+        # Restore original limit_dist if overridden
+        if original_limit_dist is not None:
+            self.rate_matrix_designer.limit_dist = original_limit_dist
+
+        return samples
+
+    @torch.no_grad()
+    def sample_with_hdc(
+        self,
+        hdc_vectors: Tensor,
+        node_features: Tensor,
+        node_mask: Tensor,
+        original_node_features: Tensor,
+        hypernet,
+        distance_threshold: float = 0.001,
+        eta: Optional[float] = None,
+        omega: Optional[float] = None,
+        sample_steps: Optional[int] = None,
+        time_distortion: Optional[str] = None,
+        noise_type_override: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        show_progress: bool = True,
+    ) -> List[Data]:
+        """
+        Generate edges with HDC distance tracking and early stopping.
+
+        At each timestep:
+        1. Get model prediction and compute deterministic argmax edges
+        2. Encode with HyperNet to get order_N
+        3. Compute cosine distance to target order_N
+        4. Track best match per sample (lowest distance seen)
+        5. Early stop if all samples are below distance_threshold
+
+        Returns the best-seen edges (not final edges) for each sample.
+
+        Args:
+            hdc_vectors: Full HDC vectors [order_0 | order_N] (num_samples, hdc_dim)
+            node_features: Fixed node types one-hot (num_samples, max_n, num_node_classes)
+            node_mask: Valid node mask (num_samples, max_n)
+            original_node_features: Original node features for HyperNet (num_samples, max_n, feat_dim)
+            hypernet: HyperNet encoder for candidate evaluation
+            distance_threshold: Cosine distance threshold for early stopping (default: 0.001)
+            eta: Stochasticity parameter (None = use default)
+            omega: Target guidance strength (None = use default)
+            sample_steps: Number of denoising steps (None = use default)
+            time_distortion: Time distortion type (None = use default)
+            noise_type_override: Override noise type for initialization
+            device: Device to run on
+            show_progress: Whether to show progress bar
+
+        Returns:
+            List of PyG Data objects with best-match edges
+        """
+        self.eval()
+
+        # Use defaults if not specified
+        if eta is None:
+            eta = self.default_eta
+        if omega is None:
+            omega = self.default_omega
+        if sample_steps is None:
+            sample_steps = self.default_sample_steps
+        if time_distortion is None:
+            time_distortion = self.default_sample_time_distortion
+
+        # Update rate matrix designer
+        self.rate_matrix_designer.eta = eta
+        self.rate_matrix_designer.omega = omega
+
+        # Handle noise type override
+        if noise_type_override is not None:
+            sampling_limit_dist = self._create_limit_distribution(noise_type_override)
+            original_limit_dist = self.rate_matrix_designer.limit_dist
+            self.rate_matrix_designer.limit_dist = sampling_limit_dist
+        else:
+            sampling_limit_dist = self.limit_dist
+            original_limit_dist = None
+
+        # Setup device
+        device = device or torch.device("cpu")
+        self.to(device)
+        hypernet = hypernet.to(device)
+        hypernet.eval()
+
+        hdc_vectors = hdc_vectors.to(device).float()
+        X = node_features.to(device).float()
+        node_mask = node_mask.to(device)
+        original_node_features = original_node_features.to(device).float()
+
+        num_samples = hdc_vectors.size(0)
+        n_max = X.size(1)
+
+        # Extract target order_N (second half of HDC vector)
+        hdc_dim = hdc_vectors.shape[-1]
+        target_order_n = hdc_vectors[:, hdc_dim // 2:]  # (num_samples, hdc_dim//2)
+
+        # Initialize best tracking
+        best_E = None  # Will store (bs, n, n) edge labels
+        best_distances = torch.full((num_samples,), float('inf'), device=device)
+
+        # Sample initial noise for edges
+        e_limit = sampling_limit_dist.E.to(device)
+        e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+            num_samples, n_max, n_max, -1
+        )
+        prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
+        E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+        E_label = E_label_flat.reshape(num_samples, n_max, n_max)
+
+        # Make symmetric
+        E_label = torch.triu(E_label, diagonal=1)
+        E_label = E_label + E_label.transpose(1, 2)
+
+        # Convert to one-hot
+        E = F.one_hot(E_label, num_classes=self.num_edge_classes).float()
+
+        # Apply mask
+        edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
+        E = E * edge_mask.unsqueeze(-1).float()
+
+        # HDC vectors reduced through MLP as y
+        y = self.condition_mlp(hdc_vectors)
+
+        # Sampling loop
+        iterator = range(sample_steps)
+        if show_progress:
+            iterator = tqdm(iterator, desc="HDC sampling with early stop")
 
         for t_int in iterator:
             t_norm = torch.tensor([t_int / sample_steps], device=device)
@@ -819,12 +1724,88 @@ class FlowEdgeDecoder(pl.LightningModule):
             t = t_norm.expand(num_samples, 1)
             s = s_norm.expand(num_samples, 1)
 
-            # Sample step - X stays fixed, only E changes
-            X, E, y = self._sample_step(t, s, X, E, y, node_mask)
+            # Prepare noisy data dict
+            noisy_data = {
+                "t": t,
+                "X_t": X,
+                "E_t": E,
+                "y_t": y,
+                "node_mask": node_mask,
+            }
 
-        # Convert to PyG Data objects
+            # Compute extra features
+            extra_data = self._compute_extra_data(noisy_data)
+
+            # Forward pass
+            pred = self.forward(noisy_data, extra_data, node_mask)
+
+            # Get predictions as probability distributions
+            pred_X = F.softmax(pred.X, dim=-1)
+            pred_E = F.softmax(pred.E, dim=-1)
+
+            # === HDC Distance Check ===
+            # Get deterministic prediction via argmax
+            E_pred_label = torch.argmax(pred_E, dim=-1)  # (bs, n, n)
+
+            # Make symmetric
+            E_pred_label = torch.triu(E_pred_label, diagonal=1)
+            E_pred_label = E_pred_label + E_pred_label.transpose(1, 2)
+
+            # Encode with HyperNet (reuse existing helper with K=1)
+            pred_order_n = self._encode_candidates_to_order_n(
+                E_pred_label.unsqueeze(0), original_node_features, node_mask, hypernet
+            ).squeeze(0)  # (bs, hdc_dim)
+
+            # Compute cosine distance
+            pred_norm = F.normalize(pred_order_n, dim=-1)
+            target_norm = F.normalize(target_order_n, dim=-1)
+            distances = 1.0 - (pred_norm * target_norm).sum(dim=-1)  # (bs,)
+
+            # Update best for samples where this is better
+            improved = distances < best_distances
+            if improved.any():
+                if best_E is None:
+                    best_E = E_pred_label.clone()
+                best_E[improved] = E_pred_label[improved]
+                best_distances[improved] = distances[improved]
+
+            # Early stopping check
+            if (best_distances < distance_threshold).all():
+                if show_progress:
+                    print(f"\nEarly stop at step {t_int + 1}/{sample_steps}, "
+                          f"max distance: {best_distances.max().item():.6f}")
+                break
+
+            # === Standard Sampling Step (no R^HDC) ===
+            # Use _sample_step which handles everything except HDC guidance
+            X, E, y, _ = self._sample_step(t, s, X, E, y, node_mask)
+
+        # Determine which samples found a good match (below threshold)
+        found_good_match = best_distances < distance_threshold
+
+        # Get final sampled state labels
+        final_E_label = torch.argmax(E, dim=-1)
+
+        # Combine results:
+        # - For samples that found good match: use best_E (best prediction by HDC distance)
+        # - For samples that didn't: use final sampled state
+        if best_E is None:
+            # No improvements found at all - use final state for everything
+            result_E = final_E_label
+        else:
+            result_E = best_E.clone()
+            # Override with final sampled state for samples that didn't find good match
+            result_E[~found_good_match] = final_E_label[~found_good_match]
+
+        # Convert to one-hot and then to PyG Data
+        result_E_onehot = F.one_hot(result_E, num_classes=self.num_edge_classes).float()
+        result_E_onehot = result_E_onehot * edge_mask.unsqueeze(-1).float()
         n_nodes = node_mask.sum(dim=1).int()
-        samples = dense_to_pyg(X, E, torch.zeros_like(y[:, :0]), node_mask, n_nodes)
+        samples = dense_to_pyg(X, result_E_onehot, torch.zeros_like(y[:, :0]), node_mask, n_nodes)
+
+        # Restore original limit_dist if overridden
+        if original_limit_dist is not None:
+            self.rate_matrix_designer.limit_dist = original_limit_dist
 
         return samples
 
@@ -877,25 +1858,6 @@ class FlowEdgeDecoder(pl.LightningModule):
 # Preprocessing Functions
 # =============================================================================
 
-def map_atom_type_to_7class(atom_idx: int, dataset: str) -> int:
-    """
-    Map dataset-specific atom type index to 7-class encoding.
-
-    Args:
-        atom_idx: Atom type index from dataset
-        dataset: Dataset name ("qm9" or "zinc")
-
-    Returns:
-        7-class atom index, or -1 if unsupported
-    """
-    if dataset.lower() == "qm9":
-        return QM9_TO_7CLASS.get(atom_idx, -1)
-    elif dataset.lower() == "zinc":
-        return ZINC_TO_7CLASS.get(atom_idx, -1)
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
-
-
 def get_bond_type_idx(bond) -> int:
     """Convert RDKit bond to 5-class index."""
     if bond is None:
@@ -906,25 +1868,26 @@ def get_bond_type_idx(bond) -> int:
 def preprocess_for_flow_edge_decoder(
     data: Data,
     hypernet,
-    dataset: str,
     device: torch.device = None,
 ) -> Optional[Data]:
     """
-    Preprocess a PyG Data object for FlowEdgeDecoder training.
+    Preprocess a PyG Data object for FlowEdgeDecoder training (ZINC only).
 
     Adds/replaces:
-    - x: 7-class atom type one-hot encoding
+    - x: 24-dim one-hot encoding (atom_type, degree, charge, Hs, ring)
     - edge_attr: 5-class bond type one-hot encoding
     - hdc_vector: Pre-computed HDC embedding
+    - original_x: Raw feature indices for HDC-guided sampling
 
     Args:
-        data: Original PyG Data object
+        data: Original PyG Data object with ZINC features
+              data.x should have shape (n, 5) with columns:
+              [atom_type, degree, charge, num_hs, is_in_ring]
         hypernet: HyperNet encoder for computing HDC embeddings
-        dataset: Dataset name ("qm9" or "zinc")
         device: Device for HDC computation
 
     Returns:
-        Preprocessed Data object, or None if molecule has unsupported atoms or no edges
+        Preprocessed Data object, or None if molecule has no edges
     """
     device = device or torch.device("cpu")
 
@@ -932,30 +1895,19 @@ def preprocess_for_flow_edge_decoder(
     if data.edge_index.numel() == 0:
         return None
 
-    # 1. Map atom types to 7-class encoding
-    atom_types = data.x[:, 0].int()  # First column is atom type
-    atom_types_7class = []
-
-    for t in atom_types:
-        mapped = map_atom_type_to_7class(int(t), dataset)
-        if mapped == -1:
-            return None  # Skip molecules with unsupported atoms
-        atom_types_7class.append(mapped)
-
-    atom_types_7class = torch.tensor(atom_types_7class, dtype=torch.long)
-    x_7class = F.one_hot(atom_types_7class, num_classes=NUM_ATOM_CLASSES).float()
+    # 1. Convert raw features to 24-dim one-hot encoding
+    # data.x has shape (n, 5): [atom_type, degree, charge, num_hs, is_in_ring]
+    x_onehot = raw_features_to_onehot(data.x)
 
     # 2. Create 5-class edge attributes from SMILES
     mol = Chem.MolFromSmiles(data.smiles)
     if mol is None:
         return None
 
-    n_atoms = len(atom_types)
+    edge_index = data.edge_index
 
     # Build adjacency with bond types
     edge_attr_list = []
-    edge_index = data.edge_index
-
     for i in range(edge_index.size(1)):
         src, dst = edge_index[0, i].item(), edge_index[1, i].item()
         bond = mol.GetBondBetweenAtoms(src, dst)
@@ -965,30 +1917,37 @@ def preprocess_for_flow_edge_decoder(
     edge_attr = torch.tensor(edge_attr_list, dtype=torch.long)
     edge_attr_onehot = F.one_hot(edge_attr, num_classes=NUM_EDGE_CLASSES).float()
 
-    # 3. Compute HDC embedding
+    # 3. Compute HDC embedding: concatenate order-0 and order-N
     data_for_hdc = data.clone().to(device)
     # Add batch attribute for single graph (required by HyperNet)
     if data_for_hdc.batch is None:
         data_for_hdc.batch = torch.zeros(data_for_hdc.x.size(0), dtype=torch.long, device=device)
     with torch.no_grad():
+        # First encode node properties to get node hypervectors
+        data_for_hdc = hypernet.encode_properties(data_for_hdc)
+
+        # Order-0: Bundle node hypervectors directly (no message passing)
+        order_zero = scatter_hd(src=data_for_hdc.node_hv, index=data_for_hdc.batch, op="bundle")
+
+        # Order-N: Full graph embedding with message passing
         hdc_out = hypernet.forward(data_for_hdc)
-        # Use graph_embedding (combined edge + graph terms)
-        if "graph_embedding" in hdc_out:
-            hdc_vector = hdc_out["graph_embedding"].squeeze(0).cpu()
-        else:
-            # Fallback: concatenate edge_terms and graph_terms
-            edge_terms = hdc_out.get("edge_terms", torch.zeros(hypernet.hv_dim))
-            graph_terms = hdc_out.get("graph_terms", torch.zeros(hypernet.hv_dim))
-            hdc_vector = torch.cat([edge_terms, graph_terms], dim=-1).squeeze(0).cpu()
+        order_n = hdc_out["graph_embedding"]
+
+        # Concatenate [order_0 | order_N]
+        hdc_concat = torch.cat([order_zero, order_n], dim=-1).cpu().float()
+        # Convert from HRRTensor subclass to regular tensor
+        hdc_vector = torch.Tensor(hdc_concat.tolist())
+        if hdc_vector.dim() == 1:
+            hdc_vector = hdc_vector.unsqueeze(0)  # Ensure (1, 2*hdc_dim) for proper batching
 
     # 4. Create new Data object
     new_data = Data(
-        x=x_7class,
+        x=x_onehot,  # 24-dim one-hot
         edge_index=edge_index.clone(),
         edge_attr=edge_attr_onehot,
         hdc_vector=hdc_vector,
         smiles=data.smiles,
-        # Keep original data for reference
+        # Keep original raw features for HDC-guided sampling
         original_x=data.x.clone(),
     )
 
@@ -1004,22 +1963,20 @@ def preprocess_for_flow_edge_decoder(
 def preprocess_dataset(
     dataset,
     hypernet,
-    dataset_name: str,
     device: torch.device = None,
     show_progress: bool = True,
 ) -> List[Data]:
     """
-    Preprocess entire dataset for FlowEdgeDecoder.
+    Preprocess entire dataset for FlowEdgeDecoder (ZINC only).
 
     Args:
-        dataset: PyG dataset or list of Data objects
+        dataset: PyG dataset or list of Data objects (ZINC format)
         hypernet: HyperNet encoder
-        dataset_name: Dataset name ("qm9" or "zinc")
         device: Device for HDC computation
         show_progress: Whether to show progress bar
 
     Returns:
-        List of preprocessed Data objects
+        List of preprocessed Data objects with 24-dim node features
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hypernet = hypernet.to(device)
@@ -1028,12 +1985,10 @@ def preprocess_dataset(
     processed = []
     iterator = dataset
     if show_progress:
-        iterator = tqdm(iterator, desc=f"Preprocessing {dataset_name}")
+        iterator = tqdm(iterator, desc="Preprocessing ZINC")
 
     for data in iterator:
-        new_data = preprocess_for_flow_edge_decoder(
-            data, hypernet, dataset_name, device
-        )
+        new_data = preprocess_for_flow_edge_decoder(data, hypernet, device)
         if new_data is not None:
             processed.append(new_data)
 
