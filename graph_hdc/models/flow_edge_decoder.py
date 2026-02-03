@@ -565,6 +565,9 @@ class FlowEdgeDecoder(pl.LightningModule):
             limit_dist=self.limit_dist,
         )
 
+        # Container for batch metrics (used by TrainingMetricsCallback)
+        self.batch_metrics: Dict[str, Tensor] = {}
+
     def _create_limit_distribution(
         self,
         noise_type: str,
@@ -784,6 +787,17 @@ class FlowEdgeDecoder(pl.LightningModule):
 
         # Log detached loss to allow deepcopy in checkpoint callback
         self.log("train/loss", loss.detach(), prog_bar=True, batch_size=batch.num_graphs)
+
+        # Store batch metrics for TrainingMetricsCallback
+        # These are used for detailed analysis (confusion matrix, timestep-binned loss, etc.)
+        self.batch_metrics = {
+            "t": noisy_data["t"].detach(),  # (bs,) or (bs, 1) timesteps
+            "pred_classes": pred.E.argmax(dim=-1).detach(),  # (bs, n, n) predicted edge classes
+            "true_classes": E.argmax(dim=-1).detach(),  # (bs, n, n) ground truth edge classes
+            "node_mask": node_mask.detach(),  # (bs, n) valid node mask
+            "loss": loss.detach(),  # scalar loss for this batch
+        }
+
         return {"loss": loss}
 
     def validation_step(

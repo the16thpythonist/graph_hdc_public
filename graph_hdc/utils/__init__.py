@@ -14,6 +14,7 @@ from graph_hdc.utils.experiment_helpers import (
     GracefulInterruptHandler,
     LossTrackingCallback,
     ReconstructionVisualizationCallback,
+    TrainingMetricsCallback,
     compute_tanimoto_similarity,
     create_hdc_config,
     create_reconstruction_plot,
@@ -53,5 +54,6 @@ __all__ = [
     "compute_tanimoto_similarity",
     "LossTrackingCallback",
     "ReconstructionVisualizationCallback",
+    "TrainingMetricsCallback",
     "GracefulInterruptHandler",
 ]

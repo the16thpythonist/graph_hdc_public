@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import math
 import signal
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+import numpy as np
 
 import matplotlib.pyplot as plt
 import pytorch_lightning as pl
@@ -33,10 +35,12 @@ from graph_hdc.hypernet.configs import (
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.hypernet.feature_encoders import CombinatoricIntegerEncoder
 from graph_hdc.hypernet.types import VSAModel
+from graph_hdc.datasets.zinc_smiles import mol_to_data as zinc_mol_to_data
 from graph_hdc.models.flow_edge_decoder import (
     ZINC_ATOM_TYPES,
     NUM_ATOM_CLASSES,
 )
+from graph_hdc.utils.helpers import scatter_hd
 
 if TYPE_CHECKING:
     from pycomex.functional.experiment import Experiment
@@ -505,6 +509,7 @@ class ReconstructionVisualizationCallback(Callback):
         eta: float,
         omega: float,
         time_distortion: str,
+        hypernet: Optional[HyperNet] = None,
     ):
         """
         Initialize the visualization callback.
@@ -516,6 +521,7 @@ class ReconstructionVisualizationCallback(Callback):
             eta: Stochasticity parameter
             omega: Target guidance strength
             time_distortion: Time distortion type
+            hypernet: Optional HyperNet encoder for computing HDC cosine distance
         """
         super().__init__()
         self.experiment = experiment
@@ -524,6 +530,7 @@ class ReconstructionVisualizationCallback(Callback):
         self.eta = eta
         self.omega = omega
         self.time_distortion = time_distortion
+        self.hypernet = hypernet
 
     def on_validation_epoch_end(
         self,
@@ -604,6 +611,45 @@ class ReconstructionVisualizationCallback(Callback):
 
         avg_similarity = sum(similarities) / len(similarities) if similarities else 0.0
 
+        # Compute HDC cosine distances if hypernet is available
+        hdc_cosine_distances = []
+        if self.hypernet is not None:
+            hdc_device = torch.device(self.hypernet.device)
+            for i, (orig_data, recon_mol) in enumerate(zip(self.vis_samples, reconstructed_mols)):
+                if recon_mol is None:
+                    hdc_cosine_distances.append(0.0)
+                    continue
+                try:
+                    recon_data = zinc_mol_to_data(recon_mol).to(hdc_device)
+                    recon_data.batch = torch.zeros(
+                        recon_data.x.size(0), dtype=torch.long, device=hdc_device
+                    )
+                    with torch.no_grad():
+                        recon_out = self.hypernet.forward(recon_data, normalize=True)
+                    recon_emb = recon_out["graph_embedding"]  # (1, hdc_dim)
+
+                    # Extract original order_N from the stored hdc_vector
+                    hdc_vec = orig_data.hdc_vector
+                    if hdc_vec.dim() == 2:
+                        hdc_vec = hdc_vec.squeeze(0)
+                    hdc_dim = hdc_vec.size(-1) // 2
+                    orig_order_n = hdc_vec[hdc_dim:].unsqueeze(0).to(hdc_device)
+
+                    cos_sim = torch.nn.functional.cosine_similarity(
+                        orig_order_n.float(), recon_emb.float(), dim=-1
+                    ).item()
+                    hdc_cosine_distances.append(cos_sim)
+                except Exception:
+                    hdc_cosine_distances.append(0.0)
+
+            avg_hdc_cosine = (
+                sum(hdc_cosine_distances) / len(hdc_cosine_distances)
+                if hdc_cosine_distances
+                else 0.0
+            )
+        else:
+            avg_hdc_cosine = None
+
         # Create 2xN visualization figure
         n_samples = len(self.vis_samples)
         fig, axes = plt.subplots(2, n_samples, figsize=(3 * n_samples, 6))
@@ -635,19 +681,24 @@ class ReconstructionVisualizationCallback(Callback):
                     recon_smiles = "Invalid"
 
             truncated_recon = recon_smiles[:20] + ("..." if len(recon_smiles) > 20 else "")
-            axes[1, i].set_title(
-                f"Recon (Tan={similarities[i]:.3f})\n{truncated_recon}",
-                fontsize=8,
-            )
+            label = f"Recon (Tan={similarities[i]:.3f}"
+            if hdc_cosine_distances:
+                label += f", HDC={hdc_cosine_distances[i]:.3f}"
+            label += f")\n{truncated_recon}"
+            axes[1, i].set_title(label, fontsize=8)
 
-        fig.suptitle(
-            f"Validation Reconstructions (Epoch {trainer.current_epoch}, Avg Tanimoto: {avg_similarity:.3f})"
-        )
+        title = f"Validation Reconstructions (Epoch {trainer.current_epoch}, Avg Tanimoto: {avg_similarity:.3f}"
+        if avg_hdc_cosine is not None:
+            title += f", Avg HDC Cos: {avg_hdc_cosine:.3f}"
+        title += ")"
+        fig.suptitle(title)
         plt.tight_layout()
 
         # Track figure and metric with PyComex
         self.experiment.track("validation_reconstructions", fig)
         self.experiment.track("tanimoto_similarity", avg_similarity)
+        if avg_hdc_cosine is not None:
+            self.experiment.track("hdc_cosine_similarity", avg_hdc_cosine)
 
         plt.close(fig)
 
@@ -708,3 +759,802 @@ class GracefulInterruptHandler:
         signal.signal(signal.SIGINT, self.original_handler)
         # Don't suppress exceptions
         return False
+
+
+# ========= Training Metrics Callback =========
+
+
+# Edge class labels for plotting
+EDGE_CLASS_LABELS = ["None", "Single", "Double", "Triple", "Aromatic"]
+
+# Module group prefixes for gradient tracking
+MODULE_GROUPS = {
+    "HDC Cond.": "condition_mlp",
+    "Time Emb.": "time_mlp",
+    "Transformer": "model",
+}
+
+
+class TrainingMetricsCallback(Callback):
+    """
+    Track and visualize comprehensive training metrics in a 4x4 grid.
+
+    Generates plots for:
+    - Row 1: Loss curves, per-class loss, learning rate, timestep-binned loss
+    - Row 2: Edge distribution, per-class accuracy, confusion matrix, loss ratio
+    - Row 3: Gradient norms (global, by module, HDC, variance)
+    - Row 4: Parameter changes, weight norms, convergence metrics
+
+    The callback reads batch metrics from the model's `batch_metrics` attribute,
+    which should be populated by the model's training_step.
+    """
+
+    def __init__(
+        self,
+        experiment: "Experiment",
+        num_timestep_bins: int = 10,
+        num_edge_classes: int = 5,
+        smoothing_window: int = 10,
+    ):
+        """
+        Initialize the training metrics callback.
+
+        Args:
+            experiment: PyComex Experiment instance for tracking
+            num_timestep_bins: Number of bins for timestep analysis
+            num_edge_classes: Number of edge classes (default 5)
+            smoothing_window: Window size for loss smoothing
+        """
+        super().__init__()
+        self.experiment = experiment
+        self.num_timestep_bins = num_timestep_bins
+        self.num_edge_classes = num_edge_classes
+        self.smoothing_window = smoothing_window
+
+        # Initialize storage for metrics
+        self._init_metric_storage()
+
+    def _init_metric_storage(self):
+        """Initialize all metric storage containers."""
+        # Row 1: Loss metrics
+        self.train_losses: List[float] = []
+        self.val_losses: List[float] = []
+        self.class_losses: List[List[float]] = []  # Per-epoch, per-class
+        self.learning_rates: List[float] = []
+        self.timestep_losses: List[List[float]] = []  # Per-epoch, per-bin
+
+        # Row 2: Edge prediction metrics
+        self.pred_edge_counts: List[np.ndarray] = []
+        self.gt_edge_counts: List[np.ndarray] = []
+        self.class_accuracies: List[List[float]] = []
+        self.confusion_matrices: List[np.ndarray] = []
+
+        # Row 3: Gradient metrics
+        self.global_grad_norms: List[float] = []
+        self.module_grad_norms: List[Dict[str, float]] = []
+        self.hdc_grad_norms: List[float] = []
+        self.grad_norm_variances: List[float] = []
+
+        # Row 4: Convergence metrics
+        self.param_deltas: List[float] = []
+        self.weight_norms: List[Dict[str, float]] = []
+        self.module_param_deltas: List[Dict[str, float]] = []
+        self.loss_improvements: List[float] = []
+
+        # Within-epoch accumulators (reset each epoch)
+        self._reset_epoch_accumulators()
+
+        # Parameter snapshot for delta computation
+        self._param_snapshot: Optional[Dict[str, Tensor]] = None
+
+    def _reset_epoch_accumulators(self):
+        """Reset accumulators at start of each epoch."""
+        self._epoch_grad_norms: List[float] = []
+        self._epoch_module_grad_norms: Dict[str, List[float]] = defaultdict(list)
+        self._epoch_timestep_losses: Dict[int, List[float]] = defaultdict(list)
+        self._epoch_confusion = np.zeros(
+            (self.num_edge_classes, self.num_edge_classes), dtype=np.int64
+        )
+        self._epoch_pred_counts = np.zeros(self.num_edge_classes, dtype=np.int64)
+        self._epoch_gt_counts = np.zeros(self.num_edge_classes, dtype=np.int64)
+        self._epoch_class_correct = np.zeros(self.num_edge_classes, dtype=np.int64)
+        self._epoch_class_total = np.zeros(self.num_edge_classes, dtype=np.int64)
+
+    # =========================================================================
+    # Helper Methods
+    # =========================================================================
+
+    def _compute_gradient_norm(
+        self, model: pl.LightningModule, prefix: Optional[str] = None
+    ) -> float:
+        """Compute gradient L2 norm for parameters matching prefix."""
+        total_norm = 0.0
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if prefix is None or name.startswith(prefix):
+                    total_norm += param.grad.data.norm(2).item() ** 2
+        return total_norm**0.5
+
+    def _compute_weight_norm(
+        self, model: pl.LightningModule, prefix: Optional[str] = None
+    ) -> float:
+        """Compute weight L2 norm for parameters matching prefix."""
+        total_norm = 0.0
+        for name, param in model.named_parameters():
+            if prefix is None or name.startswith(prefix):
+                total_norm += param.data.norm(2).item() ** 2
+        return total_norm**0.5
+
+    def _compute_param_delta(
+        self,
+        model: pl.LightningModule,
+        snapshot: Dict[str, Tensor],
+        prefix: Optional[str] = None,
+    ) -> float:
+        """Compute parameter change from snapshot."""
+        total_delta = 0.0
+        for name, param in model.named_parameters():
+            if prefix is None or name.startswith(prefix):
+                if name in snapshot:
+                    delta = (param.data.cpu() - snapshot[name]).norm(2).item() ** 2
+                    total_delta += delta
+        return total_delta**0.5
+
+    def _take_param_snapshot(self, model: pl.LightningModule) -> Dict[str, Tensor]:
+        """Take snapshot of all parameters (detached, CPU)."""
+        return {
+            name: param.data.clone().cpu() for name, param in model.named_parameters()
+        }
+
+    def _smooth(self, values: List[float], window: int) -> List[float]:
+        """Apply simple moving average smoothing."""
+        if len(values) < window:
+            return values
+        smoothed = []
+        for i in range(len(values)):
+            start = max(0, i - window + 1)
+            smoothed.append(sum(values[start : i + 1]) / (i - start + 1))
+        return smoothed
+
+    def _bin_timestep(self, t: float) -> int:
+        """Bin timestep t in [0,1] to bin index."""
+        return min(int(t * self.num_timestep_bins), self.num_timestep_bins - 1)
+
+    # =========================================================================
+    # PyTorch Lightning Hooks
+    # =========================================================================
+
+    def on_train_epoch_start(
+        self, trainer: Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        """Take parameter snapshot and reset accumulators."""
+        self._param_snapshot = self._take_param_snapshot(pl_module)
+        self._reset_epoch_accumulators()
+
+    def on_before_optimizer_step(
+        self,
+        trainer: Trainer,
+        pl_module: pl.LightningModule,
+        optimizer,
+    ) -> None:
+        """Capture gradient norms before optimizer step (while gradients exist)."""
+        # Global gradient norm
+        grad_norm = self._compute_gradient_norm(pl_module)
+        self._epoch_grad_norms.append(grad_norm)
+
+        # Module-specific gradient norms (must be captured here, before zero_grad)
+        for name, prefix in MODULE_GROUPS.items():
+            module_grad = self._compute_gradient_norm(pl_module, prefix)
+            self._epoch_module_grad_norms[name].append(module_grad)
+
+    def on_train_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: pl.LightningModule,
+        outputs,
+        batch,
+        batch_idx: int,
+    ) -> None:
+        """Accumulate batch-level metrics."""
+        # Check if model has batch_metrics
+        if not hasattr(pl_module, "batch_metrics") or not pl_module.batch_metrics:
+            return
+
+        metrics = pl_module.batch_metrics
+
+        # Extract data
+        t = metrics.get("t")
+        pred_classes = metrics.get("pred_classes")
+        true_classes = metrics.get("true_classes")
+        node_mask = metrics.get("node_mask")
+        loss = metrics.get("loss")
+
+        if t is None or pred_classes is None or true_classes is None:
+            return
+
+        # Bin timestep and accumulate loss
+        if loss is not None:
+            # t might be (bs,) or (bs, 1)
+            t_flat = t.flatten()
+            for t_val in t_flat:
+                bin_idx = self._bin_timestep(t_val.item())
+                self._epoch_timestep_losses[bin_idx].append(loss.item())
+
+        # Update confusion matrix and counts
+        if node_mask is not None:
+            # Create edge mask (valid node pairs, no diagonal)
+            bs, n = node_mask.shape
+            edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
+            diag_mask = ~torch.eye(n, dtype=torch.bool, device=edge_mask.device)
+            edge_mask = edge_mask & diag_mask.unsqueeze(0)
+
+            # Only use upper triangle to avoid double-counting symmetric edges
+            triu_mask = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+            triu_mask = triu_mask.unsqueeze(0).to(edge_mask.device)
+            edge_mask = edge_mask & triu_mask
+
+            # Flatten and filter
+            pred_flat = pred_classes[edge_mask].cpu().numpy()
+            true_flat = true_classes[edge_mask].cpu().numpy()
+
+            # Update confusion matrix
+            for p, t in zip(pred_flat, true_flat):
+                self._epoch_confusion[t, p] += 1
+
+            # Update counts
+            for c in range(self.num_edge_classes):
+                self._epoch_pred_counts[c] += (pred_flat == c).sum()
+                self._epoch_gt_counts[c] += (true_flat == c).sum()
+                correct = ((pred_flat == c) & (true_flat == c)).sum()
+                total = (true_flat == c).sum()
+                self._epoch_class_correct[c] += correct
+                self._epoch_class_total[c] += total
+
+    def on_train_epoch_end(
+        self, trainer: Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        """Aggregate epoch metrics."""
+        # Skip during sanity check
+        if trainer.sanity_checking:
+            return
+
+        # Store train loss
+        train_loss = trainer.callback_metrics.get("train/loss")
+        if train_loss is not None:
+            self.train_losses.append(float(train_loss))
+
+        # Store learning rate
+        lr = trainer.optimizers[0].param_groups[0]["lr"]
+        self.learning_rates.append(lr)
+
+        # Store gradient metrics
+        if self._epoch_grad_norms:
+            mean_grad = np.mean(self._epoch_grad_norms)
+            var_grad = np.var(self._epoch_grad_norms)
+            self.global_grad_norms.append(mean_grad)
+            self.grad_norm_variances.append(var_grad)
+
+            # Module-specific gradients (averaged from accumulated values)
+            module_grads = {}
+            for name in MODULE_GROUPS.keys():
+                if self._epoch_module_grad_norms[name]:
+                    module_grads[name] = np.mean(self._epoch_module_grad_norms[name])
+                else:
+                    module_grads[name] = 0.0
+            self.module_grad_norms.append(module_grads)
+            self.hdc_grad_norms.append(module_grads.get("HDC Cond.", 0.0))
+
+        # Store timestep-binned losses
+        bin_losses = []
+        for bin_idx in range(self.num_timestep_bins):
+            losses = self._epoch_timestep_losses.get(bin_idx, [])
+            bin_losses.append(np.mean(losses) if losses else 0.0)
+        self.timestep_losses.append(bin_losses)
+
+        # Store edge counts and confusion matrix
+        self.pred_edge_counts.append(self._epoch_pred_counts.copy())
+        self.gt_edge_counts.append(self._epoch_gt_counts.copy())
+        self.confusion_matrices.append(self._epoch_confusion.copy())
+
+        # Compute per-class accuracy
+        class_acc = []
+        for c in range(self.num_edge_classes):
+            if self._epoch_class_total[c] > 0:
+                acc = self._epoch_class_correct[c] / self._epoch_class_total[c]
+            else:
+                acc = 0.0
+            class_acc.append(acc)
+        self.class_accuracies.append(class_acc)
+
+        # Compute parameter delta
+        if self._param_snapshot is not None:
+            total_delta = self._compute_param_delta(pl_module, self._param_snapshot)
+            self.param_deltas.append(total_delta)
+
+            # Module-specific deltas
+            module_deltas = {}
+            for name, prefix in MODULE_GROUPS.items():
+                module_deltas[name] = self._compute_param_delta(
+                    pl_module, self._param_snapshot, prefix
+                )
+            self.module_param_deltas.append(module_deltas)
+
+        # Compute weight norms
+        weight_norms = {}
+        for name, prefix in MODULE_GROUPS.items():
+            weight_norms[name] = self._compute_weight_norm(pl_module, prefix)
+        self.weight_norms.append(weight_norms)
+
+    def on_validation_epoch_end(
+        self, trainer: Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        """Store validation loss, compute improvement, and generate plots."""
+        # Skip during sanity check (no training has happened yet)
+        if trainer.sanity_checking:
+            return
+
+        # Store validation loss
+        val_loss = trainer.callback_metrics.get("val/loss")
+        if val_loss is not None:
+            self.val_losses.append(float(val_loss))
+
+        # Compute loss improvement rate
+        if len(self.train_losses) >= 2:
+            prev_loss = self.train_losses[-2]
+            curr_loss = self.train_losses[-1]
+            if prev_loss > 0:
+                improvement = (prev_loss - curr_loss) / prev_loss
+            else:
+                improvement = 0.0
+            self.loss_improvements.append(improvement)
+        elif len(self.train_losses) == 1:
+            self.loss_improvements.append(0.0)
+
+        # Generate plots (only if we have at least one epoch of data)
+        epoch = trainer.current_epoch + 1
+        if len(self.train_losses) > 0:
+            try:
+                fig = self._create_metrics_plot(epoch)
+                self.experiment.track("training_metrics", fig)
+                plt.close(fig)
+            except Exception as e:
+                # Log error but don't crash training
+                self.experiment.log(f"Warning: Failed to create metrics plot: {e}")
+
+    # =========================================================================
+    # Plot Generation
+    # =========================================================================
+
+    def _create_metrics_plot(self, epoch: int) -> plt.Figure:
+        """Create 4x4 grid of training metrics."""
+        fig, axes = plt.subplots(4, 4, figsize=(16, 14))
+
+        epochs = list(range(1, len(self.train_losses) + 1))
+
+        # Row 1: Loss & LR
+        self._plot_loss_curves(axes[0, 0], epochs)
+        self._plot_class_losses(axes[0, 1], epochs)
+        self._plot_learning_rate(axes[0, 2], epochs)
+        self._plot_timestep_loss(axes[0, 3])
+
+        # Row 2: Edge Type Analysis
+        self._plot_edge_distribution(axes[1, 0])
+        self._plot_class_accuracy(axes[1, 1], epochs)
+        self._plot_confusion_matrix(axes[1, 2])
+        self._plot_class_loss_ratio(axes[1, 3], epochs)
+
+        # Row 3: Gradients
+        self._plot_global_grad_norm(axes[2, 0], epochs)
+        self._plot_module_grad_norms(axes[2, 1], epochs)
+        self._plot_hdc_grad_norm(axes[2, 2], epochs)
+        self._plot_grad_variance(axes[2, 3], epochs)
+
+        # Row 4: Convergence
+        self._plot_param_delta(axes[3, 0], epochs)
+        self._plot_weight_norms(axes[3, 1], epochs)
+        self._plot_module_param_deltas(axes[3, 2], epochs)
+        self._plot_loss_improvement(axes[3, 3], epochs)
+
+        fig.suptitle(f"Training Metrics - Epoch {epoch}", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        return fig
+
+    def _plot_loss_curves(self, ax, epochs):
+        """Plot train/val loss with smoothing."""
+        if not self.train_losses:
+            ax.set_title("Train/Val Loss")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        # Ensure we only plot data we have
+        n_train = min(len(epochs), len(self.train_losses))
+        train_epochs = epochs[:n_train]
+        train_losses = self.train_losses[:n_train]
+
+        ax.plot(train_epochs, train_losses, alpha=0.3, color="blue", label="Train (raw)")
+        ax.plot(
+            train_epochs,
+            self._smooth(train_losses, self.smoothing_window),
+            color="blue",
+            linewidth=2,
+            label="Train (smooth)",
+        )
+        if self.val_losses:
+            # Only plot as many val losses as we have epochs
+            n_val = min(len(epochs), len(self.val_losses))
+            val_epochs = epochs[:n_val]
+            val_losses = self.val_losses[:n_val]
+            ax.plot(
+                val_epochs, val_losses, alpha=0.3, color="orange", label="Val (raw)"
+            )
+            ax.plot(
+                val_epochs,
+                self._smooth(val_losses, self.smoothing_window),
+                color="orange",
+                linewidth=2,
+                label="Val (smooth)",
+            )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.set_title("Train/Val Loss")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_class_losses(self, ax, epochs):
+        """Plot loss broken down by class (from confusion matrix errors)."""
+        if not self.confusion_matrices:
+            ax.set_title("Per-Class Error Rate")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        # Compute error rate per class over epochs
+        error_rates = []
+        for cm in self.confusion_matrices:
+            row_sums = cm.sum(axis=1)
+            diag = np.diag(cm)
+            # Error rate = 1 - accuracy
+            rates = []
+            for c in range(self.num_edge_classes):
+                if row_sums[c] > 0:
+                    rates.append(1.0 - diag[c] / row_sums[c])
+                else:
+                    rates.append(0.0)
+            error_rates.append(rates)
+
+        error_rates = np.array(error_rates)
+        n_data = min(len(epochs), len(error_rates))
+        plot_epochs = epochs[:n_data]
+        colors = plt.cm.tab10(np.linspace(0, 1, self.num_edge_classes))
+
+        for c in range(self.num_edge_classes):
+            ax.plot(
+                plot_epochs,
+                error_rates[:n_data, c],
+                color=colors[c],
+                label=EDGE_CLASS_LABELS[c],
+            )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Error Rate")
+        ax.set_title("Per-Class Error Rate")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_learning_rate(self, ax, epochs):
+        """Plot learning rate schedule."""
+        if not self.learning_rates:
+            ax.set_title("Learning Rate")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.learning_rates))
+        ax.plot(epochs[:n_data], self.learning_rates[:n_data], color="green", linewidth=2)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Learning Rate")
+        ax.set_title("Learning Rate")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+
+    def _plot_timestep_loss(self, ax):
+        """Plot loss vs timestep bin."""
+        if not self.timestep_losses:
+            ax.set_title("Loss vs Timestep")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        # Use latest epoch's timestep losses
+        latest = self.timestep_losses[-1]
+        bins = np.linspace(0, 1, self.num_timestep_bins + 1)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+
+        ax.bar(bin_centers, latest, width=1.0 / self.num_timestep_bins, alpha=0.7)
+        ax.set_xlabel("Timestep t")
+        ax.set_ylabel("Loss")
+        ax.set_title("Loss vs Timestep (Latest)")
+        ax.set_xlim(0, 1)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_edge_distribution(self, ax):
+        """Plot predicted vs ground truth edge distribution."""
+        if not self.pred_edge_counts or not self.gt_edge_counts:
+            ax.set_title("Edge Distribution")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        # Use latest epoch
+        pred = self.pred_edge_counts[-1].astype(float)
+        gt = self.gt_edge_counts[-1].astype(float)
+
+        # Normalize
+        pred = pred / (pred.sum() + 1e-8)
+        gt = gt / (gt.sum() + 1e-8)
+
+        x = np.arange(self.num_edge_classes)
+        width = 0.35
+
+        ax.bar(x - width / 2, gt, width, label="Ground Truth", alpha=0.7)
+        ax.bar(x + width / 2, pred, width, label="Predicted", alpha=0.7)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(EDGE_CLASS_LABELS, fontsize=8, rotation=45)
+        ax.set_ylabel("Frequency")
+        ax.set_title("Edge Distribution")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_class_accuracy(self, ax, epochs):
+        """Plot per-class accuracy over epochs."""
+        if not self.class_accuracies:
+            ax.set_title("Per-Class Accuracy")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        accs = np.array(self.class_accuracies)
+        n_data = min(len(epochs), len(accs))
+        plot_epochs = epochs[:n_data]
+        colors = plt.cm.tab10(np.linspace(0, 1, self.num_edge_classes))
+
+        for c in range(self.num_edge_classes):
+            ax.plot(
+                plot_epochs,
+                accs[:n_data, c],
+                color=colors[c],
+                label=EDGE_CLASS_LABELS[c],
+            )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Accuracy")
+        ax.set_title("Per-Class Accuracy")
+        ax.legend(fontsize=7)
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_confusion_matrix(self, ax):
+        """Plot edge type confusion matrix (normalized by row)."""
+        if not self.confusion_matrices:
+            ax.set_title("Confusion Matrix")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        cm = self.confusion_matrices[-1]
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_normalized = cm / (row_sums + 1e-8)
+
+        im = ax.imshow(cm_normalized, cmap="Blues", vmin=0, vmax=1)
+        ax.set_xticks(range(self.num_edge_classes))
+        ax.set_yticks(range(self.num_edge_classes))
+        ax.set_xticklabels(EDGE_CLASS_LABELS, fontsize=7, rotation=45)
+        ax.set_yticklabels(EDGE_CLASS_LABELS, fontsize=7)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Ground Truth")
+        ax.set_title("Confusion Matrix")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    def _plot_class_loss_ratio(self, ax, epochs):
+        """Plot relative contribution of each class to total error."""
+        if not self.confusion_matrices:
+            ax.set_title("Class Error Contribution")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        # Compute error contribution per class
+        contributions = []
+        for cm in self.confusion_matrices:
+            row_sums = cm.sum(axis=1)
+            diag = np.diag(cm)
+            errors_per_class = row_sums - diag
+            total_errors = errors_per_class.sum()
+            if total_errors > 0:
+                contrib = errors_per_class / total_errors
+            else:
+                contrib = np.zeros(self.num_edge_classes)
+            contributions.append(contrib)
+
+        contributions = np.array(contributions)
+        n_data = min(len(epochs), len(contributions))
+        plot_epochs = epochs[:n_data]
+
+        # Stacked area plot
+        ax.stackplot(
+            plot_epochs,
+            contributions[:n_data].T,
+            labels=EDGE_CLASS_LABELS,
+            alpha=0.7,
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Error Contribution")
+        ax.set_title("Class Error Contribution")
+        ax.legend(fontsize=7, loc="upper right")
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_global_grad_norm(self, ax, epochs):
+        """Plot global gradient norm."""
+        if not self.global_grad_norms:
+            ax.set_title("Global Gradient Norm")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.global_grad_norms))
+        ax.plot(
+            epochs[:n_data],
+            self.global_grad_norms[:n_data],
+            color="purple",
+            linewidth=2,
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Gradient Norm")
+        ax.set_title("Global Gradient Norm")
+        ax.grid(True, alpha=0.3)
+
+    def _plot_module_grad_norms(self, ax, epochs):
+        """Plot gradient norms by module group."""
+        if not self.module_grad_norms:
+            ax.set_title("Gradient by Module")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        colors = {"HDC Cond.": "red", "Time Emb.": "green", "Transformer": "blue"}
+
+        for name in MODULE_GROUPS.keys():
+            values = [d.get(name, 0.0) for d in self.module_grad_norms]
+            n_data = min(len(epochs), len(values))
+            ax.plot(
+                epochs[:n_data],
+                values[:n_data],
+                color=colors.get(name, "gray"),
+                label=name,
+            )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Gradient Norm")
+        ax.set_title("Gradient by Module")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_hdc_grad_norm(self, ax, epochs):
+        """Plot HDC conditioning gradient norm."""
+        if not self.hdc_grad_norms:
+            ax.set_title("HDC Conditioning Gradient")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.hdc_grad_norms))
+        ax.plot(
+            epochs[:n_data],
+            self.hdc_grad_norms[:n_data],
+            color="red",
+            linewidth=2,
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Gradient Norm")
+        ax.set_title("HDC Conditioning Gradient")
+        ax.grid(True, alpha=0.3)
+
+    def _plot_grad_variance(self, ax, epochs):
+        """Plot gradient norm variance within epochs."""
+        if not self.grad_norm_variances:
+            ax.set_title("Gradient Variance")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.grad_norm_variances))
+        ax.plot(
+            epochs[:n_data],
+            self.grad_norm_variances[:n_data],
+            color="orange",
+            linewidth=2,
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Variance")
+        ax.set_title("Gradient Norm Variance")
+        ax.grid(True, alpha=0.3)
+
+    def _plot_param_delta(self, ax, epochs):
+        """Plot total parameter change per epoch."""
+        if not self.param_deltas:
+            ax.set_title("Parameter Change")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.param_deltas))
+        ax.plot(
+            epochs[:n_data],
+            self.param_deltas[:n_data],
+            color="teal",
+            linewidth=2,
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("||Δθ||")
+        ax.set_title("Parameter Change (Total)")
+        ax.grid(True, alpha=0.3)
+
+    def _plot_weight_norms(self, ax, epochs):
+        """Plot weight norms by module group."""
+        if not self.weight_norms:
+            ax.set_title("Weight Norms")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        colors = {"HDC Cond.": "red", "Time Emb.": "green", "Transformer": "blue"}
+
+        for name in MODULE_GROUPS.keys():
+            values = [d.get(name, 0.0) for d in self.weight_norms]
+            n_data = min(len(epochs), len(values))
+            ax.plot(
+                epochs[:n_data],
+                values[:n_data],
+                color=colors.get(name, "gray"),
+                label=name,
+            )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("||θ||")
+        ax.set_title("Weight Norms by Module")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_module_param_deltas(self, ax, epochs):
+        """Plot parameter change by module group."""
+        if not self.module_param_deltas:
+            ax.set_title("Parameter Change by Module")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        colors = {"HDC Cond.": "red", "Time Emb.": "green", "Transformer": "blue"}
+
+        for name in MODULE_GROUPS.keys():
+            values = [d.get(name, 0.0) for d in self.module_param_deltas]
+            n_data = min(len(epochs), len(values))
+            ax.plot(
+                epochs[:n_data],
+                values[:n_data],
+                color=colors.get(name, "gray"),
+                label=name,
+            )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("||Δθ||")
+        ax.set_title("Parameter Change by Module")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_loss_improvement(self, ax, epochs):
+        """Plot loss improvement rate."""
+        if not self.loss_improvements:
+            ax.set_title("Loss Improvement")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.loss_improvements))
+        ax.plot(
+            epochs[:n_data],
+            self.loss_improvements[:n_data],
+            color="green",
+            linewidth=2,
+        )
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Improvement Rate")
+        ax.set_title("Loss Improvement Rate")
+        ax.grid(True, alpha=0.3)

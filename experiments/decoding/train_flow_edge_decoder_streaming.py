@@ -103,7 +103,7 @@ EPOCHS: int = 1000
 
 # :param BATCH_SIZE:
 #     Batch size for training and validation.
-BATCH_SIZE: int = 32
+BATCH_SIZE: int = 8
 
 # :param LEARNING_RATE:
 #     Initial learning rate for Adam optimizer.
@@ -166,7 +166,7 @@ PREFILL_FRACTION: float = 0.1
 # :param STEPS_PER_EPOCH:
 #     Number of training steps per epoch. Since streaming data is infinite,
 #     this defines when validation runs.
-STEPS_PER_EPOCH: int = 10
+STEPS_PER_EPOCH: int = 1000
 
 # -----------------------------------------------------------------------------
 # Validation Configuration
@@ -256,7 +256,7 @@ def load_train_data(
 
     if e.__DEBUG__:
         fragment_library.build_from_dataset(
-            zinc_train, show_progress=True, max_molecules=1000
+            zinc_train, show_progress=True, max_molecules=25_000
         )
     else:
         fragment_library.build_from_dataset(zinc_train, show_progress=True)

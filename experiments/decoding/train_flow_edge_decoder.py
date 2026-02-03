@@ -59,6 +59,7 @@ from graph_hdc.utils.experiment_helpers import (
     GracefulInterruptHandler,
     LossTrackingCallback,
     ReconstructionVisualizationCallback,
+    TrainingMetricsCallback,
     create_reconstruction_plot,
     decode_nodes_from_hdc,
     get_canonical_smiles,
@@ -137,7 +138,7 @@ EPOCHS: int = 50
 
 # :param BATCH_SIZE:
 #     Batch size for training and validation.
-BATCH_SIZE: int = 32
+BATCH_SIZE: int = 8
 
 # :param LEARNING_RATE:
 #     Initial learning rate for Adam optimizer.
@@ -154,6 +155,11 @@ TRAIN_TIME_DISTORTION: str = "identity"
 # :param GRADIENT_CLIP_VAL:
 #     Gradient clipping value. Set to 0.0 to disable.
 GRADIENT_CLIP_VAL: float = 1.0
+
+# :param ACCUMULATE_GRAD_BATCHES:
+#     Number of batches to accumulate gradients over before performing an
+#     optimizer step. Effective batch size becomes BATCH_SIZE * ACCUMULATE_GRAD_BATCHES.
+ACCUMULATE_GRAD_BATCHES: int = 1
 
 # -----------------------------------------------------------------------------
 # Sampling Configuration
@@ -467,6 +473,11 @@ def experiment(e: Experiment) -> None:
         ),
         LearningRateMonitor(logging_interval="epoch"),
         LossTrackingCallback(experiment=e),
+        TrainingMetricsCallback(
+            experiment=e,
+            num_timestep_bins=10,
+            num_edge_classes=5,
+        ),
         ReconstructionVisualizationCallback(
             experiment=e,
             vis_samples=vis_samples,
@@ -474,6 +485,7 @@ def experiment(e: Experiment) -> None:
             eta=e.ETA,
             omega=e.OMEGA,
             time_distortion=e.SAMPLE_TIME_DISTORTION,
+            hypernet=hypernet,
         ),
     ]
 
@@ -504,6 +516,7 @@ def experiment(e: Experiment) -> None:
         default_root_dir=e.path,
         log_every_n_steps=10,
         gradient_clip_val=e.GRADIENT_CLIP_VAL,
+        accumulate_grad_batches=e.ACCUMULATE_GRAD_BATCHES,
         enable_progress_bar=True,
     )
 
