@@ -113,6 +113,7 @@ class MultiHyperNet(pl.LightningModule):
         dim_depth_pairs: list[tuple[int, int]],
         base_seed: int = 42,
         observed_node_features: set[tuple] | None = None,
+        hypernet_cls: type | None = None,
     ) -> MultiHyperNet:
         """
         Create a mixed-dimension ensemble from (dim, depth) pairs.
@@ -131,12 +132,18 @@ class MultiHyperNet(pl.LightningModule):
         observed_node_features : set[tuple] | None
             If provided, passed to each HyperNet for codebook pruning
             (e.g. when using RW-augmented features).
+        hypernet_cls : type, optional
+            Class to instantiate for each sub-HyperNet. Defaults to
+            ``HyperNet``. Pass ``RRWPHyperNet`` to create an ensemble
+            with split RRWP encoding.
 
         Returns
         -------
         MultiHyperNet
             Ensemble with ``len(dim_depth_pairs)`` sub-HyperNets.
         """
+        if hypernet_cls is None:
+            hypernet_cls = HyperNet
         hypernets = []
         for i, (dim, depth) in enumerate(dim_depth_pairs):
             cfg = replace(
@@ -145,7 +152,7 @@ class MultiHyperNet(pl.LightningModule):
                 hypernet_depth=depth,
                 seed=base_seed + i,
             )
-            hypernets.append(HyperNet(cfg, observed_node_features=observed_node_features))
+            hypernets.append(hypernet_cls(cfg, observed_node_features=observed_node_features))
         return cls(hypernets)
 
     # ─────────────────── Properties ───────────────────
@@ -228,6 +235,11 @@ class MultiHyperNet(pl.LightningModule):
     @property
     def edge_encoder_map(self):
         return self._primary.edge_encoder_map
+
+    @property
+    def order_zero_codebook(self):
+        """Codebook used for order-0 (node_terms) decoding (delegates to primary)."""
+        return self._primary.order_zero_codebook
 
     @property
     def dataset_info(self):
@@ -493,6 +505,28 @@ class MultiHyperNet(pl.LightningModule):
                     ),
                 },
             }
+
+            # Save RRWP-specific data for RRWPHyperNet sub-instances
+            from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
+            if isinstance(hn, RRWPHyperNet):
+                state["rrwp"] = {
+                    "num_rw_dims": hn._num_rw_dims,
+                    "full_bins": hn._full_bins,
+                    "full_feature_dim": hn._full_feature_dim,
+                    "full_rw_config": {
+                        "enabled": hn.rw_config.enabled,
+                        "k_values": hn.rw_config.k_values,
+                        "num_bins": hn.rw_config.num_bins,
+                        "bin_boundaries": hn.rw_config.bin_boundaries,
+                    },
+                    "codebooks": {
+                        "nodes_full": hn.nodes_codebook_full.cpu(),
+                    },
+                    "indexers": {
+                        "nodes_full": hn.nodes_indexer_full.__dict__.copy(),
+                    },
+                }
+
             hypernet_states.append(state)
 
         torch.save(
@@ -589,6 +623,20 @@ class MultiHyperNet(pl.LightningModule):
                 hn.edge_feature_indexer.__dict__.update(state["indexers"]["edge_features"])
             else:
                 hn.edge_feature_indexer = None
+
+            # Restore RRWP-specific data if present
+            if "rrwp" in state:
+                from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
+
+                hn.__class__ = RRWPHyperNet
+                rrwp = state["rrwp"]
+                hn._num_rw_dims = rrwp["num_rw_dims"]
+                hn._full_bins = rrwp["full_bins"]
+                hn._full_feature_dim = rrwp["full_feature_dim"]
+                hn.rw_config = RWConfig(**rrwp["full_rw_config"])
+                hn.nodes_codebook_full = rrwp["codebooks"]["nodes_full"].to(device)
+                hn.nodes_indexer_full = TupleIndexer.__new__(TupleIndexer)
+                hn.nodes_indexer_full.__dict__.update(rrwp["indexers"]["nodes_full"])
 
             hypernets.append(hn)
 

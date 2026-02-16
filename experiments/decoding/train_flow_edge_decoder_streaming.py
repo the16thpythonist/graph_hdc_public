@@ -92,7 +92,7 @@ HDC_DEPTH: int = 8
 #     vector more expressive about global graph topology. The FlowEdgeDecoder's
 #     24-dim one-hot node features are NOT affected — only the conditioning
 #     vector changes.
-USE_RW: bool = False
+USE_RW: bool = True
 
 # :param RW_K_VALUES:
 #     Random walk steps at which to compute return probabilities. Only used
@@ -110,6 +110,14 @@ RW_NUM_BINS: int = 5
 #     False when training on generated molecules (e.g. streaming fragments) whose
 #     topology may produce novel feature combinations.
 PRUNE_CODEBOOK: bool = False
+
+# :param USE_RRWP_HYPERNET:
+#     When True (requires USE_RW=True), creates RRWPHyperNet which uses
+#     RRWP-enriched features only for order-0 (node_terms) readout, while
+#     message passing operates on base features only. This prevents positional
+#     information from interfering with structural binding. Works with both
+#     single HyperNet and MultiHyperNet ensembles.
+USE_RRWP_HYPERNET: bool = True
 
 # :param ENSEMBLE_CONFIGS:
 #     Optional list of (hv_dim, depth) tuples for a MultiHyperNet ensemble.
@@ -385,7 +393,7 @@ __DEBUG__: bool = True
 
 # :param __TESTING__:
 #     Testing mode - runs with minimal iterations for validation.
-__TESTING__: bool = False
+__TESTING__: bool = True
 
 
 # =============================================================================
@@ -746,12 +754,18 @@ def modify_callbacks(
 
 @experiment.testing
 def testing(e: Experiment):
-    """Quick test mode with reduced parameters for streaming."""
+    """Quick test mode with reduced parameters for streaming.
+
+    Shrinks model architecture and ensemble to run on CPU with minimal RAM.
+    Still exercises the ensemble code path with a tiny MultiHyperNet.
+    """
+    # --- Data / iteration budget ---
     e.EPOCHS = 2
     e.BATCH_SIZE = 4
     e.SAMPLE_STEPS = 10
     e.NUM_RECONSTRUCTION_SAMPLES = 3
     e.NUM_VALIDATION_VISUALIZATIONS = 2
+    e.NUM_VALIDATION_REPETITIONS = 2
     e.STEPS_PER_EPOCH = 10
     e.BUFFER_SIZE = 100
     e.NUM_FRAGMENT_WORKERS = 1
@@ -761,6 +775,17 @@ def testing(e: Experiment):
     e.SMALL_MOL_MIXING_WEIGHT = 0.2
     e.NUM_SMALL_MOL_WORKERS = 1
     e.SMALL_MOL_BUFFER_SIZE = 50
+    # --- Tiny ensemble (exercises MultiHyperNet code path) ---
+    e.ENSEMBLE_CONFIGS = [(512, 2), (512, 2)]
+    e.HDC_DIM = 512
+    e.HDC_DEPTH = 2
+    # --- Small model architecture ---
+    e.N_LAYERS = 2
+    e.HIDDEN_DIM = 32
+    e.HIDDEN_MLP_DIM = 32
+    e.CONDITION_DIM = 64
+    e.TIME_EMBED_DIM = 16
+    e.USE_CROSS_ATTN = False
 
 
 # =============================================================================

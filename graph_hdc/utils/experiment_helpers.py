@@ -117,6 +117,7 @@ def load_or_create_encoder(
     device: torch.device,
     rw_config=None,
     prune_codebook: bool = True,
+    use_rrwp_hypernet: bool = False,
 ) -> HyperNet:
     """
     Load encoder from checkpoint or create a new one.
@@ -131,12 +132,20 @@ def load_or_create_encoder(
                    When enabled and creating a new encoder, the dataset
                    is scanned for observed RW-augmented feature tuples.
         prune_codebook: Whether to prune the codebook to observed tuples.
+        use_rrwp_hypernet: When True, create RRWPHyperNet instead of HyperNet.
+                          Requires rw_config to be enabled.
 
     Returns:
         HyperNet encoder instance (in eval mode)
     """
+    if use_rrwp_hypernet and (rw_config is None or not rw_config.enabled):
+        raise ValueError(
+            "use_rrwp_hypernet=True requires rw_config with enabled=True"
+        )
+
     if config_path and Path(config_path).exists():
-        hypernet = HyperNet.load(config_path, device=str(device))
+        from graph_hdc.hypernet import load_hypernet
+        hypernet = load_hypernet(config_path, device=str(device))
     elif rw_config is not None and rw_config.enabled:
         from graph_hdc.datasets.utils import scan_node_features_with_rw
         from graph_hdc.hypernet.configs import create_config_with_rw
@@ -146,7 +155,11 @@ def load_or_create_encoder(
             dataset.lower(), hv_dim, rw_config=rw_config, hypernet_depth=depth,
             prune_codebook=prune_codebook,
         )
-        hypernet = HyperNet(config, observed_node_features=observed)
+        if use_rrwp_hypernet:
+            from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
+            hypernet = RRWPHyperNet(config, observed_node_features=observed)
+        else:
+            hypernet = HyperNet(config, observed_node_features=observed)
         hypernet = hypernet.to(device)
     else:
         config = create_hdc_config(dataset, hv_dim, depth, device=str(device))
@@ -198,8 +211,9 @@ def decode_nodes_from_hdc(
     # Ensure order_zero matches the codebook's VSATensor subclass and dtype
     # so torchhd.cos() works.  Plain float32 tensors from the flow model
     # would otherwise cause type/dtype mismatches with the float64 HRRTensor
-    # codebook.
-    cb = hypernet.nodes_codebook
+    # codebook.  Use order_zero_codebook to get the correct codebook for
+    # the encoder type (base for HyperNet, full for RRWPHyperNet).
+    cb = hypernet.order_zero_codebook
     if order_zero.dtype != cb.dtype:
         order_zero = order_zero.to(dtype=cb.dtype)
     if type(order_zero) is not type(cb):
@@ -625,14 +639,8 @@ def compute_hdc_distance(
             )
 
         with torch.no_grad():
-            gen_data = hypernet.encode_properties(gen_data)
-            if gen_data.node_hv.device != hdc_device:
-                gen_data.node_hv = gen_data.node_hv.to(hdc_device)
-
-            gen_order_zero = scatter_hd(
-                src=gen_data.node_hv, index=gen_data.batch, op="bundle",
-            )
             gen_output = hypernet.forward(gen_data, normalize=True)
+            gen_order_zero = gen_output["node_terms"]
             gen_order_n = gen_output["graph_embedding"]
             gen_hdc_vector = torch.cat([gen_order_zero, gen_order_n], dim=-1)
 

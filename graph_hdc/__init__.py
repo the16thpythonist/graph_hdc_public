@@ -17,6 +17,7 @@ _apply_torchhd_patches()
 # Core encoder
 from graph_hdc.hypernet.encoder import CorrectionLevel, DecodingResult, HyperNet
 from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
+from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
 
 # Configurations
 from graph_hdc.hypernet.configs import (
@@ -44,6 +45,7 @@ __all__ = [
     # Encoder
     "HyperNet",
     "MultiHyperNet",
+    "RRWPHyperNet",
     "CorrectionLevel",
     "DecodingResult",
     # Configs

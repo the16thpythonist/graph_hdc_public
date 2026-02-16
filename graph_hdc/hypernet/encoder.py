@@ -287,6 +287,11 @@ class HyperNet(pl.LightningModule):
     def edges_indexer(self, value):
         self._edges_indexer = value
 
+    @property
+    def order_zero_codebook(self):
+        """Codebook used for order-0 (node_terms) decoding."""
+        return self.nodes_codebook
+
     def to(self, device, dtype=None):
         """Move HyperNet to device."""
         device = torch.device(device)

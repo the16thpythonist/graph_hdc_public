@@ -72,7 +72,6 @@ from graph_hdc.utils.experiment_helpers import (
     pyg_to_mol,
     scrub_smiles,
 )
-from graph_hdc.utils.helpers import scatter_hd
 
 # =============================================================================
 # PARAMETERS
@@ -136,6 +135,14 @@ USE_QUANTILE_BINS: bool = True
 #     False when training on generated molecules (e.g. streaming fragments) whose
 #     topology may produce novel feature combinations.
 PRUNE_CODEBOOK: bool = True
+
+# :param USE_RRWP_HYPERNET:
+#     When True (requires USE_RW=True), creates RRWPHyperNet which uses
+#     RRWP-enriched features only for order-0 (node_terms) readout, while
+#     message passing operates on base features only. This prevents positional
+#     information from interfering with structural binding. Works with both
+#     single HyperNet and MultiHyperNet ensembles.
+USE_RRWP_HYPERNET: bool = True
 
 # :param ENSEMBLE_CONFIGS:
 #     Optional list of (hv_dim, depth) tuples for a MultiHyperNet ensemble.
@@ -399,6 +406,9 @@ def experiment(e: Experiment) -> None:
         bin_boundaries=rw_bin_boundaries,
     )
 
+    if e.USE_RRWP_HYPERNET and not e.USE_RW:
+        raise ValueError("USE_RRWP_HYPERNET requires USE_RW=True")
+
     e.log("=" * 60)
     e.log(f"Dataset: {e.DATASET.upper()}")
     e.log(f"HDC config path: {e.HDC_CONFIG_PATH or '(creating new)'}")
@@ -409,6 +419,8 @@ def experiment(e: Experiment) -> None:
     if rw_config.enabled:
         bin_mode = "quantile" if rw_config.bin_boundaries else "uniform"
         e.log(f"RW features: k={rw_config.k_values}, bins={rw_config.num_bins} ({bin_mode})")
+    if e.USE_RRWP_HYPERNET:
+        e.log(f"RRWP HyperNet: enabled (split order-0 encoding)")
     e.log(f"Codebook pruning: {e.PRUNE_CODEBOOK}")
     e.log(f"Architecture: {e.N_LAYERS} layers, {e.HIDDEN_DIM} hidden dim")
     e.log(f"Training: {e.EPOCHS} epochs, batch size {e.BATCH_SIZE}")
@@ -430,6 +442,7 @@ def experiment(e: Experiment) -> None:
     e["config/rw_num_bins"] = e.RW_NUM_BINS
     e["config/rw_quantile_bins"] = e.USE_QUANTILE_BINS
     e["config/prune_codebook"] = e.PRUNE_CODEBOOK
+    e["config/use_rrwp_hypernet"] = e.USE_RRWP_HYPERNET
     e["config/n_layers"] = e.N_LAYERS
     e["config/hidden_dim"] = e.HIDDEN_DIM
     e["config/epochs"] = e.EPOCHS
@@ -449,15 +462,17 @@ def experiment(e: Experiment) -> None:
     e.log("\nLoading/Creating HyperNet encoder...")
 
     if resuming:
-        # When resuming, load saved encoder (may be MultiHyperNet or HyperNet)
+        # When resuming, load saved encoder (auto-detects type)
+        from graph_hdc.hypernet import load_hypernet
         resume_encoder_file = Path(e.RESUME_ENCODER_PATH)
-        resume_state = torch.load(resume_encoder_file, map_location="cpu", weights_only=False)
-        if isinstance(resume_state, dict) and resume_state.get("type") == "MultiHyperNet":
-            hypernet = MultiHyperNet.load(str(resume_encoder_file), device=str(device))
-        else:
-            hypernet = HyperNet.load(str(resume_encoder_file), device=str(device))
+        hypernet = load_hypernet(str(resume_encoder_file), device=str(device))
         hypernet.eval()
     elif use_ensemble:
+        hn_cls = None
+        if e.USE_RRWP_HYPERNET:
+            from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
+            hn_cls = RRWPHyperNet
+
         if rw_config.enabled:
             from graph_hdc.hypernet.configs import create_config_with_rw
             from graph_hdc.datasets.utils import scan_node_features_with_rw
@@ -476,6 +491,7 @@ def experiment(e: Experiment) -> None:
                 dim_depth_pairs=e.ENSEMBLE_CONFIGS,
                 base_seed=e.SEED,
                 observed_node_features=observed if e.PRUNE_CODEBOOK else None,
+                hypernet_cls=hn_cls,
             )
         else:
             from graph_hdc.utils.experiment_helpers import create_hdc_config
@@ -501,6 +517,7 @@ def experiment(e: Experiment) -> None:
             device=device,
             rw_config=rw_config,
             prune_codebook=e.PRUNE_CODEBOOK,
+            use_rrwp_hypernet=e.USE_RRWP_HYPERNET,
         )
 
     # Compute dimensions
@@ -801,13 +818,20 @@ def experiment(e: Experiment) -> None:
                 )
 
             with torch.no_grad():
-                data_for_encoding = hypernet.encode_properties(data_for_encoding)
-                order_zero = scatter_hd(
-                    src=data_for_encoding.node_hv,
-                    index=data_for_encoding.batch,
-                    op="bundle"
-                )
+                # Augment with RW features if the encoder expects them
+                if hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled:
+                    from graph_hdc.utils.rw_features import augment_data_with_rw
+                    data_for_encoding = augment_data_with_rw(
+                        data_for_encoding,
+                        k_values=hypernet.rw_config.k_values,
+                        num_bins=hypernet.rw_config.num_bins,
+                        bin_boundaries=hypernet.rw_config.bin_boundaries,
+                    )
+
+                # forward() handles encode_properties internally and returns
+                # the correct node_terms for both HyperNet and RRWPHyperNet
                 encoder_output = hypernet.forward(data_for_encoding, normalize=True)
+                order_zero = encoder_output["node_terms"]
                 order_n = encoder_output["graph_embedding"]
                 graph_embedding = torch.cat([order_zero, order_n], dim=-1).squeeze(0)
 

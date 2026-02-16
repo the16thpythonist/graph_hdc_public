@@ -2467,14 +2467,11 @@ def preprocess_for_flow_edge_decoder(
         )
 
     with torch.no_grad():
-        # First encode node properties to get node hypervectors
-        data_for_hdc = hypernet.encode_properties(data_for_hdc)
-
-        # Order-0: Bundle node hypervectors directly (no message passing)
-        order_zero = scatter_hd(src=data_for_hdc.node_hv, index=data_for_hdc.batch, op="bundle")
-
-        # Order-N: Full graph embedding with message passing
+        # forward() handles encode_properties internally and returns:
+        # - node_terms: order-0 (bundled node HVs, RRWP-enriched for RRWPHyperNet)
+        # - graph_embedding: order-N (message passing result)
         hdc_out = hypernet.forward(data_for_hdc)
+        order_zero = hdc_out["node_terms"]
         order_n = hdc_out["graph_embedding"]
 
         # Concatenate [order_0 | order_N]

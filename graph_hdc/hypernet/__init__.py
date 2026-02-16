@@ -22,6 +22,7 @@ from graph_hdc.hypernet.configs import (
 )
 from graph_hdc.hypernet.encoder import CorrectionLevel, DecodingResult, HyperNet
 from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
+from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
 from graph_hdc.hypernet.types import Feat, VSAModel
 
 
@@ -48,14 +49,19 @@ def load_hypernet(
         The loaded encoder.
     """
     checkpoint_data = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(checkpoint_data, dict) and checkpoint_data.get("type") == "MultiHyperNet":
-        return MultiHyperNet.load(path, device=device)
+    if isinstance(checkpoint_data, dict):
+        ckpt_type = checkpoint_data.get("type")
+        if ckpt_type == "MultiHyperNet":
+            return MultiHyperNet.load(path, device=device)
+        if ckpt_type == "RRWPHyperNet":
+            return RRWPHyperNet.load(path, device=device)
     return HyperNet.load(path, device=device)
 
 
 __all__ = [
     "HyperNet",
     "MultiHyperNet",
+    "RRWPHyperNet",
     "CorrectionLevel",
     "DecodingResult",
     "get_config",
