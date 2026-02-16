@@ -25,10 +25,13 @@ Usage:
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import torch
+from pycomex import INHERIT
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from pytorch_lightning.callbacks import Callback
@@ -36,10 +39,15 @@ from torch import Tensor
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
+from graph_hdc.datasets.mixed_streaming import MixedStreamingDataLoader, StreamingSource
 from graph_hdc.datasets.streaming_fragments import (
     FragmentLibrary,
     StreamingFragmentDataLoader,
     StreamingFragmentDataset,
+)
+from graph_hdc.datasets.streaming_small_molecules import (
+    SmallMoleculePool,
+    SmallMoleculeStreamingDataset,
 )
 from graph_hdc.datasets.utils import get_split
 from graph_hdc.hypernet.encoder import HyperNet
@@ -54,25 +62,9 @@ from graph_hdc.models.flow_edge_decoder import (
 # PARAMETER OVERRIDES (must be defined BEFORE Experiment.extend())
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# Model Architecture (different from base)
-# -----------------------------------------------------------------------------
-
-# :param N_LAYERS:
-#     Number of transformer layers. Streaming uses more layers for higher capacity.
-N_LAYERS: int = 12
-
-# :param HIDDEN_MLP_DIM:
-#     Hidden dimension for MLP blocks. Streaming uses smaller MLP.
-HIDDEN_MLP_DIM: int = 256
-
-# :param CONDITION_DIM:
-#     Dimension for HDC conditioning. Streaming uses smaller conditioning.
-CONDITION_DIM: int = 256
-
-# :param TIME_EMBED_DIM:
-#     Dimension for time embedding. Streaming uses larger time embedding.
-TIME_EMBED_DIM: int = 256
+# :param DATASET:
+#     Dataset name for training. Currently only "zinc" is supported.
+DATASET: str = "zinc"
 
 # -----------------------------------------------------------------------------
 # HDC Encoder Configuration
@@ -81,17 +73,101 @@ TIME_EMBED_DIM: int = 256
 # :param HDC_CONFIG_PATH:
 #     Path to saved HyperNet encoder checkpoint (.ckpt). If empty, creates a new
 #     encoder with HDC_DIM and HDC_DEPTH parameters.
-HDC_CONFIG_PATH: str = ""
+HDC_CONFIG_PATH: str = ''
 
 # :param HDC_DIM:
 #     Hypervector dimension for the HyperNet encoder. Only used if HDC_CONFIG_PATH
 #     is empty. Typical values: 256, 512, 1024.
-HDC_DIM: int = 1024
+HDC_DIM: int = 512
 
 # :param HDC_DEPTH:
 #     Message passing depth for the HyperNet encoder. Only used if HDC_CONFIG_PATH
 #     is empty. Higher values capture longer-range structural information.
-HDC_DEPTH: int = 6
+HDC_DEPTH: int = 8
+
+# :param USE_RW:
+#     Whether to augment HDC node features with random walk return probabilities.
+#     When True, each node's feature tuple is extended with binned RW return
+#     probabilities at each step in RW_K_VALUES, making the HDC conditioning
+#     vector more expressive about global graph topology. The FlowEdgeDecoder's
+#     24-dim one-hot node features are NOT affected — only the conditioning
+#     vector changes.
+USE_RW: bool = False
+
+# :param RW_K_VALUES:
+#     Random walk steps at which to compute return probabilities. Only used
+#     when USE_RW is True.
+RW_K_VALUES: tuple = (2, 4)
+
+# :param RW_NUM_BINS:
+#     Number of uniform bins for discretising RW return probabilities on [0,1].
+#     Only used when USE_RW is True.
+RW_NUM_BINS: int = 5
+
+# :param PRUNE_CODEBOOK:
+#     Whether to prune the HDC codebook to only feature tuples observed in the
+#     dataset. When True (default), unseen tuples cause encoding errors — set to
+#     False when training on generated molecules (e.g. streaming fragments) whose
+#     topology may produce novel feature combinations.
+PRUNE_CODEBOOK: bool = False
+
+# :param ENSEMBLE_CONFIGS:
+#     Optional list of (hv_dim, depth) tuples for a MultiHyperNet ensemble.
+#     Each tuple creates an independently-initialized HyperNet with its own
+#     random codebook, providing a different "perspective" on the same graph.
+#     Seeds are auto-generated as SEED+0, SEED+1, etc.
+#     When empty/None, a single HyperNet with HDC_DIM/HDC_DEPTH is used instead.
+#     Example: [(256, 6), (512, 4), (256, 8)] creates 3 HyperNets.
+ENSEMBLE_CONFIGS: Optional[List[Tuple[int, int]]] = [(512, 8), (512, 4), (512, 2)]
+
+# -----------------------------------------------------------------------------
+# Model Architecture (different from base)
+# -----------------------------------------------------------------------------
+
+# :param N_LAYERS:
+#     Number of transformer layers. Streaming uses more layers for higher capacity.
+N_LAYERS: int = 16
+
+# :param HIDDEN_DIM:
+#     Hidden dimension for transformer layers.
+HIDDEN_DIM: int = 256
+
+# :param HIDDEN_MLP_DIM:
+#     Hidden dimension for MLP blocks in transformer.
+HIDDEN_MLP_DIM: int = 256
+
+# :param N_HEADS:
+#     Number of attention heads in transformer layers.
+N_HEADS: int = INHERIT
+
+# :param DROPOUT:
+#     Dropout probability in transformer layers.
+DROPOUT: float = INHERIT
+
+# :param CONDITION_DIM:
+#     Dimension for HDC conditioning after MLP projection.
+CONDITION_DIM: int = 512
+
+# :param TIME_EMBED_DIM:
+#     Dimension for sinusoidal time embedding.
+TIME_EMBED_DIM: int = 128
+
+# :param USE_CROSS_ATTN:
+#     Whether to use cross-attention HDC conditioning. When True, the raw HDC
+#     vector is decomposed into learnable tokens, nodes cross-attend to these
+#     tokens, and node-pair combinations produce edge-specific conditioning
+#     signals — supplementing the broadcast FiLM conditioning.
+USE_CROSS_ATTN: bool = True
+
+# :param CROSS_ATTN_TOKENS:
+#     Number of tokens to decompose the HDC vector into for cross-attention.
+#     Only used when USE_CROSS_ATTN is True.
+CROSS_ATTN_TOKENS: int = 10
+
+# :param CROSS_ATTN_HEADS:
+#     Number of attention heads for the cross-attention conditioner.
+#     Only used when USE_CROSS_ATTN is True.
+CROSS_ATTN_HEADS: int = INHERIT
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -115,11 +191,48 @@ WEIGHT_DECAY: float = 0e-5
 
 # :param TRAIN_TIME_DISTORTION:
 #     Time distortion type during training. Options: "identity", "polydec".
-TRAIN_TIME_DISTORTION: str = "identity"
+TRAIN_TIME_DISTORTION: str = "polydec"
 
 # :param GRADIENT_CLIP_VAL:
 #     Gradient clipping value. Set to 0.0 to disable.
-GRADIENT_CLIP_VAL: float = 1.5
+GRADIENT_CLIP_VAL: float = 1.0
+
+# :param ACCUMULATE_GRAD_BATCHES:
+#     Number of batches to accumulate gradients over before performing an
+#     optimizer step. Effective batch size becomes BATCH_SIZE * ACCUMULATE_GRAD_BATCHES.
+ACCUMULATE_GRAD_BATCHES: int = 1
+
+# -----------------------------------------------------------------------------
+# Sampling Configuration
+# -----------------------------------------------------------------------------
+
+# :param SAMPLE_STEPS:
+#     Number of denoising steps during sampling.
+SAMPLE_STEPS: int = 100
+
+# :param ETA:
+#     Stochasticity parameter for sampling. 0.0 = deterministic.
+ETA: float = INHERIT
+
+# :param OMEGA:
+#     Target guidance strength parameter.
+OMEGA: float = INHERIT
+
+# :param SAMPLE_TIME_DISTORTION:
+#     Time distortion type during sampling. Options: "identity", "polydec".
+SAMPLE_TIME_DISTORTION: str = "polydec"
+
+# -----------------------------------------------------------------------------
+# Extra Features
+# -----------------------------------------------------------------------------
+
+# :param EXTRA_FEATURES_TYPE:
+#     Type of extra positional features. Options: "rrwp", "none".
+EXTRA_FEATURES_TYPE: str = "rrwp"
+
+# :param RRWP_STEPS:
+#     Number of random walk steps for RRWP positional encoding.
+RRWP_STEPS: int = 10
 
 # -----------------------------------------------------------------------------
 # Noise Distribution (different from base)
@@ -128,6 +241,51 @@ GRADIENT_CLIP_VAL: float = 1.5
 # :param NOISE_TYPE:
 #     Noise distribution type. Streaming uses marginal noise distribution.
 NOISE_TYPE: str = "marginal"
+
+# -----------------------------------------------------------------------------
+# System Configuration
+# -----------------------------------------------------------------------------
+
+# :param SEED:
+#     Random seed for reproducibility.
+SEED: int = INHERIT
+
+# -----------------------------------------------------------------------------
+# Reconstruction Evaluation
+# -----------------------------------------------------------------------------
+
+# :param NUM_RECONSTRUCTION_SAMPLES:
+#     Number of molecules to reconstruct and visualize after training.
+NUM_RECONSTRUCTION_SAMPLES: int = 100
+
+# :param RECONSTRUCTION_BATCH_SIZE:
+#     Batch size for parallel edge generation during reconstruction evaluation.
+#     Higher values are faster but use more GPU memory.
+RECONSTRUCTION_BATCH_SIZE: int = 1
+
+# :param NUM_VALIDATION_VISUALIZATIONS:
+#     Number of molecules to visualize during each validation epoch.
+NUM_VALIDATION_VISUALIZATIONS: int = 10
+
+# :param NUM_VALIDATION_REPETITIONS:
+#     Number of parallel decodings per molecule during validation visualization.
+#     Each molecule is decoded this many times in a single batched call, and
+#     the result with the lowest HDC cosine distance is kept (best-of-N).
+NUM_VALIDATION_REPETITIONS: int = 10
+
+# -----------------------------------------------------------------------------
+# Resume Training
+# -----------------------------------------------------------------------------
+
+# :param RESUME_CHECKPOINT_PATH:
+#     Path to PyTorch Lightning checkpoint (.ckpt) to resume training from.
+#     If set, RESUME_ENCODER_PATH must also be provided.
+RESUME_CHECKPOINT_PATH: Optional[str] = None#"/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/started/last.ckpt"
+
+# :param RESUME_ENCODER_PATH:
+#     Path to HyperNet encoder checkpoint when resuming training.
+#     Required if RESUME_CHECKPOINT_PATH is set.
+RESUME_ENCODER_PATH: Optional[str] = None#"/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/started/hypernet_encoder.ckpt"
 
 # =============================================================================
 # STREAMING-SPECIFIC PARAMETERS (must be defined BEFORE Experiment.extend())
@@ -140,11 +298,11 @@ NOISE_TYPE: str = "marginal"
 # :param BUFFER_SIZE:
 #     Number of samples to keep in the streaming buffer. Larger buffers provide
 #     more diversity but use more memory.
-BUFFER_SIZE: int = 10000
+BUFFER_SIZE: int = 3000
 
 # :param NUM_FRAGMENT_WORKERS:
 #     Number of worker processes generating samples from fragments.
-NUM_FRAGMENT_WORKERS: int = 4
+NUM_FRAGMENT_WORKERS: int = 2
 
 # :param FRAGMENTS_RANGE_MIN:
 #     Minimum number of fragments per generated molecule.
@@ -157,16 +315,53 @@ FRAGMENTS_RANGE_MAX: int = 4
 # :param MAX_GENERATED_NODES:
 #     Maximum number of atoms in generated molecules. Molecules exceeding this
 #     are discarded.
-MAX_GENERATED_NODES: int = 50
+MAX_GENERATED_NODES: int = 40
 
 # :param PREFILL_FRACTION:
 #     Fraction of buffer to fill before starting training.
 PREFILL_FRACTION: float = 0.1
 
+# :param ENUMERATE_ATTACHMENTS:
+#     If True, expand the fragment library by enumerating additional attachment
+#     positions on each fragment using a universal wildcard label. This increases
+#     the diversity of fragment combinations (e.g. positional isomers).
+ENUMERATE_ATTACHMENTS: bool = False
+
+# :param ENUM_MAX_VARIANTS_PER_FRAGMENT:
+#     Maximum number of enumerated attachment-point variants to generate per
+#     fragment. Only used when ENUMERATE_ATTACHMENTS is True.
+ENUM_MAX_VARIANTS_PER_FRAGMENT: int = 10
+
 # :param STEPS_PER_EPOCH:
 #     Number of training steps per epoch. Since streaming data is infinite,
 #     this defines when validation runs.
 STEPS_PER_EPOCH: int = 1000
+
+# -----------------------------------------------------------------------------
+# Small Molecule Mixing Configuration
+# -----------------------------------------------------------------------------
+
+# :param SMALL_MOL_MIXING_WEIGHT:
+#     Relative weight for small molecule samples in mixed streaming.
+#     Default 0.1 means ~10% of training samples come from small molecules.
+#     Set to 0.0 to disable small molecule mixing entirely.
+SMALL_MOL_MIXING_WEIGHT: float = 0.1
+
+# :param FRAGMENT_MIXING_WEIGHT:
+#     Relative weight for fragment-based samples in mixed streaming.
+FRAGMENT_MIXING_WEIGHT: float = 0.9
+
+# :param NUM_SMALL_MOL_WORKERS:
+#     Number of worker processes for small molecule streaming.
+NUM_SMALL_MOL_WORKERS: int = 1
+
+# :param SMALL_MOL_BUFFER_SIZE:
+#     Buffer size for small molecule streaming queue.
+SMALL_MOL_BUFFER_SIZE: int = 2000
+
+# :param SMALL_MOL_CSV_PATH:
+#     Path to pre-built CSV containing small molecule SMILES and source.
+SMALL_MOL_CSV_PATH: str = "data/small_molecules.csv"
 
 # -----------------------------------------------------------------------------
 # Validation Configuration
@@ -178,7 +373,7 @@ NUM_VALID_SAMPLES: int = 1000
 
 # :param NUM_MARGINAL_SAMPLES:
 #     Number of ZINC samples for computing edge marginals.
-NUM_MARGINAL_SAMPLES: int = 50_000
+NUM_MARGINAL_SAMPLES: int = 100_000
 
 # -----------------------------------------------------------------------------
 # Debug/Testing Modes
@@ -213,7 +408,7 @@ experiment = Experiment.extend(
 class StreamingDatasetCleanupCallback(Callback):
     """Cleanup streaming dataset workers on training end."""
 
-    def __init__(self, streaming_loader: StreamingFragmentDataLoader):
+    def __init__(self, streaming_loader):
         super().__init__()
         self.streaming_loader = streaming_loader
 
@@ -226,17 +421,74 @@ class StreamingDatasetCleanupCallback(Callback):
 # =============================================================================
 
 
+# CPK-inspired element colors
+_ELEMENT_COLORS = {
+    "C": "#909090",
+    "N": "#3050F8",
+    "O": "#FF0D0D",
+    "F": "#00CED1",
+    "S": "#FFFF30",
+    "Cl": "#1FF01F",
+    "Br": "#A62929",
+    "P": "#FF8000",
+    "I": "#940094",
+}
+
+
+def _plot_fragment_atom_distribution(e: Experiment, library: FragmentLibrary) -> None:
+    """Plot and save the atom type distribution across all fragments."""
+    from rdkit import Chem
+
+    atom_counts: Counter = Counter()
+    for smiles in library.fragments:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            continue
+        for atom in mol.GetAtoms():
+            sym = atom.GetSymbol()
+            if sym != "*":
+                atom_counts[sym] += 1
+
+    if not atom_counts:
+        e.log("WARNING: No atoms found in fragment library, skipping distribution plot")
+        return
+
+    # Sort elements by count (descending) for a cleaner plot
+    elements = sorted(atom_counts.keys(), key=lambda s: atom_counts[s], reverse=True)
+    counts = [atom_counts[el] for el in elements]
+    colors = [_ELEMENT_COLORS.get(el, "#CCCCCC") for el in elements]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(elements, counts, color=colors, edgecolor="black", linewidth=0.5)
+    ax.set_yscale("log")
+    ax.set_xlabel("Element")
+    ax.set_ylabel("Count (log scale)")
+    ax.set_title(f"Fragment Library Atom Distribution ({library.num_fragments} fragments)")
+    ax.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    plot_path = Path(e.path) / "fragment_atom_distribution.png"
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    e.log(f"Saved fragment atom distribution plot to: {plot_path}")
+
+    # Log the counts
+    for el, count in zip(elements, counts):
+        e.log(f"  {el}: {count}")
+
+
 @experiment.hook("load_train_data", default=False, replace=True)
 def load_train_data(
     e: Experiment,
     hypernet: HyperNet,
     device: torch.device,
-) -> Tuple[StreamingFragmentDataLoader, None]:
+) -> Tuple[MixedStreamingDataLoader, None]:
     """
-    Create streaming fragment dataset for training.
+    Create mixed streaming dataset for training.
 
-    Builds a FragmentLibrary from ZINC and creates a StreamingFragmentDataset
-    that generates infinite molecular data by combining BRICS fragments.
+    Builds a FragmentLibrary from ZINC, optionally adds a SmallMoleculePool,
+    and creates a MixedStreamingDataLoader that pulls from both sources
+    according to configurable weights.
 
     Args:
         e: Experiment instance
@@ -244,9 +496,12 @@ def load_train_data(
         device: Device for computation
 
     Returns:
-        Tuple of (streaming_train_loader, None)
+        Tuple of (mixed_train_loader, None)
         Note: Returns None for train_data because streaming has no static data.
     """
+    # -----------------------------------------------------------------
+    # Fragment library (unchanged)
+    # -----------------------------------------------------------------
     e.log("\nBuilding fragment library from ZINC...")
 
     zinc_train = get_split("train", dataset="zinc")
@@ -254,14 +509,20 @@ def load_train_data(
 
     fragment_library = FragmentLibrary(min_atoms=2, max_atoms=30)
 
-    if e.__DEBUG__:
-        fragment_library.build_from_dataset(
-            zinc_train, show_progress=True, max_molecules=25_000
-        )
-    else:
-        fragment_library.build_from_dataset(zinc_train, show_progress=True)
+    fragment_library.build_from_dataset(zinc_train, show_progress=True)
 
     e.log(f"Fragment library built: {fragment_library.num_fragments} fragments")
+
+    # Optionally expand library with enumerated attachment positions
+    if e.ENUMERATE_ATTACHMENTS:
+        n_before = fragment_library.num_fragments
+        n_added = fragment_library.expand_with_enumerated_positions(
+            max_new_points=e.ENUM_MAX_VARIANTS_PER_FRAGMENT,
+        )
+        e.log(f"Enumerated attachment expansion: {n_before} -> {fragment_library.num_fragments} "
+              f"fragments (+{n_added} variants)")
+        e["data/num_enumerated_variants"] = n_added
+
     e["data/num_fragments"] = fragment_library.num_fragments
 
     # Save fragment library
@@ -269,16 +530,20 @@ def load_train_data(
     fragment_library.save(library_path)
     e.log(f"Saved fragment library to: {library_path}")
 
+    # Plot atom distribution of the fragment library
+    _plot_fragment_atom_distribution(e, fragment_library)
+
     # Save encoder for workers
     encoder_path = Path(e.path) / "hypernet_encoder.ckpt"
     hypernet.save(encoder_path)
     e["results/encoder_path"] = str(encoder_path)
 
-    # Create streaming dataset
+    # -----------------------------------------------------------------
+    # Fragment streaming source
+    # -----------------------------------------------------------------
     e.log("\nCreating streaming fragment dataset...")
-    batch_size = 16 if e.__DEBUG__ else e.BATCH_SIZE
 
-    streaming_dataset = StreamingFragmentDataset(
+    fragment_dataset = StreamingFragmentDataset(
         fragment_library=fragment_library,
         hypernet_checkpoint_path=encoder_path,
         buffer_size=e.BUFFER_SIZE,
@@ -289,21 +554,63 @@ def load_train_data(
         prefill_fraction=e.PREFILL_FRACTION,
     )
 
-    train_loader = StreamingFragmentDataLoader(
-        dataset=streaming_dataset,
+    sources = [
+        StreamingSource(
+            name="fragments",
+            dataset=fragment_dataset,
+            weight=e.FRAGMENT_MIXING_WEIGHT,
+        ),
+    ]
+
+    # -----------------------------------------------------------------
+    # Small molecule streaming source (optional)
+    # -----------------------------------------------------------------
+    if e.SMALL_MOL_MIXING_WEIGHT > 0:
+        e.log("\nLoading small molecule pool...")
+        small_mol_pool = SmallMoleculePool(e.SMALL_MOL_CSV_PATH)
+        e.log(f"Small molecule pool: {small_mol_pool.size} unique SMILES")
+        e["data/small_mol_pool_size"] = small_mol_pool.size
+
+        small_mol_dataset = SmallMoleculeStreamingDataset(
+            smiles_pool=small_mol_pool,
+            hypernet_checkpoint_path=encoder_path,
+            buffer_size=e.SMALL_MOL_BUFFER_SIZE,
+            num_workers=e.NUM_SMALL_MOL_WORKERS,
+            max_nodes=e.MAX_GENERATED_NODES,
+            prefill_fraction=e.PREFILL_FRACTION,
+        )
+
+        sources.append(
+            StreamingSource(
+                name="small_molecules",
+                dataset=small_mol_dataset,
+                weight=e.SMALL_MOL_MIXING_WEIGHT,
+            ),
+        )
+
+    # -----------------------------------------------------------------
+    # Mixed loader
+    # -----------------------------------------------------------------
+    batch_size = 16 if e.__DEBUG__ else e.BATCH_SIZE
+
+    train_loader = MixedStreamingDataLoader(
+        sources=sources,
         batch_size=batch_size,
         steps_per_epoch=e.STEPS_PER_EPOCH,
     )
 
-    e.log(f"Streaming loader: {len(train_loader)} steps per epoch")
+    e.log(f"Mixed streaming loader: {len(train_loader)} steps per epoch, "
+          f"{len(sources)} source(s)")
+    for src in sources:
+        e.log(f"  - {src.name}: weight={src.weight}")
 
-    # Test streaming dataloader
-    e.log("\nTesting streaming dataloader (3 batches)...")
+    # Test mixed dataloader
+    e.log("\nTesting mixed streaming dataloader (3 batches)...")
     try:
         train_loader.test_iteration(num_batches=3)
-        e.log("Streaming dataloader test passed!")
+        e.log("Mixed streaming dataloader test passed!")
     except Exception as ex:
-        e.log(f"ERROR: Streaming dataloader test failed: {ex}")
+        e.log(f"ERROR: Mixed streaming dataloader test failed: {ex}")
         train_loader.stop()
         raise
 
@@ -410,13 +717,15 @@ def compute_statistics(
 def modify_callbacks(
     e: Experiment,
     callbacks: List[Callback],
-    train_loader: StreamingFragmentDataLoader,
+    train_loader,
 ) -> List[Callback]:
     """
     Add streaming cleanup callback.
 
     Adds StreamingDatasetCleanupCallback to ensure worker processes are
-    properly terminated when training ends.
+    properly terminated when training ends.  Works with both
+    ``MixedStreamingDataLoader`` and ``StreamingFragmentDataLoader`` since
+    both implement ``stop()``.
 
     Args:
         e: Experiment instance
@@ -448,6 +757,10 @@ def testing(e: Experiment):
     e.NUM_FRAGMENT_WORKERS = 1
     e.NUM_VALID_SAMPLES = 20
     e.NUM_MARGINAL_SAMPLES = 100
+    # Small molecule mixing
+    e.SMALL_MOL_MIXING_WEIGHT = 0.2
+    e.NUM_SMALL_MOL_WORKERS = 1
+    e.SMALL_MOL_BUFFER_SIZE = 50
 
 
 # =============================================================================

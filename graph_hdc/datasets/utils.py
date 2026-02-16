@@ -26,6 +26,7 @@ from graph_hdc.datasets.zinc_smiles import ZincSmiles
 
 if TYPE_CHECKING:
     from graph_hdc.hypernet import HyperNet
+    from graph_hdc.hypernet.configs import RWConfig
 
 
 def get_split(
@@ -224,6 +225,7 @@ def post_compute_encodings(
         out = hypernet.forward(batch, normalize=normalize_graph)
 
         graph_terms = out["graph_embedding"].detach().cpu()
+        node_terms = out["node_terms"].detach().cpu()
         edge_terms = out["edge_terms"].detach().cpu()
 
         per_graph = batch.to_data_list()
@@ -231,11 +233,59 @@ def post_compute_encodings(
 
         for i, d in enumerate(per_graph):
             d = d.clone()
+            d.node_terms = node_terms[i]
             d.edge_terms = edge_terms[i]
             d.graph_terms = graph_terms[i]
             augmented.append(d)
 
     return augmented
+
+
+def scan_node_features_with_rw(
+    dataset_name: Literal["qm9", "zinc"],
+    rw_config: "RWConfig",
+    max_samples: int | None = None,
+) -> set[tuple]:
+    """
+    Scan a dataset and return observed node feature tuples after RW augmentation.
+
+    This bridges cached datasets (whose ``data.x`` does not include RW columns)
+    with the RW-augmented codebook that HyperNet needs.  Each sample is cloned,
+    augmented with :func:`augment_data_with_rw`, and the resulting extended
+    feature tuples are collected.
+
+    Parameters
+    ----------
+    dataset_name : {"qm9", "zinc"}
+        Dataset to scan.
+    rw_config : RWConfig
+        Random walk configuration (must have ``enabled=True``).
+    max_samples : int, optional
+        If given, stop after this many samples (useful for testing).
+
+    Returns
+    -------
+    set[tuple]
+        All unique node feature tuples observed across the dataset
+        (with RW columns appended).
+    """
+    from graph_hdc.utils.rw_features import augment_data_with_rw
+
+    node_features: set[tuple] = set()
+    count = 0
+
+    for split in ["train", "valid", "test"]:
+        ds = get_split(split=split, dataset=dataset_name)
+        for data in tqdm(ds, desc=f"Scanning {split} with RW", unit="mol"):
+            d = data.clone()
+            d = augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries)
+            for row in d.x.int():
+                node_features.add(tuple(row.tolist()))
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                return node_features
+
+    return node_features
 
 
 def compute_standardization_stats(
@@ -263,3 +313,5 @@ def compute_standardization_stats(
     graph_std = graph_terms.std(dim=0).clamp(min=1e-8)
 
     return edge_mean, edge_std, graph_mean, graph_std
+
+

@@ -1,67 +1,122 @@
 #!/usr/bin/env python
 """
-Evaluate Node Set Decoding from HDC Embeddings (QM9).
+Evaluate Node Set Decoding from HDC Embeddings.
 
 This experiment evaluates the accuracy of decoding node multisets from order-0
-hyperdimensional computing (HDC) embeddings. For each molecule in the QM9 dataset:
-1. Extract ground truth node multiset from data.x
+hyperdimensional computing (HDC) embeddings. For each molecule in the dataset:
+1. Extract ground truth node multiset from data.x (optionally augmented with RW features)
 2. Encode to order-0 embedding (bundled node hypervectors, no message passing)
 3. Decode using decode_order_zero_counter_iterative() (iterative unbinding method)
 4. Compare decoded multiset with ground truth
 
-Metrics reported:
-- Exact match accuracy: % of molecules where decoded == ground truth
-- Per-atom-type breakdown
-- Error analysis by feature dimension
+The experiment sweeps over multiple HV dimensions to find the minimal dimension
+that achieves ~98% node decoding recovery.
+
+Metrics reported per dimension:
+- Exact match accuracy per split and overall
+- Summary table: hv_dim | train_acc | valid_acc | test_acc | overall_acc
 
 Usage:
-    # Quick test
+    # Quick test (2 dims, 100 samples)
     python evaluate_node_decoding.py --__TESTING__ True
 
-    # Full evaluation
+    # Full evaluation without RW
     python evaluate_node_decoding.py --__DEBUG__ False
+
+    # Full evaluation with RW features
+    python evaluate_node_decoding.py --USE_RW True --__DEBUG__ False
 """
 
 from __future__ import annotations
 
-import math
-from collections import Counter, OrderedDict, defaultdict
-from pathlib import Path
+from collections import Counter, defaultdict
 
 import torch
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from torch_geometric.data import Batch
+from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from graph_hdc.datasets.utils import get_split, get_dataset_info
-from graph_hdc.hypernet.configs import (
-    DSHDCConfig,
-    FeatureConfig,
-    Features,
-    IndexRange,
-)
+from graph_hdc.datasets.utils import get_split
+from graph_hdc.hypernet.configs import RWConfig, create_config_with_rw
 from graph_hdc.hypernet.encoder import HyperNet
-from graph_hdc.hypernet.feature_encoders import CombinatoricIntegerEncoder
-from graph_hdc.hypernet.types import VSAModel
 from graph_hdc.utils.helpers import scatter_hd
+from graph_hdc.utils.rw_features import augment_data_with_rw
 
 # =============================================================================
 # PARAMETERS
 # =============================================================================
 
-# HDC Encoder configuration
-HDC_DIM: int = 512  # Hypervector dimension
-HDC_DEPTH: int = 3  # Message passing depth (not used for order-0, but needed for HyperNet init)
+# -----------------------------------------------------------------------------
+# Evaluation Configuration
+# -----------------------------------------------------------------------------
 
-# Processing
-BATCH_SIZE: int = 512  # Batch size for encoding
+# :param HV_DIMS:
+#     List of hypervector dimensions to sweep. For each dimension a fresh
+#     HyperNet is created and node decoding accuracy is evaluated.
+HV_DIMS: list[int] = [512, 768, 1024, 1536, 2048]
 
-# System configuration
+# :param BASE_DATASET:
+#     Dataset name for evaluation. Supported: "qm9", "zinc".
+BASE_DATASET: str = "zinc"
+
+# :param SUBSAMPLE_RATIO:
+#     Fraction of each split to evaluate on (0, 1]. Default 1 uses the full
+#     dataset. E.g. 0.1 randomly samples 10% of each split.
+SUBSAMPLE_RATIO: float = 0.2
+
+# :param BATCH_SIZE:
+#     Batch size for batched HDC encoding during evaluation.
+BATCH_SIZE: int = 128
+
+# :param DEVICE:
+#     Device for HDC encoding. Set to "auto" (default) to pick CUDA if
+#     available, or specify "cpu" / "cuda" explicitly.
+DEVICE: str = "cuda"
+
+# -----------------------------------------------------------------------------
+# HDC Encoder Configuration
+# -----------------------------------------------------------------------------
+
+# :param USE_RW:
+#     Whether to augment HDC node features with random walk return probabilities.
+#     When True, each node's feature tuple is extended with binned RW return
+#     probabilities at each step in RW_K_VALUES, making the HDC conditioning
+#     vector more expressive about global graph topology.
+USE_RW: bool = True
+
+# :param RW_K_VALUES:
+#     Random walk steps at which to compute return probabilities. Only used
+#     when USE_RW is True.
+RW_K_VALUES: tuple[int, ...] = (3, 6)
+
+# :param RW_NUM_BINS:
+#     Number of uniform bins for discretising RW return probabilities on [0,1].
+#     Only used when USE_RW is True.
+RW_NUM_BINS: int = 10
+
+# :param PRUNE_CODEBOOK:
+#     Whether to prune the HDC codebook to only feature tuples observed in the
+#     dataset. When True (default), unseen tuples cause encoding errors — set to
+#     False when training on generated molecules (e.g. streaming fragments) whose
+#     topology may produce novel feature combinations.
+PRUNE_CODEBOOK: bool = False
+
+# -----------------------------------------------------------------------------
+# System
+# -----------------------------------------------------------------------------
+
+# :param SEED:
+#     Random seed for reproducibility (codebook generation and subsampling).
 SEED: int = 42
 
-# Debug/Testing modes
+# :param __DEBUG__:
+#     Debug mode — reuses same output folder during development.
 __DEBUG__: bool = True
+
+# :param __TESTING__:
+#     Testing mode — runs with minimal iterations for validation.
 __TESTING__: bool = False
 
 
@@ -70,64 +125,14 @@ __TESTING__: bool = False
 # =============================================================================
 
 
-def create_hdc_config(
-    hv_dim: int,
-    depth: int,
-    device: str = "cpu",
-) -> DSHDCConfig:
-    """
-    Create a HyperNet configuration for QM9.
-
-    Args:
-        hv_dim: Hypervector dimension
-        depth: Message passing depth
-        device: Device string
-
-    Returns:
-        DSHDCConfig for HyperNet initialization
-    """
-    # QM9: 4 atom types, 5 degrees, 3 charges, 5 hydrogens
-    node_feature_config = FeatureConfig(
-        count=math.prod([4, 5, 3, 5]),  # 300 combinations
-        encoder_cls=CombinatoricIntegerEncoder,
-        index_range=IndexRange((0, 4)),
-        bins=[4, 5, 3, 5],
-    )
-
-    return DSHDCConfig(
-        name=f"QM9_HRR_{hv_dim}_depth{depth}",
-        hv_dim=hv_dim,
-        vsa=VSAModel.HRR,
-        base_dataset="qm9",
-        hypernet_depth=depth,
-        device=device,
-        seed=42,
-        normalize=True,
-        dtype="float64",
-        node_feature_configs=OrderedDict([
-            (Features.NODE_FEATURES, node_feature_config),
-        ]),
-    )
-
-
-def get_ground_truth_node_counter(data: Batch | torch.Tensor) -> dict[int, Counter]:
-    """
-    Extract ground truth node multiset from PyG data.
-
-    Args:
-        data: PyG Data or Batch object with x tensor
-
-    Returns:
-        Dictionary mapping batch index to Counter of node tuples
-    """
-    x = data.x if hasattr(data, "x") else data
-    batch = data.batch if hasattr(data, "batch") else torch.zeros(x.size(0), dtype=torch.long)
+def get_ground_truth_node_counter(data: Batch) -> dict[int, Counter]:
+    """Extract ground truth node multiset from PyG data."""
+    x = data.x
+    batch = data.batch
 
     counters: dict[int, Counter] = defaultdict(Counter)
-
     for node_idx in range(x.size(0)):
         batch_idx = int(batch[node_idx].item())
-        # Convert features to tuple of ints
         features = tuple(int(f) for f in x[node_idx].tolist())
         counters[batch_idx][features] += 1
 
@@ -138,43 +143,18 @@ def compute_order_zero_embedding(
     hypernet: HyperNet,
     data: Batch,
 ) -> torch.Tensor:
-    """
-    Compute order-0 embedding (bundled node hypervectors, no message passing).
-
-    Args:
-        hypernet: HyperNet encoder instance
-        data: PyG Batch object
-
-    Returns:
-        Order-0 graph embeddings [batch_size, hv_dim]
-    """
-    # Encode node features to hypervectors
+    """Compute order-0 embedding (bundled node HVs, no message passing)."""
     data = hypernet.encode_properties(data)
-
-    # Bundle node hypervectors per graph (no message passing)
-    order_zero_embedding = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
-
-    return order_zero_embedding
+    return scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
 
 
 def compare_counters(decoded: Counter, ground_truth: Counter) -> dict:
-    """
-    Compare decoded and ground truth counters.
-
-    Args:
-        decoded: Decoded node counter
-        ground_truth: Ground truth node counter
-
-    Returns:
-        Dictionary with comparison metrics
-    """
+    """Compare decoded and ground truth counters."""
     exact_match = decoded == ground_truth
 
-    # Compute detailed metrics
     all_keys = set(decoded.keys()) | set(ground_truth.keys())
-
-    missing_in_decoded = Counter()  # In GT but not decoded (or under-counted)
-    extra_in_decoded = Counter()  # In decoded but not GT (or over-counted)
+    missing_in_decoded = Counter()
+    extra_in_decoded = Counter()
 
     for key in all_keys:
         gt_count = ground_truth.get(key, 0)
@@ -194,12 +174,6 @@ def compare_counters(decoded: Counter, ground_truth: Counter) -> dict:
     }
 
 
-def get_atom_type_name(atom_idx: int) -> str:
-    """Get human-readable atom type name for QM9."""
-    atom_map = {0: "C", 1: "N", 2: "O", 3: "F"}
-    return atom_map.get(atom_idx, f"Unknown({atom_idx})")
-
-
 # =============================================================================
 # EXPERIMENT
 # =============================================================================
@@ -211,206 +185,170 @@ def get_atom_type_name(atom_idx: int) -> str:
     glob=globals(),
 )
 def experiment(e: Experiment) -> None:
-    """Main experiment: evaluate node decoding accuracy on QM9."""
-    e.log("=" * 60)
-    e.log("Node Decoding Accuracy Evaluation (QM9)")
-    e.log("=" * 60)
+    """Evaluate node decoding accuracy across HV dimensions."""
+    e.log("=" * 70)
+    e.log("Node Decoding Accuracy Evaluation — Dimension Sweep")
+    e.log("=" * 70)
 
-    # Store configuration
-    e["config/dataset"] = "qm9"
-    e["config/hdc_dim"] = e.HDC_DIM
-    e["config/hdc_depth"] = e.HDC_DEPTH
-    e["config/batch_size"] = e.BATCH_SIZE
-    e["config/seed"] = e.SEED
+    import random as _random
+    _random.seed(e.SEED)
 
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    e.log(f"Using device: {device}")
-    e["config/device"] = str(device)
+    if e.DEVICE == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(e.DEVICE)
+    e.log(f"Device: {device}")
+    e.log(f"Dataset: {e.BASE_DATASET}")
+    e.log(f"Use RW features: {e.USE_RW}")
+    e.log(f"Codebook pruning: {e.PRUNE_CODEBOOK}")
+    e.log(f"Subsample ratio: {e.SUBSAMPLE_RATIO}")
 
-    # Create HyperNet encoder
-    e.log("Creating HyperNet encoder for QM9...")
-    config = create_hdc_config(e.HDC_DIM, e.HDC_DEPTH, device=str(device))
-    hypernet = HyperNet(config)
-    hypernet.to(device)
-    hypernet.eval()
-
-    e.log(f"  Node codebook size: {hypernet.nodes_codebook.shape[0]}")
-    e.log(f"  Hypervector dimension: {hypernet.hv_dim}")
-    e["model/node_codebook_size"] = hypernet.nodes_codebook.shape[0]
-    e["model/hv_dim"] = hypernet.hv_dim
-
-    # Get dataset info for feature names
-    dataset_info = get_dataset_info("qm9")
-    e["data/num_unique_node_types"] = len(dataset_info.node_features)
-
-    # Feature dimension names for QM9
-    feature_names = ["atom_type", "degree_idx", "formal_charge_idx", "explicit_hs"]
-    e["data/feature_names"] = feature_names
-
-    # Process each split
-    splits = ["train", "valid", "test"]
-    overall_results = {
-        "total_molecules": 0,
-        "total_exact_matches": 0,
-        "per_split": {},
-        "error_analysis": {
-            "missing_by_atom_type": Counter(),
-            "extra_by_atom_type": Counter(),
-            "node_count_errors": Counter(),  # (decoded_count - gt_count)
-        },
-    }
-
-    for split in splits:
-        e.log(f"\nProcessing {split} split...")
-        dataset = get_split(split, dataset="qm9")
-
-        if e.__TESTING__:
-            # Limit to 100 samples in testing mode
-            dataset = dataset[:100]
-
-        num_samples = len(dataset)
-        e.log(f"  Number of samples: {num_samples}")
-
-        split_exact_matches = 0
-        split_results = []
-
-        # Process in batches
-        from torch_geometric.loader import DataLoader
-        loader = DataLoader(dataset, batch_size=e.BATCH_SIZE, shuffle=False)
-
-        for batch in tqdm(loader, desc=f"  {split}", disable=not e.__DEBUG__):
-            batch = batch.to(device)
-
-            # Get ground truth
-            gt_counters = get_ground_truth_node_counter(batch)
-
-            # Compute order-0 embedding
-            with torch.no_grad():
-                order_zero_emb = compute_order_zero_embedding(hypernet, batch)
-
-            # Decode using iterative unbinding method
-            decoded_counters = hypernet.decode_order_zero_counter_iterative(order_zero_emb)
-
-            # Compare each sample in batch
-            batch_size = order_zero_emb.size(0)
-            for b_idx in range(batch_size):
-                gt_counter = gt_counters.get(b_idx, Counter())
-                dec_counter = decoded_counters.get(b_idx, Counter())
-
-                comparison = compare_counters(dec_counter, gt_counter)
-                split_results.append(comparison)
-
-                if comparison["exact_match"]:
-                    split_exact_matches += 1
-                else:
-                    # Track errors by atom type
-                    for node_tuple, count in comparison["missing_in_decoded"].items():
-                        atom_type = node_tuple[0]
-                        overall_results["error_analysis"]["missing_by_atom_type"][atom_type] += count
-                    for node_tuple, count in comparison["extra_in_decoded"].items():
-                        atom_type = node_tuple[0]
-                        overall_results["error_analysis"]["extra_by_atom_type"][atom_type] += count
-
-                    # Track node count errors
-                    count_diff = comparison["decoded_total"] - comparison["ground_truth_total"]
-                    overall_results["error_analysis"]["node_count_errors"][count_diff] += 1
-
-        # Compute split accuracy
-        split_accuracy = split_exact_matches / num_samples if num_samples > 0 else 0.0
-        e.log(f"  Exact match accuracy: {split_accuracy:.4f} ({split_exact_matches}/{num_samples})")
-
-        overall_results["per_split"][split] = {
-            "num_samples": num_samples,
-            "exact_matches": split_exact_matches,
-            "accuracy": split_accuracy,
-        }
-        overall_results["total_molecules"] += num_samples
-        overall_results["total_exact_matches"] += split_exact_matches
-
-        # Track metrics
-        e.track(f"accuracy/{split}", split_accuracy)
-        e[f"results/{split}/num_samples"] = num_samples
-        e[f"results/{split}/exact_matches"] = split_exact_matches
-        e[f"results/{split}/accuracy"] = split_accuracy
-
-    # Compute overall accuracy
-    overall_accuracy = (
-        overall_results["total_exact_matches"] / overall_results["total_molecules"]
-        if overall_results["total_molecules"] > 0
-        else 0.0
+    rw_config = RWConfig(
+        enabled=e.USE_RW,
+        k_values=e.RW_K_VALUES,
+        num_bins=e.RW_NUM_BINS,
     )
 
-    e.log("\n" + "=" * 60)
-    e.log("OVERALL RESULTS")
-    e.log("=" * 60)
-    e.log(f"Total molecules: {overall_results['total_molecules']}")
-    e.log(f"Total exact matches: {overall_results['total_exact_matches']}")
-    e.log(f"Overall accuracy: {overall_accuracy:.4f}")
-
-    e["results/overall/total_molecules"] = overall_results["total_molecules"]
-    e["results/overall/total_exact_matches"] = overall_results["total_exact_matches"]
-    e["results/overall/accuracy"] = overall_accuracy
-
-    # Error analysis
-    e.log("\n" + "-" * 60)
-    e.log("ERROR ANALYSIS")
-    e.log("-" * 60)
-
-    # Missing nodes by atom type
-    e.log("\nMissing nodes by atom type (under-decoded):")
-    missing_by_atom = overall_results["error_analysis"]["missing_by_atom_type"]
-    for atom_idx, count in sorted(missing_by_atom.items()):
-        atom_name = get_atom_type_name(atom_idx)
-        e.log(f"  {atom_name} (idx={atom_idx}): {count}")
-        e[f"error_analysis/missing_by_atom_type/{atom_name}"] = count
-
-    # Extra nodes by atom type
-    e.log("\nExtra nodes by atom type (over-decoded):")
-    extra_by_atom = overall_results["error_analysis"]["extra_by_atom_type"]
-    for atom_idx, count in sorted(extra_by_atom.items()):
-        atom_name = get_atom_type_name(atom_idx)
-        e.log(f"  {atom_name} (idx={atom_idx}): {count}")
-        e[f"error_analysis/extra_by_atom_type/{atom_name}"] = count
-
-    # Node count error distribution
-    e.log("\nNode count error distribution (decoded - ground_truth):")
-    count_errors = overall_results["error_analysis"]["node_count_errors"]
-    for diff, count in sorted(count_errors.items()):
-        e.log(f"  {diff:+d}: {count} molecules")
-        e[f"error_analysis/node_count_errors/{diff}"] = count
-
-    # Per-atom-type accuracy (based on missing/extra counts)
-    e.log("\n" + "-" * 60)
-    e.log("PER-ATOM-TYPE SUMMARY")
-    e.log("-" * 60)
-
-    all_atom_indices = set(missing_by_atom.keys()) | set(extra_by_atom.keys())
-    for atom_idx in sorted(all_atom_indices):
-        atom_name = get_atom_type_name(atom_idx)
-        missing = missing_by_atom.get(atom_idx, 0)
-        extra = extra_by_atom.get(atom_idx, 0)
-        total_errors = missing + extra
-        e.log(f"  {atom_name}: missing={missing}, extra={extra}, total_errors={total_errors}")
-
-    # Summary table
-    e.log("\n" + "=" * 60)
-    e.log("SUMMARY TABLE")
-    e.log("=" * 60)
-    e.log(f"{'Split':<10} {'Samples':<10} {'Matches':<10} {'Accuracy':<10}")
-    e.log("-" * 40)
+    # ------------------------------------------------------------------
+    # Prepare datasets (loaded once, reused across dims)
+    # ------------------------------------------------------------------
+    splits = ["train", "valid", "test"]
+    datasets = {}
     for split in splits:
-        s = overall_results["per_split"][split]
-        e.log(f"{split:<10} {s['num_samples']:<10} {s['exact_matches']:<10} {s['accuracy']:<10.4f}")
-    e.log("-" * 40)
-    e.log(f"{'TOTAL':<10} {overall_results['total_molecules']:<10} {overall_results['total_exact_matches']:<10} {overall_accuracy:<10.4f}")
+        ds = list(get_split(split, dataset=e.BASE_DATASET))
+        if e.__TESTING__:
+            ds = ds[:100]
+        elif e.SUBSAMPLE_RATIO < 1.0:
+            n = max(1, int(len(ds) * e.SUBSAMPLE_RATIO))
+            ds = _random.sample(ds, n)
+        datasets[split] = ds
+        e.log(f"  {split}: {len(ds)} samples")
 
-    e.log("\nExperiment completed successfully!")
+    # ------------------------------------------------------------------
+    # Pre-scan for observed node features (needed for codebook pruning)
+    # Scans the exact same data we'll evaluate on, avoiding mismatches.
+    # ------------------------------------------------------------------
+    observed_node_features: set[tuple] | None = None
+    if rw_config.enabled and e.PRUNE_CODEBOOK:
+        e.log("Pre-scanning datasets for RW-augmented node features...")
+        observed_node_features = set()
+        for split, ds in datasets.items():
+            for data in tqdm(ds, desc=f"  Scanning {split}", disable=not e.__DEBUG__):
+                d = data.clone()
+                d = augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries)
+                for row in d.x.int():
+                    observed_node_features.add(tuple(row.tolist()))
+        e.log(f"  Found {len(observed_node_features)} unique node feature tuples (with RW)")
+        e["scan/num_observed_features"] = len(observed_node_features)
+
+    # ------------------------------------------------------------------
+    # Dimension sweep
+    # ------------------------------------------------------------------
+    summary_rows: list[dict] = []
+
+    for hv_dim in e.HV_DIMS:
+        e.log(f"\n{'─' * 70}")
+        e.log(f"HV_DIM = {hv_dim}")
+        e.log(f"{'─' * 70}")
+
+        # Build config + HyperNet for this dimension
+        cfg = create_config_with_rw(
+            base_dataset=e.BASE_DATASET,
+            hv_dim=hv_dim,
+            rw_config=rw_config,
+            prune_codebook=e.PRUNE_CODEBOOK,
+        )
+        hn = HyperNet(cfg, observed_node_features=observed_node_features)
+        hn.to(device)
+        hn.eval()
+        e.log(f"Codebook size: {hn.nodes_codebook.shape[0]} entries")
+
+        e.log(f"  Codebook size: {hn.nodes_codebook.shape[0]}")
+
+        row = {"hv_dim": hv_dim}
+        total_mols = 0
+        total_matches = 0
+
+        for split in splits:
+            ds = datasets[split]
+            loader = DataLoader(ds, batch_size=e.BATCH_SIZE, shuffle=False)
+
+            split_matches = 0
+            split_count = 0
+
+            for batch in tqdm(loader, desc=f"  {split} (dim={hv_dim})", disable=not e.__DEBUG__):
+                # Augment with RW features on-the-fly
+                if rw_config.enabled:
+                    data_list = batch.to_data_list()
+                    data_list = [
+                        augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries)
+                        for d in data_list
+                    ]
+                    batch = Batch.from_data_list(data_list)
+
+                batch = batch.to(device)
+
+                gt_counters = get_ground_truth_node_counter(batch)
+
+                with torch.no_grad():
+                    order_zero_emb = compute_order_zero_embedding(hn, batch)
+
+                decoded_counters = hn.decode_order_zero_counter_iterative(order_zero_emb)
+
+                batch_size = order_zero_emb.size(0)
+                for b_idx in range(batch_size):
+                    gt = gt_counters.get(b_idx, Counter())
+                    dec = decoded_counters.get(b_idx, Counter())
+                    if dec == gt:
+                        split_matches += 1
+                    split_count += 1
+
+            acc = split_matches / split_count if split_count > 0 else 0.0
+            row[split] = acc
+            total_mols += split_count
+            total_matches += split_matches
+
+            e.log(f"  {split}: {acc:.4f} ({split_matches}/{split_count})")
+            e[f"results/dim_{hv_dim}/{split}/accuracy"] = acc
+            e[f"results/dim_{hv_dim}/{split}/exact_matches"] = split_matches
+            e[f"results/dim_{hv_dim}/{split}/num_samples"] = split_count
+
+        overall_acc = total_matches / total_mols if total_mols > 0 else 0.0
+        row["overall"] = overall_acc
+        summary_rows.append(row)
+
+        e.log(f"  OVERALL: {overall_acc:.4f} ({total_matches}/{total_mols})")
+        e[f"results/dim_{hv_dim}/overall_accuracy"] = overall_acc
+
+    # ------------------------------------------------------------------
+    # Summary table
+    # ------------------------------------------------------------------
+    e.log("\n" + "=" * 70)
+    e.log("SUMMARY TABLE")
+    e.log("=" * 70)
+
+    header = f"{'hv_dim':>8} | {'train':>8} | {'valid':>8} | {'test':>8} | {'overall':>8}"
+    e.log(header)
+    e.log("-" * len(header))
+
+    for row in summary_rows:
+        line = (
+            f"{row['hv_dim']:>8d} | "
+            f"{row.get('train', 0.0):>8.4f} | "
+            f"{row.get('valid', 0.0):>8.4f} | "
+            f"{row.get('test', 0.0):>8.4f} | "
+            f"{row['overall']:>8.4f}"
+        )
+        e.log(line)
+
+    e["summary"] = summary_rows
+    e.log("\nExperiment completed.")
 
 
 @experiment.testing
 def testing(e: Experiment) -> None:
-    """Quick test mode - reduced parameters."""
+    """Quick test mode — reduced dims and samples."""
+    e.HV_DIMS = [256, 512]
     e.BATCH_SIZE = 32
 
 

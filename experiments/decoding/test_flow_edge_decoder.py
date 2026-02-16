@@ -17,25 +17,29 @@ Outputs:
 - Summary bar chart (valid/match/invalid counts)
 - Timing statistics
 
+This is the BASE TEST EXPERIMENT. Child experiments can inherit via
+Experiment.extend() and override hooks for custom sampling behavior
+(e.g. HDC-guided sampling, HDC early stopping).
+
 Usage:
     # Test with SMILES list
-    python test_flow_edge_decoder.py \
-        --HDC_ENCODER_PATH /path/to/encoder.ckpt \
-        --FLOW_DECODER_PATH /path/to/decoder.ckpt \
+    python test_flow_edge_decoder.py \\
+        --HDC_ENCODER_PATH /path/to/encoder.ckpt \\
+        --FLOW_DECODER_PATH /path/to/decoder.ckpt \\
         --DATASET qm9
 
     # Test with CSV file
-    python test_flow_edge_decoder.py \
-        --HDC_ENCODER_PATH /path/to/encoder.ckpt \
-        --FLOW_DECODER_PATH /path/to/decoder.ckpt \
-        --SMILES_CSV_PATH /path/to/molecules.csv \
+    python test_flow_edge_decoder.py \\
+        --HDC_ENCODER_PATH /path/to/encoder.ckpt \\
+        --FLOW_DECODER_PATH /path/to/decoder.ckpt \\
+        --SMILES_CSV_PATH /path/to/molecules.csv \\
         --DATASET qm9
 
     # Test on CPU (useful when GPU memory is limited)
-    python test_flow_edge_decoder.py \
-        --HDC_ENCODER_PATH /path/to/encoder.ckpt \
-        --FLOW_DECODER_PATH /path/to/decoder.ckpt \
-        --DATASET qm9 \
+    python test_flow_edge_decoder.py \\
+        --HDC_ENCODER_PATH /path/to/encoder.ckpt \\
+        --FLOW_DECODER_PATH /path/to/decoder.ckpt \\
+        --DATASET qm9 \\
         --DEVICE cpu
 
     # Quick test
@@ -46,7 +50,6 @@ from __future__ import annotations
 
 import io
 import time
-from collections import Counter
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -56,288 +59,275 @@ from PIL import Image
 
 import matplotlib.pyplot as plt
 import torch
-import torch.nn.functional as F
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from rdkit import Chem
 from rdkit.Chem import Draw
 from torch_geometric.data import Data
 
+from graph_hdc.hypernet import load_hypernet
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.models.flow_edge_decoder import (
-    ZINC_ATOM_TYPES,
-    ZINC_IDX_TO_ATOM,
-    NODE_FEATURE_DIM,
-    NUM_EDGE_CLASSES,
     FlowEdgeDecoder,
     node_tuples_to_onehot,
 )
+from graph_hdc.utils.experiment_helpers import (
+    compute_hdc_distance,
+    create_accuracy_by_size_chart,
+    create_reconstruction_plot,
+    create_summary_bar_chart,
+    create_test_dummy_models,
+    decode_nodes_from_hdc,
+    get_canonical_smiles,
+    is_valid_mol,
+    load_smiles_from_csv,
+    pyg_to_mol,
+    smiles_to_pyg_data,
+)
 from graph_hdc.utils.helpers import scatter_hd
+
 
 # =============================================================================
 # PARAMETERS
 # =============================================================================
 
-# Model paths (required)
-HDC_ENCODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/debug/hypernet_encoder.ckpt"  # Path to saved HyperNet encoder checkpoint
-FLOW_DECODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/debug/last.ckpt"  # Path to saved FlowEdgeDecoder checkpoint
+# -----------------------------------------------------------------------------
+# Model Paths
+# -----------------------------------------------------------------------------
 
-# Dataset type (ZINC only supported)
+# :param HDC_ENCODER_PATH:
+#     Path to saved HyperNet encoder checkpoint (.ckpt). Required unless
+#     running in __TESTING__ mode.
+HDC_ENCODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/hypernet_encoder.ckpt"
+
+# :param FLOW_DECODER_PATH:
+#     Path to saved FlowEdgeDecoder checkpoint (.ckpt). Required unless
+#     running in __TESTING__ mode.
+FLOW_DECODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/last.ckpt"
+
+# -----------------------------------------------------------------------------
+# Dataset Configuration
+# -----------------------------------------------------------------------------
+
+# :param DATASET:
+#     Dataset type for atom feature encoding. Determines node feature
+#     dimensions and atom type mapping. Options: "zinc", "qm9".
 DATASET: str = "zinc"
 
-# Input SMILES - either provide CSV path or direct list
-SMILES_CSV_PATH: str = ""  # Path to CSV file with "smiles" column
+# -----------------------------------------------------------------------------
+# Input SMILES
+# -----------------------------------------------------------------------------
+
+# :param SMILES_CSV_PATH:
+#     Path to CSV file with a "smiles" column. If empty, uses SMILES_LIST
+#     instead.
+SMILES_CSV_PATH: str = ""
+
+# :param SMILES_LIST:
+#     List of SMILES strings to test. Used when SMILES_CSV_PATH is empty.
+#     Default: 100 diverse SMILES from ZINC (MaxMin on Morgan FP r=2, 2048 bits),
+#     cleaned of charges, stereochemistry, and explicit hydrogens.
 SMILES_LIST: list[str] = [
-    "CCO",      # Ethanol
-    "CC(=O)O",  # Acetic acid
-    "c1ccccc1", # Benzene
-    "CCN",      # Ethylamine
-    "CC=O",     # Acetaldehyde
-    "CC(=O)Oc1ccccc1C(=O)O",
-    "Cn1cnc2N(C)C(=O)N(C)C(=O)c12",
-    "CN1C(=O)C=C(Cc2ccc(F)c(F)c2)N(C)C1=O",
-    "CN1C(=O)C=C(Cc2cc(F)ccc2F)N(C)C1=O",
-    "CN1CC=C(Cc2cc(F)c(=O)cc2F)C(N)C1=O",
-    
+    "CCN(Cc1ccc(OC)c(OC)c1)C(=O)c2cscc2",
+    "C(NCC1=CC=C(C)C=C1)1=NC=NC(N2C3CC(C)(C)CC(C)(C3)C2)=C1N",
+    "C(=O)1N(C)CC(NC(C2SC=CC=2)C2CC2)C1",
+    "C1C(C(C#N)N2C(C3=CC=CC=C3)CC(C)=N2)=COC=1",
+    "FC1CCCCC1Br",
+    "NCCCCNC(=S)S",
+    "CCOCC(N)CSCC",
+    "CC(Br)=CCCCBr",
+    "C=CC(N)CCC(F)(F)F",
+    "O=C(CO)C(O)C(O)CO",
+    "Fc1cc(F)c(F)c(I)c1",
+    "FC=CC1C=CC=CC1(F)F",
+    "OC1COCOC1C1OCOCC1O",
+    "CCC(C)C(C)n1nnnc1N",
+    "CCCCC1C(C)C1(Br)Br",
+    "N#CCCCCOC1CCCC(N)C1",
+    "FOC(F)=C(F)C(F)(F)F",
+    "NS(=O)(=O)c1cscc1Br",
+    "Oc1ncnc2cnc(Cl)nc12",
+    "CSc1nc(C)c2c(n1)SCC2",
+    "CCCc1ccc(C=CCCNC)cc1",
+    "OCC1OC(O)C(F)C(O)C1O",
+    "CC1(c2ccc(Cl)nn2)CC1",
+    "C=CCN(CC=C)S(C)(=O)=O",
+    "CCCC(C)CC(NCC)C1CSCCS1",
+    "CN(C)CCN1CCN(CCCCS)CC1",
+    "Nc1cc2c3c(c1)CCCN3CCC2",
+    "Nc1ccccc1SCCCOc1ccccc1",
+    "C1=C(COCC2=CCCSC2)CSCC1",
+    "CN(C)Cc1noc(C2CNCCO2)n1",
+    "CC(C)(CCO)c1cc(Cl)sc1Cl",
+    "CC1(C)SC(C)(C)SC(C)(C)S1",
+    "N#CC1=C2C(=S)N=CN=C2N=N1",
+    "CC(CCl)CN(C)C(C)Cc1cccs1",
+    "NC1=C(Br)C(C(F)(F)F)N=N1",
+    "O=C(O)C1=CC2C=CC1C1C=CC21",
+    "CC(C)CC(C)(O)CNCC(Cl)=CCl",
+    "CN1C(=O)C2=NN=NC2N(C)C1=O",
+    "Oc1ccc(C2CNCc3sccc32)cc1O",
+    "CC1CC(C)CC2(C1)NC(=O)NC2=N",
+    "Clc1ccc(-n2ccc3ccccc32)cc1",
+    "Brc1ccc(C=NN=Cc2ccc(Br)o2)o1",
+    "C#CCN(CC(=O)O)C(=O)c1snnc1CC",
+    "CNC1CCC(N(C)C2CCCC(C)CC2)CC1",
+    "CSCCCNCc1coc(-c2ccc(C)cc2)n1",
+    "CCC(Nc1ccc(F)cc1C#N)c1ccncc1",
+    "COc1ccc(C(N)c2cc(C)ccc2C)cc1C",
+    "CC1CN2CCCC2CN1CC1CCC2CCCCC2N1",
+    "Cc1nnc2ccc(Oc3cncc(Br)c3)nn12",
+    "CCCc1nn(C)c2c1nc(CCl)n2C1CC1C",
+    "NCC1(C2(O)CCCC(C3CC3)C2)CCOC1",
+    "COC(=O)C(C)C(C)NC(C)C(=O)N(C)C",
+    "O=C(NCCCn1ccnc1)c1csc(C#CCO)c1",
+    "CC(C)OP(=S)(OC(C)C)OP1OCCC(C)O1",
+    "CC(C)(C)SCC(=O)NC1(CC(=O)O)CCC1",
+    "COCCNC12CC3CC(C)(CC(C)(C3)C1)C2",
+    "CCOC1(C)OC(N)=C(C#N)C1=C(C#N)C#N",
+    "CC(Nc1ncc(F)c(N(C)C)n1)C1=CCCCC1",
+    "Cc1noc(C)c1C(C)NS(=O)(=O)C(C)C#N",
+    "CCCN(C(C)C)C1(CN)CC(C)(C)OC1(C)C",
+    "O=S(=O)(N1CCCCC1)N1CCOC2(CCCC2)C1",
+    "O=c1c2sccc2ncn1Cc1csc(-c2ccsc2)n1",
+    "N#CC1(NC2CC2)CCC(Sc2ccc(Br)cc2)C1",
+    "C=CCNc1nnc(SCc2cc3c(cc2Br)OCO3)s1",
+    "CCN=C(NCC1CCOC1C(C)(C)C)NC(C)(C)C",
+    "CC(C)=Nn1cnc2c1=NC(C)(C)NC=2C(N)=O",
+    "CCC1(C)CC2=C3C(O)=NC(=S)N=C3SC2CO1",
+    "Cc1nn(CCO)c(C)c1CNC1CCCCC1Cc1ccccc1",
+    "CC(=O)Oc1ccc2c3c(ccc(C(C)=O)c13)CC2",
+    "Cc1cc2oc(Br)c(CC(=O)N3CCOCC3)c2cc1Cl",
+    "CS(=O)(=O)N1CCN(Cc2cc3n(n2)CCNC3)CC1",
+    "CC(C)(C)c1noc(CCc2nc(-c3cnccn3)no2)n1",
+    "O=C(NC1CC1)C1CCN(C(=O)C2CC3CCC2C3)CC1",
+    "C=Cn1ccnc1P(=S)(c1ccn(C)c1)c1nccn1C=C",
+    "CC(C)(C)C(CBr)CN1C(=O)C(C)(C)S1(=O)=O",
+    "N#Cc1ccc2ncc(CN3CCCC4(CC=CCC4)C3)n2c1",
+    "CC(O)C1C(O)CC2C3CCC4CCCCC4(C)C3CCC21C",
+    "O=S1(=O)CC(Cl)C(SSC2CS(=O)(=O)CC2Cl)C1",
+    "O=CC1=CN=c2c1ccc1c3c(ccc21)C(C=O)=CN=3",
+    "O=C(OCC1CC=CCC1)C1CCCN1C(=O)OCC(F)(F)F",
+    "CCC1(CC)C(OC)C(C)C1N1C(=O)C(CCSC)NC1=S",
+    "CC(O)CNC(=O)C1NC(C2=CC3N=CC=C3C=C2)=NO1",
+    "N#Cc1cccc(NC(=O)N(Cc2ccco2)Cc2ccccc2O)c1",
+    "CCOc1cccc2c1NC(c1ccc(N(C)C)cc1)C1CC=CC21",
+    "C1=CC(c2cccc(-c3cc(-n4cccn4)ncn3)c2)N=N1",
+    "Nc1nn2c(-c3ccccc3)cc(O)nc2c1N=Nc1ccc(O)cc1",
+    "FC(F)(F)c1ccc(Cl)c(NC(=S)NN=C2CC3C=CCC23)c1",
+    "C1=NN=c2cc3c(cc21)=NC(c1cn(C2CCNCC2)nn1)=N3",
+    "CC(C)Sc1nnc2n3ncnc3c3c4c(sc3n12)COC(C)(C)C4",
+    "CS(=O)CCNS(=O)(=O)c1ccc2c(c1)NC(=O)C(C)(C)O2",
+    "CS(=NS(=O)(=O)c1cccc2nsnc12)c1ncccc1C(F)(F)F",
+    "COCCCN1COc2ccc3c(c2C1)OC(=Cc1ccc(Br)cc1)C3=O",
+    "CC#CC1(O)CCC2C3CCC4=C(CCC5(C4)OCCO5)C3=CCC21C",
+    "CCOC(=O)CCn1c(=O)c2c(nc3n(C)c(C)cn23)n(C)c1=O",
+    "OC(c1ccccc1)C(F)(F)C1(F)OC(F)(F)C(F)(F)C1(F)F",
+    "CC(C)(C)C1=CC(C2CC(=O)NCC3N=C4C=CC=CN4C32)N=N1",
+    "Fc1ccccc1C1Oc2ccccc2C2=C1C(c1cccnc1)N1N=CNC1=N2",
+    "C=CCN1C(=O)C(CC(=O)c2ccc(F)cc2)SC1=Nc1ccc(F)cc1",
+    "CC1(C)OCC(C2OC3OC(C)(C)OC3C2OP2OCCN2C(C)(C)C)O1",
+    "CC(OC(=O)c1ccc(-n2cncn2)cc1)C(=O)C1=c2ccccc2=NC1",
+    "CCCC1CCc2c(sc(NC(=O)C3C4CCC(O4)C3C(=O)O)c2C(N)=O)C1",
+    "Cc1cccc(N2C(=O)C(=C3SC(=S)N(c4cccc(C)c4C)C3=O)SC2=S)c1C",
+    "C=C1CCCC2(C)CC3OC(=O)C(CN4CCc5cc(OC)c(OC)cc5C4CCO)C3CC12",
+    "O=C1N=C(O)C(=Cc2ccc(OC(=O)c3sc4cc(Cl)ccc4c3Cl)cc2)C(=O)N1",
 ]
 
-# Sampling configuration
-SAMPLE_STEPS: int = 1000
+# -----------------------------------------------------------------------------
+# Sampling Configuration
+# -----------------------------------------------------------------------------
+
+# :param SAMPLE_STEPS:
+#     Number of denoising steps during discrete flow matching sampling.
+#     Higher values give better results but are slower.
+SAMPLE_STEPS: int = 100
+
+# :param ETA:
+#     Stochasticity parameter for sampling. 0.0 = deterministic CTMC.
 ETA: float = 0.0
+
+# :param OMEGA:
+#     Target guidance strength parameter for sampling.
 OMEGA: float = 0.0
+
+# :param SAMPLE_TIME_DISTORTION:
+#     Time distortion schedule for sampling. Options: "identity", "polydec".
 SAMPLE_TIME_DISTORTION: str = "polydec"
-NOISE_TYPE_OVERRIDE: Optional[str] = None  # Override noise type: "uniform", "marginal", or None (use trained)
-DETERMINISTIC: bool = False  # Use argmax instead of sampling for deterministic trajectories
 
+# :param NOISE_TYPE_OVERRIDE:
+#     Override the noise type used during sampling. Options: "uniform",
+#     "marginal", or None (use the type the model was trained with).
+NOISE_TYPE_OVERRIDE: Optional[str] = None
+
+# :param DETERMINISTIC:
+#     If True, use argmax instead of sampling for deterministic trajectories.
+DETERMINISTIC: bool = False
+
+# -----------------------------------------------------------------------------
+# Repetition Configuration
+# -----------------------------------------------------------------------------
+
+# :param NUM_REPETITIONS:
+#     Number of independent edge generation attempts per molecule.
+#     When > 1, each attempt is scored by HDC cosine distance to the
+#     original order_N embedding, and the best result is kept.
+NUM_REPETITIONS: int = 64
+
+# :param INIT_MODE:
+#     Initialization mode for the edge matrix at the start of sampling.
+#     Options:
+#       - "noise": Sample initial edges from the limit distribution (default,
+#         original stochastic behavior).
+#       - "empty": Start from an all-no-edge graph (class 0 everywhere).
+#         Fully deterministic when combined with DETERMINISTIC=True.
+INIT_MODE: str = "noise"
+
+# -----------------------------------------------------------------------------
 # GIF Animation Configuration
-GENERATE_GIF: bool = True                       # Enable/disable GIF generation
-GIF_FRAME_INTERVAL: int = 10                    # Capture frame every N steps
-GIF_FPS: int = 10                               # Frames per second (100ms per frame)
-GIF_IMAGE_SIZE: Tuple[int, int] = (400, 400)    # Size of molecule rendering
+# -----------------------------------------------------------------------------
 
-# System configuration
+# :param GENERATE_GIF:
+#     Whether to generate animated GIFs showing the sampling trajectory
+#     for each molecule.
+GENERATE_GIF: bool = True
+
+# :param GIF_FRAME_INTERVAL:
+#     Capture a frame every N sampling steps for the GIF animation.
+GIF_FRAME_INTERVAL: int = 10
+
+# :param GIF_FPS:
+#     Frames per second for the output GIF animation.
+GIF_FPS: int = 10
+
+# :param GIF_IMAGE_SIZE:
+#     Size (width, height) of molecule rendering in GIF frames.
+GIF_IMAGE_SIZE: Tuple[int, int] = (400, 400)
+
+# -----------------------------------------------------------------------------
+# System Configuration
+# -----------------------------------------------------------------------------
+
+# :param SEED:
+#     Random seed for reproducibility.
 SEED: int = 42
-DEVICE: str = "auto"  # "auto", "cpu", or "cuda" - device for inference
 
-# Debug/Testing modes
+# :param DEVICE:
+#     Device for the FlowEdgeDecoder inference. Options: "auto" (prefer GPU),
+#     "cpu", "cuda". The HyperNet encoder always runs on CPU.
+DEVICE: str = "cuda"
+
+# -----------------------------------------------------------------------------
+# Debug/Testing Modes
+# -----------------------------------------------------------------------------
+
+# :param __DEBUG__:
+#     Debug mode - reuses same output folder during development.
 __DEBUG__: bool = True
+
+# :param __TESTING__:
+#     Testing mode - runs with minimal iterations for validation.
 __TESTING__: bool = False
-
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
-
-def load_smiles_from_csv(csv_path: str) -> list[str]:
-    """
-    Load SMILES from a CSV file.
-
-    Args:
-        csv_path: Path to CSV file with "smiles" column
-
-    Returns:
-        List of SMILES strings
-    """
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    if "smiles" not in df.columns:
-        raise ValueError(f"CSV file must have 'smiles' column. Found: {list(df.columns)}")
-
-    return df["smiles"].dropna().tolist()
-
-
-def smiles_to_pyg_data(smiles: str, dataset: str = "zinc") -> Optional[Data]:
-    """
-    Convert SMILES to PyG Data object with ZINC node features.
-
-    Args:
-        smiles: SMILES string
-        dataset: Dataset name (only "zinc" supported)
-
-    Returns:
-        PyG Data object or None if conversion fails
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-
-    from graph_hdc.datasets.zinc_smiles import ZINC_ATOM_TO_IDX
-    atom_to_idx = ZINC_ATOM_TO_IDX
-
-    # Build node features (5-dim: atom_type, degree, charge, Hs, ring)
-    x = []
-    for atom in mol.GetAtoms():
-        sym = atom.GetSymbol()
-        if sym not in atom_to_idx:
-            return None  # Unsupported atom type
-
-        atom_type = atom_to_idx[sym]
-        degree = max(0, min(5, atom.GetDegree() - 1))
-        charge = atom.GetFormalCharge()
-        charge_idx = 0 if charge == 0 else (1 if charge > 0 else 2)
-        explicit_hs = min(3, atom.GetTotalNumHs())
-        is_in_ring = int(atom.IsInRing())
-        x.append([float(atom_type), float(degree), float(charge_idx), float(explicit_hs), float(is_in_ring)])
-
-    x = torch.tensor(x, dtype=torch.float)
-
-    # Build edge index
-    edge_index = []
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        edge_index.append([i, j])
-        edge_index.append([j, i])
-
-    if len(edge_index) > 0:
-        edge_index = torch.tensor(edge_index, dtype=torch.long).T
-    else:
-        edge_index = torch.zeros((2, 0), dtype=torch.long)
-
-    return Data(x=x, edge_index=edge_index, smiles=smiles)
-
-
-def decode_nodes_from_hdc(
-    hypernet: HyperNet,
-    hdc_vector: torch.Tensor,
-    base_hdc_dim: int,
-) -> tuple[list[tuple[int, ...]], int]:
-    """
-    Decode node tuples from HDC embedding.
-
-    The hdc_vector is a concatenation of [order_0 | order_N], where:
-    - order_0: Bundled node hypervectors (first base_hdc_dim dimensions)
-    - order_N: Graph embedding after message passing (last base_hdc_dim dimensions)
-
-    Node decoding uses the order_0 part.
-
-    Args:
-        hypernet: HyperNet encoder instance
-        hdc_vector: Concatenated HDC vector (2 * base_hdc_dim,) or (batch, 2 * base_hdc_dim)
-        base_hdc_dim: Base hypervector dimension
-
-    Returns:
-        Tuple of (list of node tuples (atom, degree, charge, Hs, ring), number of nodes)
-    """
-    # Extract order_0 from the first half
-    if hdc_vector.dim() == 1:
-        order_zero = hdc_vector[:base_hdc_dim].unsqueeze(0)
-    else:
-        order_zero = hdc_vector[:, :base_hdc_dim]
-
-    # Decode node counts from order-0 embedding using iterative unbinding
-    node_counter_dict = hypernet.decode_order_zero_counter_iterative(order_zero)
-    node_counter = node_counter_dict.get(0, Counter())
-
-    # Convert to list of node tuples
-    node_tuples = []
-    for node_tuple, count in node_counter.items():
-        node_tuples.extend([node_tuple] * count)
-
-    return node_tuples, len(node_tuples)
-
-
-def pyg_to_mol(data: Data) -> Optional[Chem.Mol]:
-    """
-    Convert FlowEdgeDecoder output (PyG Data) to RDKit Mol.
-
-    Expects 24-dim one-hot node features where first 9 dims are atom type.
-
-    Args:
-        data: PyG Data from FlowEdgeDecoder.sample()
-
-    Returns:
-        RDKit Mol or None if conversion fails
-    """
-    try:
-        mol = Chem.RWMol()
-
-        # Get atom types from first 9 dimensions of 24-dim one-hot
-        if data.x.dim() > 1:
-            # Extract atom type from first 9 dims (ZINC atom classes)
-            atom_type_probs = data.x[:, :9]
-            node_types = atom_type_probs.argmax(dim=-1).cpu().numpy()
-        else:
-            node_types = data.x.cpu().numpy()
-
-        # Add atoms
-        atom_map = {}
-        for i, atom_type_idx in enumerate(node_types):
-            atom_symbol = ZINC_IDX_TO_ATOM[int(atom_type_idx)]
-            atom = Chem.Atom(atom_symbol)
-            rdkit_idx = mol.AddAtom(atom)
-            atom_map[i] = rdkit_idx
-
-        # Get edge info
-        if data.edge_index is None or data.edge_index.numel() == 0:
-            mol = mol.GetMol()
-            return mol
-
-        edge_index = data.edge_index.cpu().numpy()
-        if data.edge_attr is not None:
-            if data.edge_attr.dim() > 1:
-                edge_types = data.edge_attr.argmax(dim=-1).cpu().numpy()
-            else:
-                edge_types = data.edge_attr.cpu().numpy()
-        else:
-            edge_types = [1] * edge_index.shape[1]
-
-        bond_type_map = {
-            1: Chem.BondType.SINGLE,
-            2: Chem.BondType.DOUBLE,
-            3: Chem.BondType.TRIPLE,
-            4: Chem.BondType.AROMATIC,
-        }
-
-        added_bonds = set()
-        for k in range(edge_index.shape[1]):
-            i, j = int(edge_index[0, k]), int(edge_index[1, k])
-            edge_type = int(edge_types[k])
-
-            if edge_type == 0 or i == j:
-                continue
-
-            bond_key = (min(i, j), max(i, j))
-            if bond_key in added_bonds:
-                continue
-            added_bonds.add(bond_key)
-
-            if edge_type in bond_type_map:
-                mol.AddBond(atom_map[i], atom_map[j], bond_type_map[edge_type])
-
-        mol = mol.GetMol()
-
-        try:
-            Chem.SanitizeMol(mol)
-        except Exception:
-            pass
-
-        return mol
-
-    except Exception:
-        return None
-
-
-def is_valid_mol(mol: Optional[Chem.Mol]) -> bool:
-    """Check if molecule is valid."""
-    if mol is None:
-        return False
-    try:
-        smiles = Chem.MolToSmiles(mol)
-        return smiles is not None and len(smiles) > 0
-    except Exception:
-        return False
-
-
-def get_canonical_smiles(mol: Optional[Chem.Mol]) -> Optional[str]:
-    """Get canonical SMILES from molecule."""
-    if mol is None:
-        return None
-    try:
-        return Chem.MolToSmiles(mol, canonical=True)
-    except Exception:
-        return None
 
 
 # =============================================================================
@@ -363,29 +353,24 @@ def dense_E_to_pyg_data(
     Returns:
         PyG Data object with x, edge_index, edge_attr
     """
-    # Extract single sample
-    x = X[sample_idx]  # (n, dx)
-    e = E[sample_idx]  # (n, n, de)
-    mask = node_mask[sample_idx]  # (n,)
+    x = X[sample_idx]
+    e = E[sample_idx]
+    mask = node_mask[sample_idx]
 
-    # Get number of valid nodes
     n_valid = mask.sum().item()
-    x_valid = x[:n_valid]  # (n_valid, dx)
-    e_valid = e[:n_valid, :n_valid]  # (n_valid, n_valid, de)
+    x_valid = x[:n_valid]
+    e_valid = e[:n_valid, :n_valid]
 
-    # Convert edges to sparse format
-    # Get argmax for edge types
-    e_labels = torch.argmax(e_valid, dim=-1)  # (n_valid, n_valid)
+    e_labels = torch.argmax(e_valid, dim=-1)
 
-    # Build edge_index and edge_attr for non-zero edges
     edge_src = []
     edge_dst = []
     edge_types = []
 
     for i in range(n_valid):
-        for j in range(i + 1, n_valid):  # Upper triangle only (symmetric)
+        for j in range(i + 1, n_valid):
             edge_type = e_labels[i, j].item()
-            if edge_type > 0:  # Non-zero edge (has a bond)
+            if edge_type > 0:
                 edge_src.extend([i, j])
                 edge_dst.extend([j, i])
                 edge_types.extend([edge_type, edge_type])
@@ -418,14 +403,11 @@ def render_frame(
     Returns:
         PIL Image with the rendered molecule and annotations (fixed size)
     """
-    # Fixed output size (slightly larger to accommodate title and SMILES)
     output_width = image_size[0]
-    output_height = image_size[1] + 60  # Extra space for title and SMILES
+    output_height = image_size[1] + 60
 
-    # Create figure with fixed size - do NOT use tight_layout or bbox_inches="tight"
     fig, ax = plt.subplots(figsize=(output_width / 100, output_height / 100), dpi=100)
 
-    # Try to render the molecule
     if mol is not None:
         try:
             img = Draw.MolToImage(mol, size=image_size)
@@ -443,11 +425,9 @@ def render_frame(
 
     ax.axis("off")
 
-    # Add annotations
     title = f"t = {t_value:.3f}"
     ax.set_title(title, fontsize=12, fontweight="bold", pad=10)
 
-    # Add SMILES at bottom (truncated if too long)
     if smiles:
         smiles_display = smiles[:40] + "..." if len(smiles) > 40 else smiles
     else:
@@ -455,10 +435,8 @@ def render_frame(
 
     fig.text(0.5, 0.02, smiles_display, ha="center", fontsize=8, family="monospace")
 
-    # Adjust subplot to leave room for title and SMILES (no tight_layout)
     fig.subplots_adjust(top=0.88, bottom=0.08, left=0.02, right=0.98)
 
-    # Convert matplotlib figure to PIL Image with FIXED size (no bbox_inches="tight")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=100, facecolor="white", edgecolor="none")
     buf.seek(0)
@@ -466,7 +444,6 @@ def render_frame(
     buf.close()
     plt.close(fig)
 
-    # Ensure exact output size by resizing if necessary
     if pil_image.size != (output_width, output_height):
         pil_image = pil_image.resize((output_width, output_height), Image.Resampling.LANCZOS)
 
@@ -489,10 +466,7 @@ def create_reconstruction_gif(
     if len(frames) == 0:
         return
 
-    # Calculate duration in seconds
     duration = 1.0 / fps
-
-    # Convert PIL Images to numpy arrays
     frame_arrays = [np.array(frame) for frame in frames]
 
     imageio.mimsave(
@@ -500,7 +474,7 @@ def create_reconstruction_gif(
         frame_arrays,
         format="GIF",
         duration=duration,
-        loop=0,  # Loop forever
+        loop=0,
     )
 
 
@@ -518,18 +492,9 @@ class FrameCollector:
         sample_steps: int,
         image_size: Tuple[int, int] = (400, 400),
     ):
-        """
-        Initialize frame collector.
-
-        Args:
-            capture_interval: Capture frame every N steps
-            sample_steps: Total number of sampling steps
-            image_size: Size for molecule rendering
-        """
         self.capture_interval = capture_interval
         self.sample_steps = sample_steps
         self.image_size = image_size
-        # (step, t_value, noisy_pyg_data, prediction_pyg_data or None)
         self.frames: List[Tuple[int, float, Data, Optional[Data]]] = []
 
     def __call__(
@@ -541,20 +506,6 @@ class FrameCollector:
         node_mask: torch.Tensor,
         pred_E: Optional[torch.Tensor] = None,
     ) -> None:
-        """
-        Callback invoked at each sampling step.
-
-        Captures frame data if step matches the capture interval.
-
-        Args:
-            step: Current step index
-            t_value: Current time value (0.0 to 1.0)
-            X: Node features tensor
-            E: Current noisy edge features tensor
-            node_mask: Valid node mask
-            pred_E: Model's predicted clean edge distribution (None at t=0)
-        """
-        # Capture at step 0 (initial), every capture_interval steps, and final step
         should_capture = (
             step == 0
             or step % self.capture_interval == 0
@@ -562,10 +513,8 @@ class FrameCollector:
         )
 
         if should_capture:
-            # Convert dense tensors to PyG Data (for single sample, idx=0)
             noisy_pyg_data = dense_E_to_pyg_data(X, E, node_mask, sample_idx=0)
 
-            # Convert prediction if available
             pred_pyg_data = None
             if pred_E is not None:
                 pred_pyg_data = dense_E_to_pyg_data(X, pred_E, node_mask, sample_idx=0)
@@ -577,27 +526,15 @@ class FrameCollector:
         save_path: Path,
         fps: int = 10,
     ) -> None:
-        """
-        Render all captured noisy state frames to GIF.
-
-        Args:
-            save_path: Output path for GIF
-            fps: Frames per second
-        """
+        """Render all captured noisy state frames to GIF."""
         rendered_frames = []
 
         for step, t_value, noisy_pyg_data, _ in self.frames:
-            # Convert PyG Data to RDKit molecule
             mol = pyg_to_mol(noisy_pyg_data)
-
-            # Get SMILES if valid
             smiles = get_canonical_smiles(mol)
-
-            # Render frame
             frame_img = render_frame(mol, t_value, smiles, self.image_size)
             rendered_frames.append(frame_img)
 
-        # Create GIF
         create_reconstruction_gif(rendered_frames, save_path, fps)
 
     def render_prediction_gif(
@@ -605,33 +542,18 @@ class FrameCollector:
         save_path: Path,
         fps: int = 10,
     ) -> None:
-        """
-        Render all captured prediction frames to GIF.
-
-        Shows the model's predicted final clean graph at each timestep.
-
-        Args:
-            save_path: Output path for GIF
-            fps: Frames per second
-        """
+        """Render all captured prediction frames to GIF."""
         rendered_frames = []
 
         for step, t_value, _, pred_pyg_data in self.frames:
-            # Skip frames without prediction (t=0)
             if pred_pyg_data is None:
                 continue
 
-            # Convert PyG Data to RDKit molecule
             mol = pyg_to_mol(pred_pyg_data)
-
-            # Get SMILES if valid
             smiles = get_canonical_smiles(mol)
-
-            # Render frame
             frame_img = render_frame(mol, t_value, smiles, self.image_size)
             rendered_frames.append(frame_img)
 
-        # Create GIF (only if we have frames)
         if rendered_frames:
             create_reconstruction_gif(rendered_frames, save_path, fps)
 
@@ -640,102 +562,74 @@ class FrameCollector:
         self.frames = []
 
 
-# =============================================================================
-# Visualization Functions
-# =============================================================================
-
-
-def create_comparison_plot(
-    original_mol: Chem.Mol,
-    generated_mol: Optional[Chem.Mol],
-    original_smiles: str,
-    generated_smiles: Optional[str],
-    is_valid: bool,
-    is_match: bool,
-    sample_idx: int,
+def create_evolution_grid(
+    frames: List[Tuple[int, float, Data, Optional[Data]]],
     save_path: Path,
+    n_rows: int = 4,
+    n_cols: int = 5,
 ) -> None:
-    """Create side-by-side plot of original vs generated molecule."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    """
+    Create a grid of subplots showing the molecule's evolution over sampling time.
 
-    # Plot original molecule
-    try:
-        img_original = Draw.MolToImage(original_mol, size=(400, 400))
-        axes[0].imshow(img_original)
-    except Exception:
-        axes[0].text(0.5, 0.5, "Failed to draw", ha="center", va="center", fontsize=14)
-    axes[0].set_title(f"Original\n{original_smiles[:50]}{'...' if len(original_smiles) > 50 else ''}", fontsize=10)
-    axes[0].axis("off")
+    Selects ``n_rows * n_cols`` evenly-spaced frames from the captured list and
+    renders each as an RDKit molecule image.  Subplots are arranged left-to-right,
+    top-to-bottom (time 0 at top-left, final time at bottom-right).
 
-    # Plot generated molecule
-    if generated_mol is not None:
-        try:
-            img_generated = Draw.MolToImage(generated_mol, size=(400, 400))
-            axes[1].imshow(img_generated)
-        except Exception:
-            axes[1].text(0.5, 0.5, "Failed to draw", ha="center", va="center", fontsize=14)
+    Args:
+        frames: List of ``(step, t_value, noisy_pyg_data, pred_pyg_data)`` tuples
+                as produced by :class:`FrameCollector`.
+        save_path: Output path for the PNG figure.
+        n_rows: Number of rows in the grid (default 4).
+        n_cols: Number of columns in the grid (default 5).
+    """
+    n_cells = n_rows * n_cols
+
+    if len(frames) == 0:
+        return
+
+    # Sub-sample to exactly n_cells frames, evenly spaced
+    if len(frames) <= n_cells:
+        selected = frames
     else:
-        axes[1].text(0.5, 0.5, "Generation failed", ha="center", va="center", fontsize=14)
+        indices = np.linspace(0, len(frames) - 1, n_cells, dtype=int)
+        selected = [frames[i] for i in indices]
 
-    gen_smiles_display = generated_smiles or "N/A"
-    if len(gen_smiles_display) > 50:
-        gen_smiles_display = gen_smiles_display[:50] + "..."
-    axes[1].set_title(f"Generated\n{gen_smiles_display}", fontsize=10)
-    axes[1].axis("off")
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(3 * n_cols, 3 * n_rows),
+        dpi=150,
+    )
 
-    # Add status information
-    status_color = "green" if is_match else ("orange" if is_valid else "red")
-    status_text = "MATCH" if is_match else ("Valid" if is_valid else "Invalid")
-    fig.suptitle(f"Sample {sample_idx + 1}: {status_text}", fontsize=14, color=status_color, fontweight="bold")
+    for cell_idx, ax in enumerate(axes.flat):
+        if cell_idx < len(selected):
+            _step, t_value, noisy_pyg_data, _ = selected[cell_idx]
+            mol = pyg_to_mol(noisy_pyg_data)
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+            if mol is not None:
+                try:
+                    img = Draw.MolToImage(mol, size=(300, 300))
+                    ax.imshow(img)
+                except Exception:
+                    ax.text(
+                        0.5, 0.5, "Render\nFailed",
+                        ha="center", va="center", fontsize=10,
+                        transform=ax.transAxes,
+                    )
+            else:
+                ax.text(
+                    0.5, 0.5, "Invalid",
+                    ha="center", va="center", fontsize=10,
+                    transform=ax.transAxes,
+                )
 
+            ax.set_title(f"t = {t_value:.3f}", fontsize=9)
+        else:
+            ax.set_visible(False)
 
-def create_summary_bar_chart(
-    match_count: int,
-    valid_count: int,
-    invalid_count: int,
-    total_count: int,
-    save_path: Path,
-) -> None:
-    """Create summary bar chart showing match/valid/invalid counts."""
-    fig, ax = plt.subplots(figsize=(8, 6))
+        ax.axis("off")
 
-    categories = ["Match", "Valid (no match)", "Invalid"]
-    # Valid count from the caller includes matches, so we need to subtract
-    valid_no_match = valid_count - match_count
-    counts = [match_count, valid_no_match, invalid_count]
-    colors = ["green", "orange", "red"]
-
-    bars = ax.bar(categories, counts, color=colors, edgecolor="black", linewidth=1.2)
-
-    # Add count labels on bars
-    for bar, count in zip(bars, counts):
-        height = bar.get_height()
-        percentage = 100 * count / total_count if total_count > 0 else 0
-        ax.annotate(
-            f"{count}\n({percentage:.1f}%)",
-            xy=(bar.get_x() + bar.get_width() / 2, height),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=12,
-            fontweight="bold",
-        )
-
-    ax.set_ylabel("Count", fontsize=12)
-    ax.set_title(f"Reconstruction Results (n={total_count})", fontsize=14, fontweight="bold")
-    ax.set_ylim(0, max(counts) * 1.2 if max(counts) > 0 else 1)
-
-    # Add grid
-    ax.yaxis.grid(True, linestyle="--", alpha=0.7)
-    ax.set_axisbelow(True)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -755,14 +649,41 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
     e.log("FlowEdgeDecoder Testing")
     e.log("=" * 60)
+    e.log_parameters()
 
-    # Validate required parameters
-    if not e.HDC_ENCODER_PATH and not e.__TESTING__:
-        e.log("ERROR: HDC_ENCODER_PATH is required")
-        return
-    if not e.FLOW_DECODER_PATH and not e.__TESTING__:
-        e.log("ERROR: FLOW_DECODER_PATH is required")
-        return
+    # Device setup: decoder runs on DEVICE, HyperNet always on CPU
+    if e.DEVICE == "auto":
+        decoder_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        decoder_device = torch.device(e.DEVICE)
+    hdc_device = torch.device("cpu")
+    e.log(f"Decoder device: {decoder_device}")
+    e.log(f"HyperNet device: {hdc_device} (always CPU)")
+    e["config/device"] = str(decoder_device)
+
+    # =========================================================================
+    # Apply Hooks
+    # =========================================================================
+
+    # Load models
+    hypernet, decoder, base_hdc_dim = e.apply_hook(
+        "load_models",
+        device=decoder_device,
+    )
+
+    hypernet.to(hdc_device)
+    hypernet.eval()
+    decoder.to(decoder_device)
+    decoder.eval()
+
+    e["model/base_hdc_dim"] = base_hdc_dim
+    e["model/concat_hdc_dim"] = 2 * base_hdc_dim
+
+    # Load SMILES
+    smiles_list = e.apply_hook("load_smiles")
+
+    e.log(f"Number of SMILES to test: {len(smiles_list)}")
+    e["data/num_smiles"] = len(smiles_list)
 
     # Store configuration
     e["config/hdc_encoder_path"] = e.HDC_ENCODER_PATH
@@ -774,103 +695,19 @@ def experiment(e: Experiment) -> None:
     e["config/sample_time_distortion"] = e.SAMPLE_TIME_DISTORTION
     e["config/noise_type_override"] = e.NOISE_TYPE_OVERRIDE
     e["config/deterministic"] = e.DETERMINISTIC
+    e["config/num_repetitions"] = e.NUM_REPETITIONS
+    e["config/init_mode"] = e.INIT_MODE
     e["config/generate_gif"] = e.GENERATE_GIF
-    e["config/gif_frame_interval"] = e.GIF_FRAME_INTERVAL
-    e["config/gif_fps"] = e.GIF_FPS
-    e["config/gif_image_size"] = e.GIF_IMAGE_SIZE
     e["config/device_setting"] = e.DEVICE
-
-    # Device setup
-    if e.DEVICE == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(e.DEVICE)
-    e.log(f"Using device: {device}")
-    e["config/device"] = str(device)
-
-    # Load SMILES
-    if e.SMILES_CSV_PATH:
-        e.log(f"Loading SMILES from CSV: {e.SMILES_CSV_PATH}")
-        smiles_list = load_smiles_from_csv(e.SMILES_CSV_PATH)
-        e["config/smiles_source"] = "csv"
-        e["config/smiles_csv_path"] = e.SMILES_CSV_PATH
-    else:
-        smiles_list = e.SMILES_LIST
-        e["config/smiles_source"] = "list"
-
-    e.log(f"Number of SMILES to test: {len(smiles_list)}")
-    e["data/num_smiles"] = len(smiles_list)
-
-    # Load models
-    e.log("\nLoading models...")
-
-    if e.__TESTING__:
-        # Create dummy models for testing
-        from collections import OrderedDict
-        import math
-        from graph_hdc.hypernet.configs import DSHDCConfig, FeatureConfig, Features, IndexRange
-        from graph_hdc.hypernet.feature_encoders import CombinatoricIntegerEncoder
-        from graph_hdc.hypernet.types import VSAModel
-
-        e.log("TESTING MODE: Creating dummy models...")
-
-        # Create minimal HyperNet (ZINC config with 5 features)
-        node_feature_config = FeatureConfig(
-            count=math.prod([9, 6, 3, 4, 2]),  # ZINC: 9*6*3*4*2 = 1296
-            encoder_cls=CombinatoricIntegerEncoder,
-            index_range=IndexRange((0, 5)),
-            bins=[9, 6, 3, 4, 2],
-        )
-        config = DSHDCConfig(
-            name="TEST_ZINC",
-            hv_dim=256,
-            vsa=VSAModel.HRR,
-            base_dataset="zinc",
-            hypernet_depth=3,
-            device=str(device),
-            seed=42,
-            normalize=True,
-            dtype="float64",
-            node_feature_configs=OrderedDict([(Features.NODE_FEATURES, node_feature_config)]),
-        )
-        hypernet = HyperNet(config)
-
-        # Create minimal FlowEdgeDecoder (24-dim node features)
-        decoder = FlowEdgeDecoder(
-            num_node_classes=NODE_FEATURE_DIM,
-            hdc_dim=512,  # 2x base dim for concatenated embeddings
-            condition_dim=64,
-            n_layers=2,
-            hidden_dim=64,
-            hidden_mlp_dim=128,
-        )
-        base_hdc_dim = 256
-    else:
-        # Load HyperNet encoder
-        e.log(f"Loading HyperNet from: {e.HDC_ENCODER_PATH}")
-        hypernet = HyperNet.load(e.HDC_ENCODER_PATH, device=str(device))
-        base_hdc_dim = hypernet.hv_dim
-        e.log(f"  HyperNet hv_dim: {base_hdc_dim}")
-
-        # Load FlowEdgeDecoder
-        e.log(f"Loading FlowEdgeDecoder from: {e.FLOW_DECODER_PATH}")
-        decoder = FlowEdgeDecoder.load(e.FLOW_DECODER_PATH, device=device)
-        e.log(f"  FlowEdgeDecoder hdc_dim: {decoder.hdc_dim}")
-        e.log(f"  FlowEdgeDecoder condition_dim: {decoder.condition_dim}")
-
-    hypernet.to(device)
-    hypernet.eval()
-    decoder.to(device)
-    decoder.eval()
-
-    e["model/base_hdc_dim"] = base_hdc_dim
-    e["model/concat_hdc_dim"] = 2 * base_hdc_dim
 
     # Create output directories
     plots_dir = Path(e.path) / "comparison_plots"
     plots_dir.mkdir(exist_ok=True)
 
-    # Process each SMILES
+    # =========================================================================
+    # Process Each SMILES
+    # =========================================================================
+
     e.log("\n" + "=" * 60)
     e.log("Processing SMILES")
     e.log("=" * 60)
@@ -881,7 +718,6 @@ def experiment(e: Experiment) -> None:
     invalid_count = 0
     skipped_count = 0
 
-    # Start timing
     start_time = time.time()
 
     for idx, smiles in enumerate(smiles_list):
@@ -915,14 +751,19 @@ def experiment(e: Experiment) -> None:
             })
             continue
 
-        # Add batch attribute
-        data = data.to(device)
-        data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device=device)
+        num_atoms = original_mol.GetNumHeavyAtoms()
+
+        # Add batch attribute (HyperNet runs on CPU)
+        data = data.to(hdc_device)
+        data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device=hdc_device)
 
         # Encode with HyperNet - compute concatenated [order_0 | order_N]
         with torch.no_grad():
-            # Encode node properties
             data = hypernet.encode_properties(data)
+
+            # Ensure node_hv is on correct device
+            if data.node_hv.device != hdc_device:
+                data.node_hv = data.node_hv.to(hdc_device)
 
             # Order-0: Bundle node hypervectors (no message passing)
             order_zero = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
@@ -950,40 +791,45 @@ def experiment(e: Experiment) -> None:
                 "generated_smiles": None,
                 "status": "invalid",
                 "error": "No nodes decoded",
+                "num_atoms": num_atoms,
+                "is_match": False,
             })
             continue
 
-        # Prepare inputs for FlowEdgeDecoder.sample()
-        # Convert node tuples to 24-dim one-hot
-        node_features = node_tuples_to_onehot(node_tuples, device=device).unsqueeze(0)
+        # Prepare inputs for edge generation (on decoder device)
+        node_features = node_tuples_to_onehot(node_tuples, device=decoder_device).unsqueeze(0)
+        node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=decoder_device)
+        hdc_vectors = hdc_vector.unsqueeze(0).to(decoder_device)
 
-        node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=device)
-        hdc_vectors = hdc_vector.unsqueeze(0)
+        # Generate edges via hook
+        generated_samples = e.apply_hook(
+            "generate_edges",
+            decoder=decoder,
+            hypernet=hypernet,
+            hdc_vectors=hdc_vectors,
+            node_features=node_features,
+            node_mask=node_mask,
+            node_tuples=node_tuples,
+            num_nodes=num_nodes,
+            original_data=data,
+            base_hdc_dim=base_hdc_dim,
+            device=decoder_device,
+            idx=idx,
+            plots_dir=plots_dir,
+        )
 
-        # Create frame collector if GIF generation is enabled
-        frame_collector = None
-        if e.GENERATE_GIF:
-            frame_collector = FrameCollector(
-                capture_interval=e.GIF_FRAME_INTERVAL,
-                sample_steps=e.SAMPLE_STEPS,
-                image_size=e.GIF_IMAGE_SIZE,
-            )
-
-        # Generate edges
-        with torch.no_grad():
-            generated_samples = decoder.sample(
-                hdc_vectors=hdc_vectors,
-                node_features=node_features,
-                node_mask=node_mask,
-                sample_steps=e.SAMPLE_STEPS,
-                eta=e.ETA,
-                omega=e.OMEGA,
-                time_distortion=e.SAMPLE_TIME_DISTORTION,
-                noise_type_override=e.NOISE_TYPE_OVERRIDE,
-                show_progress=False,
-                step_callback=frame_collector,
-                deterministic=e.DETERMINISTIC,
-            )
+        # Handle skip (None return from hook)
+        if generated_samples is None:
+            e.log("  Skipped by generate_edges hook")
+            skipped_count += 1
+            results.append({
+                "idx": idx,
+                "original_smiles": smiles,
+                "generated_smiles": None,
+                "status": "skipped",
+                "error": "Skipped by generate_edges hook",
+            })
+            continue
 
         # Convert to RDKit molecule
         generated_data = generated_samples[0]
@@ -993,7 +839,6 @@ def experiment(e: Experiment) -> None:
         e.log(f"  Generated: {generated_smiles or 'N/A'}")
 
         # Check validity and match
-        # For comparison, remove all Hs from original and recanonicalize
         is_valid = is_valid_mol(generated_mol)
         original_canonical = None
         if original_mol is not None:
@@ -1022,7 +867,7 @@ def experiment(e: Experiment) -> None:
 
         # Create comparison plot
         plot_path = plots_dir / f"comparison_{idx + 1:04d}.png"
-        create_comparison_plot(
+        create_reconstruction_plot(
             original_mol=original_mol,
             generated_mol=generated_mol,
             original_smiles=smiles,
@@ -1033,18 +878,6 @@ def experiment(e: Experiment) -> None:
             save_path=plot_path,
         )
 
-        # Generate GIF animations if enabled
-        if e.GENERATE_GIF and frame_collector is not None:
-            # GIF showing noisy states progression
-            gif_path = plots_dir / f"reconstruction_{idx + 1:04d}_animation.gif"
-            frame_collector.render_gif(gif_path, fps=e.GIF_FPS)
-            e.log(f"  GIF saved: {gif_path.name}")
-
-            # GIF showing model's predictions at each timestep
-            pred_gif_path = plots_dir / f"reconstruction_{idx + 1:04d}_prediction.gif"
-            frame_collector.render_prediction_gif(pred_gif_path, fps=e.GIF_FPS)
-            e.log(f"  Prediction GIF saved: {pred_gif_path.name}")
-
         results.append({
             "idx": idx,
             "original_smiles": smiles,
@@ -1053,22 +886,30 @@ def experiment(e: Experiment) -> None:
             "status": status,
             "is_valid": is_valid,
             "is_match": is_match,
+            "num_atoms": num_atoms,
         })
 
-    # End timing
+    # =========================================================================
+    # Summary
+    # =========================================================================
+
     end_time = time.time()
     total_time = end_time - start_time
     num_processed = len(smiles_list) - skipped_count
 
-    # Create summary bar chart
-    summary_plot_path = Path(e.path) / "summary_bar_chart.png"
-    create_summary_bar_chart(
+    # Create summary visualization via hook
+    e.apply_hook(
+        "create_summary_visualization",
         match_count=match_count,
         valid_count=valid_count,
         invalid_count=invalid_count,
         total_count=num_processed,
-        save_path=summary_plot_path,
     )
+
+    # Create accuracy-by-molecule-size chart
+    accuracy_by_size_path = Path(e.path) / "accuracy_by_size.png"
+    create_accuracy_by_size_chart(results, accuracy_by_size_path)
+    e.log(f"Accuracy by size chart saved to: {accuracy_by_size_path}")
 
     # Log summary
     e.log("\n" + "=" * 60)
@@ -1109,6 +950,8 @@ def experiment(e: Experiment) -> None:
             "omega": e.OMEGA,
             "noise_type_override": e.NOISE_TYPE_OVERRIDE,
             "deterministic": e.DETERMINISTIC,
+            "num_repetitions": e.NUM_REPETITIONS,
+            "init_mode": e.INIT_MODE,
         },
         "summary": {
             "total_smiles": len(smiles_list),
@@ -1126,6 +969,254 @@ def experiment(e: Experiment) -> None:
 
     e.log("\nExperiment completed!")
     e.log(f"Comparison plots saved to: {plots_dir}")
+
+
+# =============================================================================
+# HOOKS
+# =============================================================================
+
+
+@experiment.hook("load_models", default=True)
+def load_models(
+    e: Experiment,
+    device: torch.device,
+) -> Tuple[HyperNet, FlowEdgeDecoder, int]:
+    """
+    Load HyperNet encoder and FlowEdgeDecoder models.
+
+    Default implementation loads from checkpoint paths specified in parameters,
+    or creates dummy models in testing mode.
+
+    Args:
+        e: Experiment instance for accessing parameters.
+        device: Device to load models to.
+
+    Returns:
+        Tuple of (hypernet, decoder, base_hdc_dim).
+    """
+    e.log("\nLoading models...")
+
+    if e.__TESTING__:
+        e.log("TESTING MODE: Creating dummy models...")
+        device = torch.device("cpu")
+        hypernet, decoder, base_hdc_dim = create_test_dummy_models(device)
+    else:
+        if not e.HDC_ENCODER_PATH:
+            raise ValueError("HDC_ENCODER_PATH is required")
+        if not e.FLOW_DECODER_PATH:
+            raise ValueError("FLOW_DECODER_PATH is required")
+
+        e.log(f"Loading HyperNet from: {e.HDC_ENCODER_PATH}")
+        hypernet = load_hypernet(e.HDC_ENCODER_PATH, device="cpu")
+        base_hdc_dim = hypernet.hv_dim
+        e.log(f"  HyperNet hv_dim: {base_hdc_dim}")
+
+        e.log(f"Loading FlowEdgeDecoder from: {e.FLOW_DECODER_PATH}")
+        decoder = FlowEdgeDecoder.load(e.FLOW_DECODER_PATH, device=device)
+        e.log(f"  FlowEdgeDecoder hdc_dim: {decoder.hdc_dim}")
+        e.log(f"  FlowEdgeDecoder condition_dim: {decoder.condition_dim}")
+
+    return hypernet, decoder, base_hdc_dim
+
+
+@experiment.hook("load_smiles", default=True)
+def load_smiles(e: Experiment) -> list[str]:
+    """
+    Load SMILES strings for testing.
+
+    Default implementation loads from CSV file if SMILES_CSV_PATH is set,
+    otherwise uses the SMILES_LIST parameter.
+
+    Args:
+        e: Experiment instance.
+
+    Returns:
+        List of SMILES strings.
+    """
+    if e.SMILES_CSV_PATH:
+        e.log(f"Loading SMILES from CSV: {e.SMILES_CSV_PATH}")
+        smiles_list = load_smiles_from_csv(e.SMILES_CSV_PATH)
+        e["config/smiles_source"] = "csv"
+        e["config/smiles_csv_path"] = e.SMILES_CSV_PATH
+    else:
+        smiles_list = e.SMILES_LIST
+        e["config/smiles_source"] = "list"
+
+    return smiles_list
+
+
+@experiment.hook("generate_edges", default=True)
+def generate_edges(
+    e: Experiment,
+    decoder: FlowEdgeDecoder,
+    hypernet: HyperNet,
+    hdc_vectors: torch.Tensor,
+    node_features: torch.Tensor,
+    node_mask: torch.Tensor,
+    node_tuples: list,
+    num_nodes: int,
+    original_data: Data,
+    base_hdc_dim: int,
+    device: torch.device,
+    idx: int,
+    plots_dir: Path,
+) -> Optional[List[Data]]:
+    """
+    Generate edges with optional best-of-N repetitions.
+
+    When ``NUM_REPETITIONS > 1``, edge generation is run N times in a
+    single batched ``sample_best_of_n()`` call and the result with the
+    lowest HDC cosine distance to the original molecule is kept.
+
+    Child experiments can override this hook to use different sampling methods
+    (e.g. ``sample_with_hdc()``, ``sample_with_hdc_guidance()``).
+
+    Args:
+        e: Experiment instance.
+        decoder: FlowEdgeDecoder model.
+        hypernet: HyperNet encoder.
+        hdc_vectors: Concatenated HDC vectors (1, 2*hdc_dim).
+        node_features: One-hot node features (1, n, 24).
+        node_mask: Valid node mask (1, n).
+        node_tuples: Decoded node tuples.
+        num_nodes: Number of decoded nodes.
+        original_data: Original PyG Data object (with original features).
+        base_hdc_dim: Base hypervector dimension.
+        device: Device for computation.
+        idx: Current molecule index.
+        plots_dir: Directory for saving per-molecule outputs.
+
+    Returns:
+        List of generated PyG Data objects, or None to skip this molecule.
+    """
+    num_reps = e.NUM_REPETITIONS
+
+    # GIF handling: only supported for single repetition
+    generate_gif = e.GENERATE_GIF and num_reps == 1
+    if num_reps > 1 and e.GENERATE_GIF and idx == 0:
+        e.log("  NOTE: GIF generation disabled when NUM_REPETITIONS > 1")
+
+    # Capture interval for the evolution grid (~20 frames)
+    grid_capture_interval = max(1, e.SAMPLE_STEPS // 19)
+
+    # Build initial edges based on INIT_MODE
+    init_edges = None
+    if e.INIT_MODE == "empty":
+        n_max = node_features.size(1)
+        de = decoder.num_edge_classes
+        init_edges = torch.zeros(1, n_max, n_max, de, device=device)
+        init_edges[..., 0] = 1.0  # class 0 = no_edge
+    elif e.INIT_MODE != "noise":
+        raise ValueError(f"Unknown INIT_MODE: {e.INIT_MODE}. Use 'noise' or 'empty'.")
+
+    # Common sampling kwargs
+    sample_kwargs = dict(
+        sample_steps=e.SAMPLE_STEPS,
+        eta=e.ETA,
+        omega=e.OMEGA,
+        time_distortion=e.SAMPLE_TIME_DISTORTION,
+        noise_type_override=e.NOISE_TYPE_OVERRIDE,
+        show_progress=False,
+        deterministic=e.DETERMINISTIC,
+        initial_edges=init_edges,
+        device=device,
+    )
+
+    best_frame_collector = None
+
+    if num_reps > 1:
+        # ─── Batched best-of-N via sample_best_of_n ───
+        raw_x = getattr(original_data, "original_x", None)
+
+        def score_fn(s):
+            return compute_hdc_distance(
+                s, hdc_vectors, base_hdc_dim,
+                hypernet, device, dataset=e.DATASET,
+                original_x=raw_x,
+            )
+
+        with torch.no_grad():
+            best_sample, best_distance = decoder.sample_best_of_n(
+                hdc_vectors=hdc_vectors,
+                node_features=node_features,
+                node_mask=node_mask,
+                num_repetitions=num_reps,
+                score_fn=score_fn,
+                **sample_kwargs,
+            )
+
+        best_samples = [best_sample]
+        e.log(f"  Best HDC distance across {num_reps} reps: {best_distance:.6f}")
+
+    else:
+        # ─── Single repetition: preserve GIF / evolution grid support ───
+        if generate_gif:
+            capture_interval = min(grid_capture_interval, e.GIF_FRAME_INTERVAL)
+        else:
+            capture_interval = grid_capture_interval
+
+        frame_collector = FrameCollector(
+            capture_interval=capture_interval,
+            sample_steps=e.SAMPLE_STEPS,
+            image_size=e.GIF_IMAGE_SIZE,
+        )
+
+        with torch.no_grad():
+            best_samples = decoder.sample(
+                hdc_vectors=hdc_vectors,
+                node_features=node_features,
+                node_mask=node_mask,
+                step_callback=frame_collector,
+                **sample_kwargs,
+            )
+
+        if generate_gif:
+            gif_path = plots_dir / f"reconstruction_{idx + 1:04d}_animation.gif"
+            frame_collector.render_gif(gif_path, fps=e.GIF_FPS)
+            e.log(f"  GIF saved: {gif_path.name}")
+            pred_gif_path = plots_dir / f"reconstruction_{idx + 1:04d}_prediction.gif"
+            frame_collector.render_prediction_gif(pred_gif_path, fps=e.GIF_FPS)
+            e.log(f"  Prediction GIF saved: {pred_gif_path.name}")
+
+        best_frame_collector = frame_collector
+
+    # Save evolution grid for the best repetition
+    if best_frame_collector is not None and len(best_frame_collector.frames) > 0:
+        grid_path = plots_dir / f"evolution_{idx + 1:04d}.png"
+        create_evolution_grid(best_frame_collector.frames, grid_path)
+        e.log(f"  Evolution grid saved: {grid_path.name}")
+
+    return best_samples
+
+
+@experiment.hook("create_summary_visualization", default=True)
+def create_summary_visualization(
+    e: Experiment,
+    match_count: int,
+    valid_count: int,
+    invalid_count: int,
+    total_count: int,
+) -> None:
+    """
+    Create summary visualization of test results.
+
+    Default implementation creates a bar chart showing match/valid/invalid counts.
+
+    Args:
+        e: Experiment instance.
+        match_count: Number of exact SMILES matches.
+        valid_count: Number of valid molecules (includes matches).
+        invalid_count: Number of invalid molecules.
+        total_count: Total number of processed molecules.
+    """
+    summary_plot_path = Path(e.path) / "summary_bar_chart.png"
+    create_summary_bar_chart(
+        match_count=match_count,
+        valid_count=valid_count,
+        invalid_count=invalid_count,
+        total_count=total_count,
+        save_path=summary_plot_path,
+    )
     e.log(f"Summary chart saved to: {summary_plot_path}")
 
 
@@ -1141,7 +1232,7 @@ def testing(e: Experiment) -> None:
     e.SMILES_LIST = ["CCO", "CC=O"]  # Just 2 simple molecules
     e.DATASET = "zinc"  # Match the dummy HyperNet config
     e.GENERATE_GIF = True
-    e.GIF_FRAME_INTERVAL = 2  # Capture more frames in test mode (every 2 steps)
+    e.GIF_FRAME_INTERVAL = 2  # Capture more frames in test mode
 
 
 # =============================================================================

@@ -16,17 +16,20 @@ _apply_torchhd_patches()
 
 # Core encoder
 from graph_hdc.hypernet.encoder import CorrectionLevel, DecodingResult, HyperNet
+from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
 
 # Configurations
 from graph_hdc.hypernet.configs import (
     DecoderSettings,
     DSHDCConfig,
     FallbackDecoderSettings,
+    RWConfig,
+    create_config_with_rw,
     get_config,
 )
 
 # Datasets
-from graph_hdc.datasets.utils import get_split, post_compute_encodings
+from graph_hdc.datasets.utils import get_split, post_compute_encodings, scan_node_features_with_rw
 
 # Evaluator and metrics
 from graph_hdc.utils.evaluator import (
@@ -40,16 +43,20 @@ from graph_hdc.utils.evaluator import (
 __all__ = [
     # Encoder
     "HyperNet",
+    "MultiHyperNet",
     "CorrectionLevel",
     "DecodingResult",
     # Configs
     "get_config",
+    "create_config_with_rw",
     "DSHDCConfig",
+    "RWConfig",
     "DecoderSettings",
     "FallbackDecoderSettings",
     # Datasets
     "get_split",
     "post_compute_encodings",
+    "scan_node_features_with_rw",
     # Evaluator
     "GenerationEvaluator",
     "rdkit_logp",

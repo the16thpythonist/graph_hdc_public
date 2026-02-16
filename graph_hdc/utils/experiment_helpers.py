@@ -1,5 +1,5 @@
 """
-Experiment helper utilities for FlowEdgeDecoder training.
+Experiment helper utilities for FlowEdgeDecoder training and testing.
 
 Helper functions and callbacks extracted from experiment files to enable
 code reuse across base and child experiments via PyComex inheritance.
@@ -39,6 +39,9 @@ from graph_hdc.datasets.zinc_smiles import mol_to_data as zinc_mol_to_data
 from graph_hdc.models.flow_edge_decoder import (
     ZINC_ATOM_TYPES,
     NUM_ATOM_CLASSES,
+    NODE_FEATURE_DIM,
+    FlowEdgeDecoder,
+    onehot_to_raw_features,
 )
 from graph_hdc.utils.helpers import scatter_hd
 
@@ -112,6 +115,8 @@ def load_or_create_encoder(
     hv_dim: int,
     depth: int,
     device: torch.device,
+    rw_config=None,
+    prune_codebook: bool = True,
 ) -> HyperNet:
     """
     Load encoder from checkpoint or create a new one.
@@ -122,14 +127,30 @@ def load_or_create_encoder(
         hv_dim: Hypervector dimension
         depth: Message passing depth
         device: Device to load to
+        rw_config: Optional RWConfig for random walk features.
+                   When enabled and creating a new encoder, the dataset
+                   is scanned for observed RW-augmented feature tuples.
+        prune_codebook: Whether to prune the codebook to observed tuples.
 
     Returns:
         HyperNet encoder instance (in eval mode)
     """
     if config_path and Path(config_path).exists():
         hypernet = HyperNet.load(config_path, device=str(device))
+    elif rw_config is not None and rw_config.enabled:
+        from graph_hdc.datasets.utils import scan_node_features_with_rw
+        from graph_hdc.hypernet.configs import create_config_with_rw
+
+        observed = scan_node_features_with_rw(dataset.lower(), rw_config) if prune_codebook else None
+        config = create_config_with_rw(
+            dataset.lower(), hv_dim, rw_config=rw_config, hypernet_depth=depth,
+            prune_codebook=prune_codebook,
+        )
+        hypernet = HyperNet(config, observed_node_features=observed)
+        hypernet = hypernet.to(device)
     else:
         config = create_hdc_config(dataset, hv_dim, depth, device=str(device))
+        config.prune_codebook = prune_codebook
         hypernet = HyperNet(config)
         hypernet = hypernet.to(device)
 
@@ -144,7 +165,8 @@ def decode_nodes_from_hdc(
     hypernet: HyperNet,
     hdc_vector: Tensor,
     base_hdc_dim: int,
-) -> Tuple[List[Tuple[int, ...]], int]:
+    debug: bool = False,
+) -> Tuple[List[Tuple[int, ...]], int] | Tuple[List[Tuple[int, ...]], int, List[float], List[float]]:
     """
     Decode node tuples from HDC embedding.
 
@@ -159,16 +181,37 @@ def decode_nodes_from_hdc(
         hypernet: HyperNet encoder instance
         hdc_vector: Concatenated HDC vector (2 * base_hdc_dim,) or (batch, 2 * base_hdc_dim)
         base_hdc_dim: Base hypervector dimension (hdc_vector has 2x this)
+        debug: If True, also return residual norms and cosine similarities
+            from each iteration of the decoding loop.
 
     Returns:
         Tuple of (list of node tuples, number of nodes)
         Each tuple is (atom_idx, degree, charge, num_hs, is_ring)
+        If debug=True, additionally returns (norms_history, similarities)
     """
     # Extract order_0 from the first half of concatenated embedding
     if hdc_vector.dim() == 1:
         order_zero = hdc_vector[:base_hdc_dim].unsqueeze(0)
     else:
         order_zero = hdc_vector[:, :base_hdc_dim]
+
+    # Ensure order_zero matches the codebook's VSATensor subclass and dtype
+    # so torchhd.cos() works.  Plain float32 tensors from the flow model
+    # would otherwise cause type/dtype mismatches with the float64 HRRTensor
+    # codebook.
+    cb = hypernet.nodes_codebook
+    if order_zero.dtype != cb.dtype:
+        order_zero = order_zero.to(dtype=cb.dtype)
+    if type(order_zero) is not type(cb):
+        order_zero = order_zero.as_subclass(type(cb))
+
+    if debug:
+        # Call iterative decoder directly with debug=True for a single embedding
+        result = hypernet.decode_order_zero_iterative(order_zero[0], debug=True)
+        decoded_nodes, norms_history, similarities = result
+
+        node_tuples = list(decoded_nodes)
+        return node_tuples, len(node_tuples), norms_history, similarities
 
     # Decode node counts from order-0 embedding using iterative unbinding
     # Returns dict: {batch_idx: Counter({node_tuple: count, ...})}
@@ -279,6 +322,38 @@ def pyg_to_mol(data: Data) -> Optional[Chem.Mol]:
         # If even partial init fails, return None
         return None
 
+    except Exception:
+        return None
+
+
+def scrub_smiles(smiles: str) -> Optional[str]:
+    """
+    Clean a SMILES string by neutralizing formal charges, removing
+    stereochemistry, and stripping explicit hydrogens.
+
+    Args:
+        smiles: Input SMILES string.
+
+    Returns:
+        Canonical scrubbed SMILES, or None on failure.
+    """
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+
+        # Remove stereochemistry (E/Z, R/S)
+        Chem.RemoveStereochemistry(mol)
+
+        # Strip explicit hydrogens
+        mol = Chem.RemoveAllHs(mol)
+
+        # Neutralize formal charges
+        from rdkit.Chem.MolStandardize import rdMolStandardize
+        uncharger = rdMolStandardize.Uncharger()
+        mol = uncharger.uncharge(mol)
+
+        return Chem.MolToSmiles(mol, canonical=True)
     except Exception:
         return None
 
@@ -469,12 +544,6 @@ class LossTrackingCallback(Callback):
     """
 
     def __init__(self, experiment: "Experiment"):
-        """
-        Initialize the callback with a PyComex experiment.
-
-        Args:
-            experiment: PyComex Experiment instance for tracking metrics
-        """
         super().__init__()
         self.experiment = experiment
 
@@ -487,10 +556,93 @@ class LossTrackingCallback(Callback):
             self.experiment.track("loss_train", float(train_loss))
 
     def on_validation_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
-        """Track validation loss at the end of each validation epoch."""
+        """Track validation loss."""
         val_loss = trainer.callback_metrics.get("val/loss")
         if val_loss is not None:
             self.experiment.track("loss_val", float(val_loss))
+
+
+def compute_hdc_distance(
+    generated_data: Data,
+    original_hdc_vectors: Tensor,
+    base_hdc_dim: int,
+    hypernet: HyperNet,
+    device: torch.device,
+    dataset: str = "zinc",
+    original_x: Optional[Tensor] = None,
+) -> float:
+    """
+    Compute HDC cosine distance between a generated graph and the original.
+
+    Encodes the generated graph directly using its ``edge_index`` and node
+    features, bypassing the lossy SMILES round-trip.  When ``original_x``
+    (raw integer features, e.g. shape ``(n, 5)`` for ZINC) is provided it is
+    used as-is; otherwise the 24-dim one-hot ``generated_data.x`` is reversed
+    via ``onehot_to_raw_features``.
+
+    Delegates to ``hypernet.calculate_distance`` which handles both single
+    HyperNet (one order-N comparison) and MultiHyperNet (per-sub-HyperNet
+    average) transparently.
+
+    Args:
+        generated_data: Generated PyG Data object (from FlowEdgeDecoder.sample)
+        original_hdc_vectors: Full concatenated [order_0 | order_N] vector
+        base_hdc_dim: Base HDC dimension (unused, kept for API compat)
+        hypernet: HyperNet or MultiHyperNet encoder
+        device: Unused, kept for API compatibility
+        dataset: Dataset type for feature encoding ("zinc" or "qm9")
+        original_x: Optional raw node features tensor (n, num_raw_features).
+                     When provided, used directly instead of reversing one-hot.
+
+    Returns:
+        Cosine distance (float). Lower is better. Returns inf on failure.
+    """
+    try:
+        # Get raw node features for HyperNet encoding
+        if original_x is not None:
+            raw_x = original_x.clone()
+        else:
+            raw_x = onehot_to_raw_features(generated_data.x)
+
+        # Build a clean Data with raw features and generated edges
+        hdc_device = hypernet.nodes_codebook.device
+        gen_data = Data(
+            x=raw_x.to(hdc_device),
+            edge_index=generated_data.edge_index.to(hdc_device),
+        )
+        gen_data.batch = torch.zeros(
+            gen_data.x.size(0), dtype=torch.long, device=hdc_device
+        )
+
+        # Augment with RW features if the hypernet expects them
+        if hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled:
+            from graph_hdc.utils.rw_features import augment_data_with_rw
+            gen_data = augment_data_with_rw(
+                gen_data,
+                k_values=hypernet.rw_config.k_values,
+                num_bins=hypernet.rw_config.num_bins,
+                bin_boundaries=hypernet.rw_config.bin_boundaries,
+            )
+
+        with torch.no_grad():
+            gen_data = hypernet.encode_properties(gen_data)
+            if gen_data.node_hv.device != hdc_device:
+                gen_data.node_hv = gen_data.node_hv.to(hdc_device)
+
+            gen_order_zero = scatter_hd(
+                src=gen_data.node_hv, index=gen_data.batch, op="bundle",
+            )
+            gen_output = hypernet.forward(gen_data, normalize=True)
+            gen_order_n = gen_output["graph_embedding"]
+            gen_hdc_vector = torch.cat([gen_order_zero, gen_order_n], dim=-1)
+
+        return hypernet.calculate_distance(
+            original_hdc_vectors.to(hdc_device), gen_hdc_vector,
+        ).item()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return float("inf")
 
 
 class ReconstructionVisualizationCallback(Callback):
@@ -499,6 +651,10 @@ class ReconstructionVisualizationCallback(Callback):
 
     Takes fixed validation samples, generates reconstructions using the model,
     and creates a 2xN figure comparing originals with reconstructions.
+
+    When ``num_repetitions > 1``, each molecule is decoded multiple times in
+    a single batched ``sample()`` call and the result with the lowest HDC
+    cosine distance to the original is kept (best-of-N).
     """
 
     def __init__(
@@ -510,6 +666,8 @@ class ReconstructionVisualizationCallback(Callback):
         omega: float,
         time_distortion: str,
         hypernet: Optional[HyperNet] = None,
+        num_repetitions: int = 1,
+        dataset: str = "zinc",
     ):
         """
         Initialize the visualization callback.
@@ -522,6 +680,8 @@ class ReconstructionVisualizationCallback(Callback):
             omega: Target guidance strength
             time_distortion: Time distortion type
             hypernet: Optional HyperNet encoder for computing HDC cosine distance
+            num_repetitions: Number of parallel decodings per molecule (best-of-N)
+            dataset: Dataset type for HDC distance computation ("zinc" or "qm9")
         """
         super().__init__()
         self.experiment = experiment
@@ -531,6 +691,8 @@ class ReconstructionVisualizationCallback(Callback):
         self.omega = omega
         self.time_distortion = time_distortion
         self.hypernet = hypernet
+        self.num_repetitions = num_repetitions
+        self.dataset = dataset
 
     def on_validation_epoch_end(
         self,
@@ -541,64 +703,104 @@ class ReconstructionVisualizationCallback(Callback):
         if len(self.vis_samples) == 0:
             return
 
-        # Collect inputs for batch sampling
+        device = pl_module.device
+        num_reps = self.num_repetitions
+        n_samples = len(self.vis_samples)
+
+        # Collect per-sample inputs
+        scrubbed_smiles_list = []
+        original_mols = []
         hdc_vectors_list = []
         node_features_list = []
-        original_mols = []
-        max_nodes = 0
 
         for data in self.vis_samples:
-            # Parse original molecule from SMILES
-            original_mol = Chem.MolFromSmiles(data.smiles)
-            original_mols.append(original_mol)
+            scrubbed = scrub_smiles(data.smiles) or data.smiles
+            scrubbed_smiles_list.append(scrubbed)
+            original_mols.append(Chem.MolFromSmiles(scrubbed))
 
-            # Get preprocessed HDC vector (already concatenated [order_0 | order_N])
             hdc_vec = data.hdc_vector
             if hdc_vec.dim() == 2:
                 hdc_vec = hdc_vec.squeeze(0)
             hdc_vectors_list.append(hdc_vec)
-
-            # Get 24-dim one-hot node features
             node_features_list.append(data.x)
-            max_nodes = max(max_nodes, data.x.size(0))
 
-        # Pad to common size and stack
-        device = pl_module.device
-        batch_size = len(self.vis_samples)
-        hdc_dim = hdc_vectors_list[0].size(-1)
-        node_feature_dim = node_features_list[0].size(-1)
-
-        hdc_vectors = torch.stack(hdc_vectors_list, dim=0).to(device).float()
-
-        # Pad node features and create masks
-        node_features = torch.zeros(batch_size, max_nodes, node_feature_dim, device=device)
-        node_mask = torch.zeros(batch_size, max_nodes, dtype=torch.bool, device=device)
-
-        for i, nf in enumerate(node_features_list):
-            n = nf.size(0)
-            node_features[i, :n] = nf.to(device)
-            node_mask[i, :n] = True
-
-        # Generate reconstructions one at a time with logging
+        # Generate reconstructions: process each molecule sequentially,
+        # but batch num_repetitions parallel decodings per molecule.
         pl_module.eval()
+        self.experiment.log(
+            f"\nGenerating {n_samples} reconstructions "
+            f"(best-of-{num_reps}, {self.sample_steps} steps)..."
+        )
+
         reconstructed_samples = []
-        self.experiment.log(f"\nGenerating {batch_size} reconstructions ({self.sample_steps} steps each)...")
+        best_distances = []
+
+        sample_kwargs = dict(
+            sample_steps=self.sample_steps,
+            eta=self.eta,
+            omega=self.omega,
+            time_distortion=self.time_distortion,
+            device=device,
+            show_progress=False,
+        )
 
         with torch.no_grad():
-            for i in range(batch_size):
-                sample = pl_module.sample(
-                    hdc_vectors=hdc_vectors[i : i + 1],
-                    node_features=node_features[i : i + 1],
-                    node_mask=node_mask[i : i + 1],
-                    sample_steps=self.sample_steps,
-                    eta=self.eta,
-                    omega=self.omega,
-                    time_distortion=self.time_distortion,
-                    device=device,
-                    show_progress=False,
+            for i in range(n_samples):
+                hdc_vec = hdc_vectors_list[i].to(device).float().unsqueeze(0)
+                nf = node_features_list[i].to(device).unsqueeze(0)
+                n_nodes = node_features_list[i].size(0)
+                mask = torch.ones(1, n_nodes, dtype=torch.bool, device=device)
+
+                if num_reps > 1 and self.hypernet is not None:
+                    orig_hdc = hdc_vectors_list[i]
+                    base_hdc_dim = orig_hdc.size(-1) // 2
+
+                    raw_x = getattr(self.vis_samples[i], "original_x", None)
+
+                    def score_fn(s, _orig=orig_hdc, _dim=base_hdc_dim, _raw_x=raw_x):
+                        return compute_hdc_distance(
+                            s, _orig.unsqueeze(0), _dim,
+                            self.hypernet, device, dataset=self.dataset,
+                            original_x=_raw_x,
+                        )
+
+                    best_sample, best_dist = pl_module.sample_best_of_n(
+                        hdc_vectors=hdc_vec,
+                        node_features=nf,
+                        node_mask=mask,
+                        num_repetitions=num_reps,
+                        score_fn=score_fn,
+                        **sample_kwargs,
+                    )
+                else:
+                    samples = pl_module.sample(
+                        hdc_vectors=hdc_vec,
+                        node_features=nf,
+                        node_mask=mask,
+                        **sample_kwargs,
+                    )
+                    best_sample = samples[0]
+                    best_dist = None
+
+                reconstructed_samples.append(best_sample)
+                best_distances.append(best_dist)
+                self.experiment.log(
+                    f"  Molecule {i + 1}/{n_samples}"
+                    + (f" (best HDC dist: {best_dist:.6f})" if best_dist is not None else "")
                 )
-                reconstructed_samples.extend(sample)
-                self.experiment.log(f"  Reconstructed molecule {i + 1}/{batch_size}")
+
+        # Move generated samples to CPU and release all GPU references
+        # from the sampling loop so empty_cache() can fully reclaim memory.
+        reconstructed_samples = [s.cpu() for s in reconstructed_samples]
+        # Break references to GPU tensors left over from the last loop iteration
+        # (hdc_vec, nf, mask are .to(device) copies; best_sample holds GPU Data;
+        # samples/score_fn may exist depending on which branch ran).
+        hdc_vec = nf = mask = best_sample = best_dist = None  # noqa: F841
+        samples = score_fn = None  # noqa: F841
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Convert reconstructions to RDKit molecules
         reconstructed_mols = [pyg_to_mol(data) for data in reconstructed_samples]
@@ -615,32 +817,45 @@ class ReconstructionVisualizationCallback(Callback):
         hdc_cosine_distances = []
         if self.hypernet is not None:
             hdc_device = torch.device(self.hypernet.device)
-            for i, (orig_data, recon_mol) in enumerate(zip(self.vis_samples, reconstructed_mols)):
-                if recon_mol is None:
-                    hdc_cosine_distances.append(0.0)
-                    continue
-                try:
-                    recon_data = zinc_mol_to_data(recon_mol).to(hdc_device)
-                    recon_data.batch = torch.zeros(
-                        recon_data.x.size(0), dtype=torch.long, device=hdc_device
-                    )
-                    with torch.no_grad():
+            with torch.no_grad():
+                for i, (orig_data, recon_mol) in enumerate(zip(self.vis_samples, reconstructed_mols)):
+                    if recon_mol is None:
+                        hdc_cosine_distances.append(0.0)
+                        continue
+                    recon_data = recon_out = recon_emb = orig_order_n = None
+                    try:
+                        recon_data = zinc_mol_to_data(recon_mol).to(hdc_device)
+                        recon_data.batch = torch.zeros(
+                            recon_data.x.size(0), dtype=torch.long, device=hdc_device
+                        )
+                        if hasattr(self.hypernet, "rw_config") and self.hypernet.rw_config.enabled:
+                            from graph_hdc.utils.rw_features import augment_data_with_rw
+                            recon_data = augment_data_with_rw(
+                                recon_data,
+                                k_values=self.hypernet.rw_config.k_values,
+                                num_bins=self.hypernet.rw_config.num_bins,
+                                bin_boundaries=self.hypernet.rw_config.bin_boundaries,
+                            )
                         recon_out = self.hypernet.forward(recon_data, normalize=True)
-                    recon_emb = recon_out["graph_embedding"]  # (1, hdc_dim)
+                        recon_emb = recon_out["graph_embedding"]
 
-                    # Extract original order_N from the stored hdc_vector
-                    hdc_vec = orig_data.hdc_vector
-                    if hdc_vec.dim() == 2:
-                        hdc_vec = hdc_vec.squeeze(0)
-                    hdc_dim = hdc_vec.size(-1) // 2
-                    orig_order_n = hdc_vec[hdc_dim:].unsqueeze(0).to(hdc_device)
+                        hdc_vec = orig_data.hdc_vector
+                        if hdc_vec.dim() == 2:
+                            hdc_vec = hdc_vec.squeeze(0)
+                        hdc_dim = hdc_vec.size(-1) // 2
+                        orig_order_n = hdc_vec[hdc_dim:].unsqueeze(0).to(hdc_device)
 
-                    cos_sim = torch.nn.functional.cosine_similarity(
-                        orig_order_n.float(), recon_emb.float(), dim=-1
-                    ).item()
-                    hdc_cosine_distances.append(cos_sim)
-                except Exception:
-                    hdc_cosine_distances.append(0.0)
+                        cos_sim = torch.nn.functional.cosine_similarity(
+                            orig_order_n.float(), recon_emb.float(), dim=-1
+                        ).item()
+                        hdc_cosine_distances.append(cos_sim)
+                    except Exception:
+                        hdc_cosine_distances.append(0.0)
+                    finally:
+                        del recon_data, recon_out, recon_emb, orig_order_n
+            # Release remaining references
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             avg_hdc_cosine = (
                 sum(hdc_cosine_distances) / len(hdc_cosine_distances)
@@ -663,7 +878,7 @@ class ReconstructionVisualizationCallback(Callback):
             orig_img = draw_mol_or_error(original_mols[i], size=(200, 200))
             axes[0, i].imshow(orig_img)
             axes[0, i].axis("off")
-            orig_smiles = self.vis_samples[i].smiles
+            orig_smiles = scrubbed_smiles_list[i]
             truncated_orig = orig_smiles[:20] + ("..." if len(orig_smiles) > 20 else "")
             axes[0, i].set_title(f"Original\n{truncated_orig}", fontsize=8)
 
@@ -820,7 +1035,6 @@ class TrainingMetricsCallback(Callback):
         self.train_losses: List[float] = []
         self.val_losses: List[float] = []
         self.class_losses: List[List[float]] = []  # Per-epoch, per-class
-        self.learning_rates: List[float] = []
         self.timestep_losses: List[List[float]] = []  # Per-epoch, per-bin
 
         # Row 2: Edge prediction metrics
@@ -839,7 +1053,7 @@ class TrainingMetricsCallback(Callback):
         self.param_deltas: List[float] = []
         self.weight_norms: List[Dict[str, float]] = []
         self.module_param_deltas: List[Dict[str, float]] = []
-        self.loss_improvements: List[float] = []
+        self.tanimoto_similarities: List[float] = []
 
         # Within-epoch accumulators (reset each epoch)
         self._reset_epoch_accumulators()
@@ -980,22 +1194,17 @@ class TrainingMetricsCallback(Callback):
                 bin_idx = self._bin_timestep(t_val.item())
                 self._epoch_timestep_losses[bin_idx].append(loss.item())
 
-        # Update confusion matrix and counts
+        # Update confusion matrix and counts (all tensors are on CPU)
         if node_mask is not None:
-            # Create edge mask (valid node pairs, no diagonal)
             bs, n = node_mask.shape
             edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
-            diag_mask = ~torch.eye(n, dtype=torch.bool, device=edge_mask.device)
+            diag_mask = ~torch.eye(n, dtype=torch.bool)
             edge_mask = edge_mask & diag_mask.unsqueeze(0)
-
-            # Only use upper triangle to avoid double-counting symmetric edges
             triu_mask = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
-            triu_mask = triu_mask.unsqueeze(0).to(edge_mask.device)
-            edge_mask = edge_mask & triu_mask
+            edge_mask = edge_mask & triu_mask.unsqueeze(0)
 
-            # Flatten and filter
-            pred_flat = pred_classes[edge_mask].cpu().numpy()
-            true_flat = true_classes[edge_mask].cpu().numpy()
+            pred_flat = pred_classes[edge_mask].numpy()
+            true_flat = true_classes[edge_mask].numpy()
 
             # Update confusion matrix
             for p, t in zip(pred_flat, true_flat):
@@ -1022,10 +1231,6 @@ class TrainingMetricsCallback(Callback):
         train_loss = trainer.callback_metrics.get("train/loss")
         if train_loss is not None:
             self.train_losses.append(float(train_loss))
-
-        # Store learning rate
-        lr = trainer.optimizers[0].param_groups[0]["lr"]
-        self.learning_rates.append(lr)
 
         # Store gradient metrics
         if self._epoch_grad_norms:
@@ -1098,17 +1303,11 @@ class TrainingMetricsCallback(Callback):
         if val_loss is not None:
             self.val_losses.append(float(val_loss))
 
-        # Compute loss improvement rate
-        if len(self.train_losses) >= 2:
-            prev_loss = self.train_losses[-2]
-            curr_loss = self.train_losses[-1]
-            if prev_loss > 0:
-                improvement = (prev_loss - curr_loss) / prev_loss
-            else:
-                improvement = 0.0
-            self.loss_improvements.append(improvement)
-        elif len(self.train_losses) == 1:
-            self.loss_improvements.append(0.0)
+        # Read Tanimoto similarity from ReconstructionVisualizationCallback
+        # (must run after it in callback order)
+        tracked = self.experiment.data.get("tanimoto_similarity", [])
+        if len(tracked) > len(self.tanimoto_similarities):
+            self.tanimoto_similarities.append(float(tracked[-1]))
 
         # Generate plots (only if we have at least one epoch of data)
         epoch = trainer.current_epoch + 1
@@ -1131,10 +1330,10 @@ class TrainingMetricsCallback(Callback):
 
         epochs = list(range(1, len(self.train_losses) + 1))
 
-        # Row 1: Loss & LR
+        # Row 1: Loss curves
         self._plot_loss_curves(axes[0, 0], epochs)
         self._plot_class_losses(axes[0, 1], epochs)
-        self._plot_learning_rate(axes[0, 2], epochs)
+        self._plot_loss_log_scale(axes[0, 2], epochs)
         self._plot_timestep_loss(axes[0, 3])
 
         # Row 2: Edge Type Analysis
@@ -1153,7 +1352,7 @@ class TrainingMetricsCallback(Callback):
         self._plot_param_delta(axes[3, 0], epochs)
         self._plot_weight_norms(axes[3, 1], epochs)
         self._plot_module_param_deltas(axes[3, 2], epochs)
-        self._plot_loss_improvement(axes[3, 3], epochs)
+        self._plot_tanimoto_similarity(axes[3, 3], epochs)
 
         fig.suptitle(f"Training Metrics - Epoch {epoch}", fontsize=14, fontweight="bold")
         plt.tight_layout()
@@ -1240,20 +1439,25 @@ class TrainingMetricsCallback(Callback):
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
-    def _plot_learning_rate(self, ax, epochs):
-        """Plot learning rate schedule."""
-        if not self.learning_rates:
-            ax.set_title("Learning Rate")
+    def _plot_loss_log_scale(self, ax, epochs):
+        """Plot train/val loss on a log scale."""
+        if not self.train_losses and not self.val_losses:
+            ax.set_title("Loss (log scale)")
             ax.text(0.5, 0.5, "No data", ha="center", va="center")
             return
 
-        n_data = min(len(epochs), len(self.learning_rates))
-        ax.plot(epochs[:n_data], self.learning_rates[:n_data], color="green", linewidth=2)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Learning Rate")
-        ax.set_title("Learning Rate")
+        if self.train_losses:
+            n_train = min(len(epochs), len(self.train_losses))
+            ax.plot(epochs[:n_train], self.train_losses[:n_train], label="Train", linewidth=1.5)
+        if self.val_losses:
+            val_epochs = list(range(1, len(self.val_losses) + 1))
+            ax.plot(val_epochs, self.val_losses, label="Val", linewidth=1.5)
         ax.set_yscale("log")
-        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss (log scale)")
+        ax.set_title("Loss (log scale)")
+        ax.legend(fontsize=8)
+        ax.grid(True, which="both", ls="--", alpha=0.3)
 
     def _plot_timestep_loss(self, ax):
         """Plot loss vs timestep bin."""
@@ -1539,22 +1743,302 @@ class TrainingMetricsCallback(Callback):
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
-    def _plot_loss_improvement(self, ax, epochs):
-        """Plot loss improvement rate."""
-        if not self.loss_improvements:
-            ax.set_title("Loss Improvement")
+    def _plot_tanimoto_similarity(self, ax, epochs):
+        """Plot average Tanimoto similarity over validation samples per epoch."""
+        if not self.tanimoto_similarities:
+            ax.set_title("Tanimoto Similarity")
             ax.text(0.5, 0.5, "No data", ha="center", va="center")
             return
 
-        n_data = min(len(epochs), len(self.loss_improvements))
-        ax.plot(
-            epochs[:n_data],
-            self.loss_improvements[:n_data],
-            color="green",
-            linewidth=2,
-        )
-        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        n_data = min(len(epochs), len(self.tanimoto_similarities))
+        ep = epochs[:n_data]
+        raw = self.tanimoto_similarities[:n_data]
+
+        # Raw values (semi-transparent)
+        ax.plot(ep, raw, color="green", alpha=0.3, linewidth=1, label="Raw")
+
+        # Smoothed values
+        smoothed = self._smooth(raw, window=10)
+        ax.plot(ep, smoothed, color="green", linewidth=2, label="Smoothed")
+
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Improvement Rate")
-        ax.set_title("Loss Improvement Rate")
+        ax.set_ylabel("Avg Tanimoto")
+        ax.set_title("Tanimoto Similarity")
+        ax.set_ylim(-0.05, 1.05)
+        ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
+
+
+# ========= Test Experiment Helpers =========
+
+
+def load_smiles_from_csv(csv_path: str) -> list[str]:
+    """
+    Load SMILES strings from a CSV file.
+
+    Args:
+        csv_path: Path to CSV file. Must contain a "smiles" column.
+
+    Returns:
+        List of SMILES strings (NaN values dropped).
+
+    Raises:
+        ValueError: If CSV file does not contain a "smiles" column.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    if "smiles" not in df.columns:
+        raise ValueError(f"CSV file must have 'smiles' column. Found: {list(df.columns)}")
+
+    return df["smiles"].dropna().tolist()
+
+
+def smiles_to_pyg_data(smiles: str, dataset: str = "zinc") -> Optional[Data]:
+    """
+    Convert SMILES string to PyG Data object with node features.
+
+    Supports both QM9 (4-dim features) and ZINC (5-dim features) datasets.
+
+    Args:
+        smiles: SMILES string to convert.
+        dataset: Dataset name for feature encoding ("qm9" or "zinc").
+
+    Returns:
+        PyG Data object with ``x``, ``edge_index``, and ``smiles`` attributes,
+        or ``None`` if the SMILES cannot be parsed or contains unsupported atoms.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    # Get atom type mapping based on dataset
+    if dataset.lower() == "qm9":
+        from graph_hdc.datasets.qm9_smiles import QM9_ATOM_TO_IDX
+        atom_to_idx = QM9_ATOM_TO_IDX
+        num_features = 4
+    else:
+        from graph_hdc.datasets.zinc_smiles import ZINC_ATOM_TO_IDX
+        atom_to_idx = ZINC_ATOM_TO_IDX
+        num_features = 5
+
+    # Build node features
+    x = []
+    for atom in mol.GetAtoms():
+        sym = atom.GetSymbol()
+        if sym not in atom_to_idx:
+            return None  # Unsupported atom type
+
+        atom_type = atom_to_idx[sym]
+        degree = max(0, min(5, atom.GetDegree() - 1))
+        charge = atom.GetFormalCharge()
+        charge_idx = 0 if charge == 0 else (1 if charge > 0 else 2)
+        explicit_hs = min(3, atom.GetTotalNumHs())
+
+        if num_features == 4:
+            x.append([float(atom_type), float(degree), float(charge_idx), float(explicit_hs)])
+        else:
+            is_in_ring = float(atom.IsInRing())
+            x.append([float(atom_type), float(degree), float(charge_idx), float(explicit_hs), is_in_ring])
+
+    x = torch.tensor(x, dtype=torch.float)
+
+    # Build edge index
+    edge_index = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        edge_index.append([i, j])
+        edge_index.append([j, i])
+
+    if len(edge_index) > 0:
+        edge_index = torch.tensor(edge_index, dtype=torch.long).T
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+    return Data(x=x, edge_index=edge_index, smiles=smiles)
+
+
+def create_summary_bar_chart(
+    match_count: int,
+    valid_count: int,
+    invalid_count: int,
+    total_count: int,
+    save_path: Path,
+    title_prefix: str = "",
+) -> None:
+    """
+    Create summary bar chart showing match/valid/invalid counts.
+
+    Args:
+        match_count: Number of exact SMILES matches.
+        valid_count: Number of valid molecules (includes matches).
+        invalid_count: Number of invalid molecules.
+        total_count: Total number of processed molecules.
+        save_path: Path to save the chart image.
+        title_prefix: Optional prefix for the chart title (e.g. "HDC-Guided").
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    categories = ["Match", "Valid (no match)", "Invalid"]
+    valid_no_match = valid_count - match_count
+    counts = [match_count, valid_no_match, invalid_count]
+    colors = ["green", "orange", "red"]
+
+    bars = ax.bar(categories, counts, color=colors, edgecolor="black", linewidth=1.2)
+
+    # Add count labels on bars
+    for bar, count in zip(bars, counts):
+        height = bar.get_height()
+        percentage = 100 * count / total_count if total_count > 0 else 0
+        ax.annotate(
+            f"{count}\n({percentage:.1f}%)",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=12,
+            fontweight="bold",
+        )
+
+    ax.set_ylabel("Count", fontsize=12)
+    prefix = f"{title_prefix} " if title_prefix else ""
+    ax.set_title(f"{prefix}Reconstruction Results (n={total_count})", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, max(counts) * 1.2 if max(counts) > 0 else 1)
+
+    ax.yaxis.grid(True, linestyle="--", alpha=0.7)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def create_accuracy_by_size_chart(
+    results: List[Dict],
+    save_path: Path,
+    title_prefix: str = "",
+) -> None:
+    """
+    Create bar chart showing exact match accuracy grouped by molecule size.
+
+    Each bar represents molecules with the same number of heavy atoms.
+    The y-axis shows the fraction of exact SMILES matches for that size.
+    Sizes with no processed molecules are omitted (no bar).
+
+    Args:
+        results: List of result dicts, each containing at least
+            ``num_atoms`` (int) and ``is_match`` (bool). Entries without
+            these keys (e.g. skipped molecules) are ignored.
+        save_path: Path to save the chart image.
+        title_prefix: Optional prefix for the chart title.
+    """
+    # Group results by molecule size (skip entries without num_atoms)
+    size_groups: Dict[int, List[bool]] = defaultdict(list)
+    for r in results:
+        if "num_atoms" not in r or "is_match" not in r:
+            continue
+        size_groups[r["num_atoms"]].append(r["is_match"])
+
+    if not size_groups:
+        return
+
+    sizes = sorted(size_groups.keys())
+    accuracies = []
+    counts = []
+    for s in sizes:
+        matches = size_groups[s]
+        counts.append(len(matches))
+        accuracies.append(sum(matches) / len(matches))
+
+    fig, ax = plt.subplots(figsize=(max(8, len(sizes) * 0.6), 6))
+
+    bars = ax.bar(
+        [str(s) for s in sizes],
+        accuracies,
+        color="#4C72B0",
+        edgecolor="black",
+        linewidth=0.8,
+    )
+
+    # Add count labels above each bar
+    for bar, acc, cnt in zip(bars, accuracies, counts):
+        height = bar.get_height()
+        ax.annotate(
+            f"{acc:.0%}\n(n={cnt})",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+
+    ax.set_xlabel("Number of Heavy Atoms", fontsize=12)
+    ax.set_ylabel("Exact Match Accuracy", fontsize=12)
+    prefix = f"{title_prefix} " if title_prefix else ""
+    total = sum(counts)
+    ax.set_title(
+        f"{prefix}Reconstruction Accuracy by Molecule Size (n={total})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax.set_ylim(0, min(1.0, max(accuracies) * 1.3) if accuracies else 1.0)
+
+    ax.yaxis.grid(True, linestyle="--", alpha=0.7)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def create_test_dummy_models(
+    device: torch.device,
+) -> Tuple[HyperNet, FlowEdgeDecoder, int]:
+    """
+    Create dummy HyperNet and FlowEdgeDecoder models for testing mode.
+
+    Creates minimal ZINC-compatible models with small dimensions that can
+    run quickly without pretrained checkpoints.
+
+    Args:
+        device: Device to create models on.
+
+    Returns:
+        Tuple of (hypernet, decoder, base_hdc_dim) where base_hdc_dim is 256.
+    """
+    base_hdc_dim = 256
+
+    # Create minimal HyperNet (ZINC config with 5 features)
+    node_feature_config = FeatureConfig(
+        count=math.prod([9, 6, 3, 4, 2]),  # ZINC: 9*6*3*4*2 = 1296
+        encoder_cls=CombinatoricIntegerEncoder,
+        index_range=IndexRange((0, 5)),
+        bins=[9, 6, 3, 4, 2],
+    )
+    config = DSHDCConfig(
+        name="TEST_ZINC",
+        hv_dim=base_hdc_dim,
+        vsa=VSAModel.HRR,
+        base_dataset="zinc",
+        hypernet_depth=3,
+        device=str(device),
+        seed=42,
+        normalize=True,
+        dtype="float64",
+        node_feature_configs=OrderedDict([(Features.NODE_FEATURES, node_feature_config)]),
+    )
+    hypernet = HyperNet(config)
+
+    # Create minimal FlowEdgeDecoder (24-dim node features)
+    decoder = FlowEdgeDecoder(
+        num_node_classes=NODE_FEATURE_DIM,
+        hdc_dim=2 * base_hdc_dim,  # Concatenated [order_0 | order_N]
+        condition_dim=64,
+        n_layers=2,
+        hidden_dim=64,
+        hidden_mlp_dim=128,
+    )
+
+    return hypernet, decoder, base_hdc_dim

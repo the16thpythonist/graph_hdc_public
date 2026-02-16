@@ -27,6 +27,7 @@ from graph_hdc.models.flow_edge_decoder import (
     DistributionNodes,
     FlowEdgeDecoder,
     FlowEdgeDecoderConfig,
+    HDCCrossAttentionConditioner,
     # Preprocessing
     compute_edge_marginals,
     compute_node_counts,
@@ -80,6 +81,37 @@ def small_model(mock_edge_marginals, mock_node_counts):
         eta=0.0,
         omega=0.0,
         sample_time_distortion="identity",
+    )
+
+
+@pytest.fixture
+def small_model_cross_attn(mock_edge_marginals, mock_node_counts):
+    """Create a small FlowEdgeDecoder with cross-attention conditioning for testing."""
+    return FlowEdgeDecoder(
+        num_node_classes=NODE_FEATURE_DIM,
+        num_edge_classes=NUM_EDGE_CLASSES,
+        hdc_dim=64,
+        n_layers=2,
+        hidden_dim=32,
+        hidden_mlp_dim=64,
+        n_heads=2,
+        dropout=0.0,
+        noise_type="marginal",
+        edge_marginals=mock_edge_marginals,
+        node_counts=mock_node_counts,
+        max_nodes=15,
+        extra_features_type="rrwp",
+        rrwp_steps=5,
+        lr=1e-4,
+        weight_decay=0.0,
+        train_time_distortion="identity",
+        sample_steps=3,
+        eta=0.0,
+        omega=0.0,
+        sample_time_distortion="identity",
+        use_cross_attn=True,
+        cross_attn_tokens=4,
+        cross_attn_heads=2,
     )
 
 
@@ -923,6 +955,168 @@ class TestConfiguration:
 
 
 # =============================================================================
+# Test Cross-Attention Conditioning
+# =============================================================================
+
+class TestCrossAttentionConditioning:
+    """Tests for HDCCrossAttentionConditioner and cross-attention conditioning in FlowEdgeDecoder."""
+
+    def test_conditioner_output_shape(self):
+        """Test HDCCrossAttentionConditioner produces correct output shape."""
+        bs, n = 2, 8
+        hdc_dim = 64
+        node_input_dim = 29  # 24 + 5 RRWP
+        edge_cond_dim = 8
+        num_tokens = 4
+        n_heads = 2
+
+        conditioner = HDCCrossAttentionConditioner(
+            hdc_dim=hdc_dim,
+            node_input_dim=node_input_dim,
+            edge_cond_dim=edge_cond_dim,
+            num_tokens=num_tokens,
+            n_heads=n_heads,
+        )
+
+        X = torch.randn(bs, n, node_input_dim)
+        hdc_raw = torch.randn(bs, hdc_dim)
+        node_mask = torch.ones(bs, n, dtype=torch.bool)
+        node_mask[1, 6:] = False  # Second graph has 6 valid nodes
+
+        with torch.no_grad():
+            edge_cond = conditioner(X, hdc_raw, node_mask)
+
+        assert edge_cond.shape == (bs, n, n, edge_cond_dim)
+
+    def test_conditioner_respects_node_mask(self):
+        """Test that edge conditioning is zero for invalid node pairs."""
+        bs, n = 1, 6
+        hdc_dim = 64
+        node_input_dim = 29
+        edge_cond_dim = 8
+
+        conditioner = HDCCrossAttentionConditioner(
+            hdc_dim=hdc_dim,
+            node_input_dim=node_input_dim,
+            edge_cond_dim=edge_cond_dim,
+            num_tokens=4,
+            n_heads=2,
+        )
+
+        X = torch.randn(bs, n, node_input_dim)
+        hdc_raw = torch.randn(bs, hdc_dim)
+        node_mask = torch.zeros(bs, n, dtype=torch.bool)
+        node_mask[0, :4] = True  # Only first 4 nodes valid
+
+        with torch.no_grad():
+            edge_cond = conditioner(X, hdc_raw, node_mask)
+
+        # Edges involving invalid nodes (indices 4, 5) should be zero
+        assert torch.allclose(edge_cond[0, 4:, :, :], torch.zeros_like(edge_cond[0, 4:, :, :]))
+        assert torch.allclose(edge_cond[0, :, 4:, :], torch.zeros_like(edge_cond[0, :, 4:, :]))
+
+    def test_forward_with_cross_attn(self, small_model_cross_attn, mock_dense_batch):
+        """Test forward pass with cross-attention conditioning produces correct shapes."""
+        model = small_model_cross_attn
+        model.eval()
+
+        X = mock_dense_batch["X"]
+        E = mock_dense_batch["E"]
+        hdc = mock_dense_batch["hdc_vectors"]
+        node_mask = mock_dense_batch["node_mask"]
+
+        noisy_data = model._apply_noise(X, E, hdc, node_mask)
+        extra_data = model._compute_extra_data(noisy_data)
+
+        with torch.no_grad():
+            pred = model.forward(noisy_data, extra_data, node_mask)
+
+        bs, n = X.shape[:2]
+        assert pred.X.shape == (bs, n, NODE_FEATURE_DIM)
+        assert pred.E.shape == (bs, n, n, NUM_EDGE_CLASSES)
+        assert not torch.isnan(pred.E).any()
+        assert not torch.isinf(pred.E).any()
+
+    def test_apply_noise_includes_hdc_raw(self, small_model, small_model_cross_attn, mock_dense_batch):
+        """Test that _apply_noise includes hdc_raw key in returned dict."""
+        X = mock_dense_batch["X"]
+        E = mock_dense_batch["E"]
+        hdc = mock_dense_batch["hdc_vectors"]
+        node_mask = mock_dense_batch["node_mask"]
+
+        # Both models should include hdc_raw
+        noisy_std = small_model._apply_noise(X, E, hdc, node_mask)
+        noisy_ca = small_model_cross_attn._apply_noise(X, E, hdc, node_mask)
+
+        assert "hdc_raw" in noisy_std
+        assert "hdc_raw" in noisy_ca
+        assert torch.allclose(noisy_std["hdc_raw"], hdc)
+        assert torch.allclose(noisy_ca["hdc_raw"], hdc)
+
+    def test_training_step_with_cross_attn(self, small_model_cross_attn, mock_pyg_batch):
+        """Test training step works with cross-attention model."""
+        result = small_model_cross_attn.training_step(mock_pyg_batch, 0)
+
+        assert result is not None
+        assert "loss" in result
+        assert torch.isfinite(result["loss"])
+        assert result["loss"].requires_grad
+
+    def test_sample_with_cross_attn(self, small_model_cross_attn, mock_dense_batch):
+        """Test sampling works with cross-attention model."""
+        small_model_cross_attn.eval()
+
+        samples = small_model_cross_attn.sample(
+            hdc_vectors=mock_dense_batch["hdc_vectors"],
+            node_features=mock_dense_batch["X"],
+            node_mask=mock_dense_batch["node_mask"],
+            sample_steps=2,
+            show_progress=False,
+        )
+
+        assert isinstance(samples, list)
+        assert len(samples) == 2  # batch size
+        assert all(isinstance(s, Data) for s in samples)
+
+    def test_cross_attn_different_from_standard(self, small_model, small_model_cross_attn, mock_dense_batch):
+        """Test that cross-attention model produces different outputs than standard model."""
+        small_model.eval()
+        small_model_cross_attn.eval()
+
+        X = mock_dense_batch["X"]
+        E = mock_dense_batch["E"]
+        hdc = mock_dense_batch["hdc_vectors"]
+        node_mask = mock_dense_batch["node_mask"]
+
+        # Use a fixed timestep for reproducibility
+        t = torch.tensor([[0.5], [0.5]])
+
+        noisy_std = small_model._apply_noise(X, E, hdc, node_mask, t=t)
+        noisy_ca = small_model_cross_attn._apply_noise(X, E, hdc, node_mask, t=t)
+
+        extra_std = small_model._compute_extra_data(noisy_std)
+        extra_ca = small_model_cross_attn._compute_extra_data(noisy_ca)
+
+        with torch.no_grad():
+            pred_std = small_model.forward(noisy_std, extra_std, node_mask)
+            pred_ca = small_model_cross_attn.forward(noisy_ca, extra_ca, node_mask)
+
+        # Outputs should differ since cross-attn adds edge-specific conditioning
+        # (different random weights means different outputs)
+        assert not torch.allclose(pred_std.E, pred_ca.E, atol=1e-3)
+
+    def test_input_dims_with_cross_attn(self, small_model, small_model_cross_attn):
+        """Test that cross-attention model has larger E input dimension."""
+        edge_cond_dim = small_model_cross_attn.hidden_dims["de"]  # hidden_dim // 4 = 8
+        expected_diff = edge_cond_dim
+
+        assert small_model_cross_attn.input_dims["E"] == small_model.input_dims["E"] + expected_diff
+        # X and y dimensions should be unchanged
+        assert small_model_cross_attn.input_dims["X"] == small_model.input_dims["X"]
+        assert small_model_cross_attn.input_dims["y"] == small_model.input_dims["y"]
+
+
+# =============================================================================
 # End-to-End Decoding Test
 # =============================================================================
 
@@ -1468,14 +1662,13 @@ class TestHDCGuidedSamplingWithHyperNet:
         expected_hdc_dim = 256
         assert order_n.shape == (K, bs, expected_hdc_dim), f"Expected ({K}, {bs}, {expected_hdc_dim}), got {order_n.shape}"
 
-    def test_sample_with_hdc_guidance_real_data(self, hypernet_for_hdc, model_for_hdc, real_zinc_data):
-        """Test sample_with_hdc_guidance with real ZINC data."""
+    def test_sample_with_soft_hdc_guidance_blend_mode(self, hypernet_for_hdc, model_for_hdc, real_zinc_data):
+        """Test sample_with_soft_hdc_guidance with blend integration mode."""
         from graph_hdc.utils.helpers import scatter_hd
 
         hypernet = hypernet_for_hdc
         model = model_for_hdc
 
-        # Use real data
         data = real_zinc_data[1]  # CC (ethane)
         n = data.x.size(0)
         bs = 1
@@ -1490,20 +1683,20 @@ class TestHDCGuidedSamplingWithHyperNet:
             order_n = output["graph_embedding"]
             hdc_vectors = torch.cat([order_zero, order_n], dim=-1)  # (1, 512)
 
-        # Convert node features to 24-dim one-hot
         node_features = raw_features_to_onehot(data.x).unsqueeze(0)  # (1, n, 24)
-
         node_mask = torch.ones(bs, n, dtype=torch.bool)
-        original_node_features = data.x.unsqueeze(0)  # (1, n, 5)
+        raw_node_features = data.x.unsqueeze(0)  # (1, n, 5)
 
-        samples = model.sample_with_hdc_guidance(
+        samples = model.sample_with_soft_hdc_guidance(
             hdc_vectors=hdc_vectors,
             node_features=node_features,
             node_mask=node_mask,
-            original_node_features=original_node_features,
             hypernet=hypernet,
-            gamma=1.0,
-            num_candidates=2,
+            raw_node_features=raw_node_features,
+            gamma=0.5,
+            tau=0.5,
+            integration_mode="blend",
+            schedule="linear_decay",
             sample_steps=2,
             show_progress=False,
         )
@@ -1512,8 +1705,8 @@ class TestHDCGuidedSamplingWithHyperNet:
         assert samples[0].x is not None
         assert samples[0].edge_index is not None
 
-    def test_sample_with_hdc_guidance_gamma_zero_runs(self, hypernet_for_hdc, model_for_hdc, real_zinc_data):
-        """Test that sample_with_hdc_guidance runs with gamma=0 using real data."""
+    def test_sample_with_soft_hdc_guidance_rate_matrix_mode(self, hypernet_for_hdc, model_for_hdc, real_zinc_data):
+        """Test sample_with_soft_hdc_guidance with rate_matrix integration mode."""
         from graph_hdc.utils.helpers import scatter_hd
 
         hypernet = hypernet_for_hdc
@@ -1523,7 +1716,6 @@ class TestHDCGuidedSamplingWithHyperNet:
         n = data.x.size(0)
         bs = 1
 
-        # Compute HDC embedding
         data_for_hdc = data.clone()
         data_for_hdc.batch = torch.zeros(n, dtype=torch.long)
         with torch.no_grad():
@@ -1533,25 +1725,335 @@ class TestHDCGuidedSamplingWithHyperNet:
             order_n = output["graph_embedding"]
             hdc_vectors = torch.cat([order_zero, order_n], dim=-1)
 
-        # Convert node features to 24-dim one-hot
-        node_features = raw_features_to_onehot(data.x).unsqueeze(0)  # (1, n, 24)
-
+        node_features = raw_features_to_onehot(data.x).unsqueeze(0)
         node_mask = torch.ones(bs, n, dtype=torch.bool)
-        original_node_features = data.x.unsqueeze(0)  # (1, n, 5)
+        raw_node_features = data.x.unsqueeze(0)
 
-        samples = model.sample_with_hdc_guidance(
+        samples = model.sample_with_soft_hdc_guidance(
             hdc_vectors=hdc_vectors,
             node_features=node_features,
             node_mask=node_mask,
-            original_node_features=original_node_features,
             hypernet=hypernet,
-            gamma=0.0,
-            num_candidates=2,
+            raw_node_features=raw_node_features,
+            gamma=0.5,
+            tau=0.5,
+            integration_mode="rate_matrix",
+            schedule="constant",
             sample_steps=2,
             show_progress=False,
         )
 
         assert len(samples) == bs
+
+    def test_sample_with_soft_hdc_guidance_gamma_zero(self, hypernet_for_hdc, model_for_hdc, real_zinc_data):
+        """Test that gamma=0 degenerates to standard sampling (no guidance)."""
+        from graph_hdc.utils.helpers import scatter_hd
+
+        hypernet = hypernet_for_hdc
+        model = model_for_hdc
+
+        data = real_zinc_data[1]  # CC
+        n = data.x.size(0)
+        bs = 1
+
+        data_for_hdc = data.clone()
+        data_for_hdc.batch = torch.zeros(n, dtype=torch.long)
+        with torch.no_grad():
+            data_for_hdc = hypernet.encode_properties(data_for_hdc)
+            order_zero = scatter_hd(src=data_for_hdc.node_hv, index=data_for_hdc.batch, op="bundle")
+            output = hypernet.forward(data_for_hdc)
+            order_n = output["graph_embedding"]
+            hdc_vectors = torch.cat([order_zero, order_n], dim=-1)
+
+        node_features = raw_features_to_onehot(data.x).unsqueeze(0)
+        node_mask = torch.ones(bs, n, dtype=torch.bool)
+        raw_node_features = data.x.unsqueeze(0)
+
+        samples = model.sample_with_soft_hdc_guidance(
+            hdc_vectors=hdc_vectors,
+            node_features=node_features,
+            node_mask=node_mask,
+            hypernet=hypernet,
+            raw_node_features=raw_node_features,
+            gamma=0.0,
+            sample_steps=2,
+            show_progress=False,
+        )
+
+        assert len(samples) == bs
+
+    def test_sample_with_soft_hdc_guidance_step_callback(self, hypernet_for_hdc, model_for_hdc, real_zinc_data):
+        """Test that step_callback is invoked at each step."""
+        from graph_hdc.utils.helpers import scatter_hd
+
+        hypernet = hypernet_for_hdc
+        model = model_for_hdc
+
+        data = real_zinc_data[1]  # CC
+        n = data.x.size(0)
+        bs = 1
+
+        data_for_hdc = data.clone()
+        data_for_hdc.batch = torch.zeros(n, dtype=torch.long)
+        with torch.no_grad():
+            data_for_hdc = hypernet.encode_properties(data_for_hdc)
+            order_zero = scatter_hd(src=data_for_hdc.node_hv, index=data_for_hdc.batch, op="bundle")
+            output = hypernet.forward(data_for_hdc)
+            order_n = output["graph_embedding"]
+            hdc_vectors = torch.cat([order_zero, order_n], dim=-1)
+
+        node_features = raw_features_to_onehot(data.x).unsqueeze(0)
+        node_mask = torch.ones(bs, n, dtype=torch.bool)
+        raw_node_features = data.x.unsqueeze(0)
+
+        callback_calls = []
+        def callback(step, t, X, E, mask, pred_E=None):
+            callback_calls.append(step)
+
+        sample_steps = 3
+        samples = model.sample_with_soft_hdc_guidance(
+            hdc_vectors=hdc_vectors,
+            node_features=node_features,
+            node_mask=node_mask,
+            hypernet=hypernet,
+            raw_node_features=raw_node_features,
+            gamma=0.5,
+            sample_steps=sample_steps,
+            show_progress=False,
+            step_callback=callback,
+        )
+
+        # Initial callback (step 0) + one per sampling step
+        assert len(callback_calls) == sample_steps + 1
+        assert callback_calls[0] == 0
+
+
+class TestSoftHDCHelpers:
+    """Tests for the differentiable soft HDC helper methods."""
+
+    def test_fft_bind_matches_torchhd(self):
+        """Test _fft_bind produces same result as torchhd.bind for HRR."""
+        import torchhd
+
+        D = 256
+        a = torch.randn(4, D)
+        b = torch.randn(4, D)
+
+        result_fft = FlowEdgeDecoder._fft_bind(a, b)
+
+        a_hrr = a.as_subclass(torchhd.HRRTensor)
+        b_hrr = b.as_subclass(torchhd.HRRTensor)
+        result_torchhd = torchhd.bind(a_hrr, b_hrr)
+
+        assert torch.allclose(result_fft, result_torchhd.float(), atol=1e-5)
+
+    def test_fft_bind_is_differentiable(self):
+        """Test _fft_bind supports autograd."""
+        a = torch.randn(4, 64, requires_grad=True)
+        b = torch.randn(4, 64)
+
+        result = FlowEdgeDecoder._fft_bind(a, b)
+        loss = result.sum()
+        loss.backward()
+
+        assert a.grad is not None
+        assert a.grad.shape == a.shape
+
+    def test_soft_hdc_encode_output_shape(self):
+        """Test _soft_hdc_encode returns correct shape."""
+        bs, n, D = 2, 5, 64
+        depth = 3
+
+        soft_A = torch.rand(bs, n, n)
+        node_hvs = torch.randn(bs, n, D)
+        node_mask = torch.ones(bs, n, dtype=torch.bool)
+        node_mask[1, 3:] = False
+
+        graph_emb = FlowEdgeDecoder._soft_hdc_encode(
+            soft_A, node_hvs, node_mask, depth, normalize=False,
+        )
+
+        assert graph_emb.shape == (bs, D)
+
+    def test_soft_hdc_encode_is_differentiable(self):
+        """Test _soft_hdc_encode supports autograd through soft_A."""
+        bs, n, D = 1, 4, 32
+
+        soft_A = torch.rand(bs, n, n, requires_grad=True)
+        node_hvs = torch.randn(bs, n, D)
+        node_mask = torch.ones(bs, n, dtype=torch.bool)
+
+        graph_emb = FlowEdgeDecoder._soft_hdc_encode(
+            soft_A, node_hvs, node_mask, depth=2, normalize=False,
+        )
+
+        loss = graph_emb.sum()
+        loss.backward()
+
+        assert soft_A.grad is not None
+        assert soft_A.grad.shape == soft_A.shape
+
+    def test_soft_hdc_encode_respects_mask(self):
+        """Test masked nodes don't contribute to graph embedding."""
+        bs, n, D = 1, 4, 32
+
+        soft_A = torch.zeros(bs, n, n)
+        node_hvs = torch.randn(bs, n, D)
+
+        mask_all = torch.ones(bs, n, dtype=torch.bool)
+        mask_half = torch.zeros(bs, n, dtype=torch.bool)
+        mask_half[0, :2] = True
+
+        emb_all = FlowEdgeDecoder._soft_hdc_encode(
+            soft_A, node_hvs, mask_all, depth=1, normalize=False,
+        )
+        emb_half = FlowEdgeDecoder._soft_hdc_encode(
+            soft_A, node_hvs, mask_half, depth=1, normalize=False,
+        )
+
+        # With zero adjacency, each node contributes independently
+        # so masking should change the result
+        assert not torch.allclose(emb_all, emb_half)
+
+
+# =============================================================================
+# Test Node HDC Codebook Embedding
+# =============================================================================
+
+class TestNodeHDCEmbedding:
+    """Tests for per-node HDC codebook embedding feature."""
+
+    @pytest.fixture
+    def mock_codebook(self):
+        """Create a mock codebook matching ZINC node feature bins [9,6,3,4,2]=1296 entries."""
+        n_entries = 9 * 6 * 3 * 4 * 2  # 1296
+        hv_dim = 64
+        return torch.randn(n_entries, hv_dim)
+
+    @pytest.fixture
+    def small_model_node_hdc(self, mock_edge_marginals, mock_node_counts, mock_codebook):
+        """Create a small FlowEdgeDecoder with per-node HDC embedding enabled."""
+        return FlowEdgeDecoder(
+            num_node_classes=NODE_FEATURE_DIM,
+            num_edge_classes=NUM_EDGE_CLASSES,
+            hdc_dim=64,
+            n_layers=2,
+            hidden_dim=32,
+            hidden_mlp_dim=64,
+            n_heads=2,
+            dropout=0.0,
+            noise_type="marginal",
+            edge_marginals=mock_edge_marginals,
+            node_counts=mock_node_counts,
+            max_nodes=15,
+            extra_features_type="rrwp",
+            rrwp_steps=5,
+            lr=1e-4,
+            weight_decay=0.0,
+            train_time_distortion="identity",
+            sample_steps=3,
+            eta=0.0,
+            omega=0.0,
+            sample_time_distortion="identity",
+            node_hdc_embed_dim=16,
+            nodes_codebook=mock_codebook,
+        )
+
+    def test_input_dims_include_embed(self, small_model_node_hdc):
+        """Input dims X should include node_hdc_embed_dim."""
+        model = small_model_node_hdc
+        # Base 24 + RRWP extra + 16 (node_hdc_embed_dim)
+        assert model.input_dims["X"] == NODE_FEATURE_DIM + model.extra_features.output_dims()["X"] + 16
+
+    def test_lookup_node_hdc_embeddings(self, small_model_node_hdc, mock_dense_batch):
+        """Lookup should produce correct output shape."""
+        model = small_model_node_hdc
+        X_t = mock_dense_batch["X"]  # (2, 8, 24)
+        result = model._lookup_node_hdc_embeddings(X_t)
+        assert result.shape == (2, 8, 16)
+
+    def test_forward_with_node_hdc(self, small_model_node_hdc, mock_dense_batch):
+        """Forward pass should work with node HDC embeddings enabled."""
+        model = small_model_node_hdc
+        X = mock_dense_batch["X"]
+        E = mock_dense_batch["E"]
+        node_mask = mock_dense_batch["node_mask"]
+        hdc_vectors = mock_dense_batch["hdc_vectors"]
+
+        noisy_data = {
+            "X_t": X,
+            "E_t": E,
+            "y_t": model.condition_mlp(hdc_vectors),
+            "t": torch.rand(X.shape[0], 1),
+            "node_mask": node_mask,
+            "hdc_raw": hdc_vectors,
+        }
+        extra_data = model._compute_extra_data(noisy_data)
+        pred = model.forward(noisy_data, extra_data, node_mask)
+        assert pred.X.shape == (X.shape[0], X.shape[1], NODE_FEATURE_DIM)
+        assert pred.E.shape == (X.shape[0], X.shape[1], X.shape[1], NUM_EDGE_CLASSES)
+
+    def test_training_step_with_node_hdc(self, small_model_node_hdc, mock_pyg_batch):
+        """Training step should work end-to-end with node HDC embeddings."""
+        model = small_model_node_hdc
+        result = model.training_step(mock_pyg_batch, 0)
+        # training_step returns a dict with "loss" key
+        if isinstance(result, dict):
+            loss = result["loss"]
+        else:
+            loss = result
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+
+    def test_disabled_by_default(self, small_model):
+        """Default model should have node_hdc_embed_dim=0."""
+        assert small_model.node_hdc_embed_dim == 0
+
+    def test_codebook_strides(self, small_model_node_hdc):
+        """Verify codebook strides match NODE_FEATURE_BINS."""
+        strides = small_model_node_hdc._codebook_strides
+        expected = torch.tensor([6*3*4*2, 3*4*2, 4*2, 2, 1], dtype=torch.long)
+        assert torch.equal(strides, expected)
+
+    def test_codebook_stored_as_plain_tensor(self, small_model_node_hdc):
+        """Buffer must be a plain torch.Tensor, not a VSATensor subclass."""
+        cb = small_model_node_hdc._nodes_codebook
+        assert type(cb) is torch.Tensor
+
+    def test_codebook_vsatensor_converted(self, mock_edge_marginals, mock_node_counts):
+        """Passing a torchhd VSATensor codebook should be converted to plain Tensor."""
+        import torchhd
+        n_entries = 9 * 6 * 3 * 4 * 2
+        hv_dim = 64
+        vsa_codebook = torchhd.random(n_entries, hv_dim)
+        assert type(vsa_codebook) is not torch.Tensor  # sanity: it's a VSATensor
+
+        model = FlowEdgeDecoder(
+            num_node_classes=NODE_FEATURE_DIM,
+            num_edge_classes=NUM_EDGE_CLASSES,
+            hdc_dim=64,
+            n_layers=2,
+            hidden_dim=32,
+            hidden_mlp_dim=64,
+            n_heads=2,
+            dropout=0.0,
+            noise_type="marginal",
+            edge_marginals=mock_edge_marginals,
+            node_counts=mock_node_counts,
+            max_nodes=15,
+            extra_features_type="rrwp",
+            rrwp_steps=5,
+            node_hdc_embed_dim=16,
+            nodes_codebook=vsa_codebook,
+        )
+        assert type(model._nodes_codebook) is torch.Tensor
+        assert torch.equal(model._nodes_codebook, vsa_codebook.as_subclass(torch.Tensor))
+
+    def test_codebook_buffer_supports_deepcopy(self, small_model_node_hdc):
+        """Model with codebook buffer must survive deepcopy (required by PL checkpointing)."""
+        model_copy = deepcopy(small_model_node_hdc)
+        assert torch.equal(model_copy._nodes_codebook, small_model_node_hdc._nodes_codebook)
+        assert model_copy.node_hdc_embed_dim == small_model_node_hdc.node_hdc_embed_dim
 
 
 if __name__ == "__main__":

@@ -2,13 +2,23 @@
 Dataset loaders for molecular datasets.
 """
 
+from graph_hdc.datasets.mixed_streaming import MixedStreamingDataLoader, StreamingSource
 from graph_hdc.datasets.qm9_smiles import QM9Smiles
 from graph_hdc.datasets.streaming_fragments import (
     FragmentLibrary,
     StreamingFragmentDataLoader,
     StreamingFragmentDataset,
 )
-from graph_hdc.datasets.utils import DatasetInfo, get_dataset_info, get_split, post_compute_encodings
+from graph_hdc.datasets.streaming_small_molecules import (
+    SmallMoleculePool,
+    SmallMoleculeStreamingDataset,
+)
+from graph_hdc.datasets.utils import (
+    DatasetInfo,
+    get_dataset_info,
+    get_split,
+    post_compute_encodings,
+)
 from graph_hdc.datasets.zinc_smiles import ZincSmiles
 
 __all__ = [
@@ -21,4 +31,8 @@ __all__ = [
     "FragmentLibrary",
     "StreamingFragmentDataset",
     "StreamingFragmentDataLoader",
+    "SmallMoleculePool",
+    "SmallMoleculeStreamingDataset",
+    "MixedStreamingDataLoader",
+    "StreamingSource",
 ]

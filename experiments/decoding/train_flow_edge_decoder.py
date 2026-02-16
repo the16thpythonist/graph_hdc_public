@@ -38,7 +38,7 @@ import torch
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from rdkit import Chem
 from torch import Tensor
@@ -46,12 +46,16 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from graph_hdc.datasets.utils import get_split
+from graph_hdc.hypernet.configs import RWConfig
+from graph_hdc.utils.rw_features import get_zinc_rw_boundaries
 from graph_hdc.hypernet.encoder import HyperNet
+from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
 from graph_hdc.models.flow_edge_decoder import (
     NODE_FEATURE_DIM,
     FlowEdgeDecoder,
     compute_edge_marginals,
     compute_node_counts,
+    get_node_feature_bins,
     preprocess_dataset,
     node_tuples_to_onehot,
 )
@@ -66,6 +70,7 @@ from graph_hdc.utils.experiment_helpers import (
     is_valid_mol,
     load_or_create_encoder,
     pyg_to_mol,
+    scrub_smiles,
 )
 from graph_hdc.utils.helpers import scatter_hd
 
@@ -96,6 +101,51 @@ HDC_DIM: int = 1024
 #     is empty. Higher values capture longer-range structural information.
 HDC_DEPTH: int = 6
 
+# :param USE_RW:
+#     Whether to augment HDC node features with random walk return probabilities.
+#     When True, each node's feature tuple is extended with binned RW return
+#     probabilities at each step in RW_K_VALUES, making the HDC conditioning
+#     vector more expressive about global graph topology. The FlowEdgeDecoder's
+#     24-dim one-hot node features are NOT affected — only the conditioning
+#     vector changes.
+USE_RW: bool = True
+
+# :param RW_K_VALUES:
+#     Random walk steps at which to compute return probabilities. Only used
+#     when USE_RW is True.
+RW_K_VALUES: tuple = (3, 6)
+
+# :param RW_NUM_BINS:
+#     Number of bins for discretising RW return probabilities. When
+#     USE_QUANTILE_BINS is True, must be one of {3, 4, 5, 6} (precomputed).
+#     Only used when USE_RW is True.
+RW_NUM_BINS: int = 4
+
+# :param USE_QUANTILE_BINS:
+#     Whether to use precomputed quantile-based bin boundaries for RW features
+#     instead of uniform bins on [0,1]. Quantile binning distributes atoms
+#     equally across bins for each k value, avoiding the near-degenerate
+#     distributions that uniform binning produces at higher k (e.g. k=10 puts
+#     81% of atoms into bin 0 with uniform bins). Requires RW_NUM_BINS in
+#     {3, 4, 5, 6}. Only used when USE_RW is True.
+USE_QUANTILE_BINS: bool = True
+
+# :param PRUNE_CODEBOOK:
+#     Whether to prune the HDC codebook to only feature tuples observed in the
+#     dataset. When True (default), unseen tuples cause encoding errors — set to
+#     False when training on generated molecules (e.g. streaming fragments) whose
+#     topology may produce novel feature combinations.
+PRUNE_CODEBOOK: bool = True
+
+# :param ENSEMBLE_CONFIGS:
+#     Optional list of (hv_dim, depth) tuples for a MultiHyperNet ensemble.
+#     Each tuple creates an independently-initialized HyperNet with its own
+#     random codebook, providing a different "perspective" on the same graph.
+#     Seeds are auto-generated as SEED+0, SEED+1, etc.
+#     When empty/None, a single HyperNet with HDC_DIM/HDC_DEPTH is used instead.
+#     Example: [(256, 6), (512, 4), (256, 8)] creates 3 HyperNets.
+ENSEMBLE_CONFIGS: Optional[List[Tuple[int, int]]] = None
+
 # -----------------------------------------------------------------------------
 # Model Architecture
 # -----------------------------------------------------------------------------
@@ -114,7 +164,7 @@ HIDDEN_MLP_DIM: int = 256
 
 # :param N_HEADS:
 #     Number of attention heads in transformer layers.
-N_HEADS: int = 8
+N_HEADS: int = 4
 
 # :param DROPOUT:
 #     Dropout probability in transformer layers.
@@ -127,6 +177,29 @@ CONDITION_DIM: int = 256
 # :param TIME_EMBED_DIM:
 #     Dimension for sinusoidal time embedding.
 TIME_EMBED_DIM: int = 256
+
+# :param NODE_HDC_EMBED_DIM:
+#     Dimension for per-node HDC codebook embedding. When >0, each node's
+#     codebook hypervector is projected to this dimension and concatenated
+#     with the one-hot node features. Set to 0 to disable.
+NODE_HDC_EMBED_DIM: int = 64
+
+# :param USE_CROSS_ATTN:
+#     Whether to use cross-attention HDC conditioning. When True, the raw HDC
+#     vector is decomposed into learnable tokens, nodes cross-attend to these
+#     tokens, and node-pair combinations produce edge-specific conditioning
+#     signals — supplementing the broadcast FiLM conditioning.
+USE_CROSS_ATTN: bool = False
+
+# :param CROSS_ATTN_TOKENS:
+#     Number of tokens to decompose the HDC vector into for cross-attention.
+#     Only used when USE_CROSS_ATTN is True.
+CROSS_ATTN_TOKENS: int = 8
+
+# :param CROSS_ATTN_HEADS:
+#     Number of attention heads for the cross-attention conditioner.
+#     Only used when USE_CROSS_ATTN is True.
+CROSS_ATTN_HEADS: int = 4
 
 # -----------------------------------------------------------------------------
 # Training Hyperparameters
@@ -167,7 +240,7 @@ ACCUMULATE_GRAD_BATCHES: int = 1
 
 # :param SAMPLE_STEPS:
 #     Number of denoising steps during sampling.
-SAMPLE_STEPS: int = 1000
+SAMPLE_STEPS: int = 100
 
 # :param ETA:
 #     Stochasticity parameter for sampling. 0.0 = deterministic.
@@ -225,9 +298,20 @@ PRECISION: str = "32"
 #     Number of molecules to reconstruct and visualize after training.
 NUM_RECONSTRUCTION_SAMPLES: int = 100
 
+# :param RECONSTRUCTION_BATCH_SIZE:
+#     Batch size for parallel edge generation during reconstruction evaluation.
+#     Higher values are faster but use more GPU memory.
+RECONSTRUCTION_BATCH_SIZE: int = 16
+
 # :param NUM_VALIDATION_VISUALIZATIONS:
 #     Number of molecules to visualize during each validation epoch.
-NUM_VALIDATION_VISUALIZATIONS: int = 5
+NUM_VALIDATION_VISUALIZATIONS: int = 10
+
+# :param NUM_VALIDATION_REPETITIONS:
+#     Number of parallel decodings per molecule during validation visualization.
+#     Each molecule is decoded this many times in a single batched call, and
+#     the result with the lowest HDC cosine distance is kept (best-of-N).
+NUM_VALIDATION_REPETITIONS: int = 8
 
 # -----------------------------------------------------------------------------
 # Resume Training
@@ -301,10 +385,31 @@ def experiment(e: Experiment) -> None:
         e.log("FlowEdgeDecoder Training (RESUMING from checkpoint)")
     else:
         e.log("FlowEdgeDecoder Training")
+    use_ensemble = bool(e.ENSEMBLE_CONFIGS)
+
+    # Build RW config from parameters
+    rw_bin_boundaries = None
+    if e.USE_RW and e.USE_QUANTILE_BINS:
+        rw_bin_boundaries = get_zinc_rw_boundaries(e.RW_NUM_BINS)
+
+    rw_config = RWConfig(
+        enabled=e.USE_RW,
+        k_values=e.RW_K_VALUES,
+        num_bins=e.RW_NUM_BINS,
+        bin_boundaries=rw_bin_boundaries,
+    )
+
     e.log("=" * 60)
     e.log(f"Dataset: {e.DATASET.upper()}")
     e.log(f"HDC config path: {e.HDC_CONFIG_PATH or '(creating new)'}")
-    e.log(f"HDC dim: {e.HDC_DIM}, depth: {e.HDC_DEPTH}")
+    if use_ensemble:
+        e.log(f"Ensemble: {len(e.ENSEMBLE_CONFIGS)} HyperNets, configs={e.ENSEMBLE_CONFIGS}")
+    else:
+        e.log(f"HDC dim: {e.HDC_DIM}, depth: {e.HDC_DEPTH}")
+    if rw_config.enabled:
+        bin_mode = "quantile" if rw_config.bin_boundaries else "uniform"
+        e.log(f"RW features: k={rw_config.k_values}, bins={rw_config.num_bins} ({bin_mode})")
+    e.log(f"Codebook pruning: {e.PRUNE_CODEBOOK}")
     e.log(f"Architecture: {e.N_LAYERS} layers, {e.HIDDEN_DIM} hidden dim")
     e.log(f"Training: {e.EPOCHS} epochs, batch size {e.BATCH_SIZE}")
     e.log(f"Debug mode: {e.__DEBUG__}")
@@ -318,6 +423,13 @@ def experiment(e: Experiment) -> None:
     e["config/hdc_config_path"] = e.HDC_CONFIG_PATH
     e["config/hdc_dim"] = e.HDC_DIM
     e["config/hdc_depth"] = e.HDC_DEPTH
+    e["config/ensemble_configs"] = e.ENSEMBLE_CONFIGS
+    e["config/use_ensemble"] = use_ensemble
+    e["config/use_rw"] = e.USE_RW
+    e["config/rw_k_values"] = list(e.RW_K_VALUES)
+    e["config/rw_num_bins"] = e.RW_NUM_BINS
+    e["config/rw_quantile_bins"] = e.USE_QUANTILE_BINS
+    e["config/prune_codebook"] = e.PRUNE_CODEBOOK
     e["config/n_layers"] = e.N_LAYERS
     e["config/hidden_dim"] = e.HIDDEN_DIM
     e["config/epochs"] = e.EPOCHS
@@ -337,7 +449,48 @@ def experiment(e: Experiment) -> None:
     e.log("\nLoading/Creating HyperNet encoder...")
 
     if resuming:
-        hypernet = HyperNet.load(str(resume_encoder_path), device=str(device))
+        # When resuming, load saved encoder (may be MultiHyperNet or HyperNet)
+        resume_encoder_file = Path(e.RESUME_ENCODER_PATH)
+        resume_state = torch.load(resume_encoder_file, map_location="cpu", weights_only=False)
+        if isinstance(resume_state, dict) and resume_state.get("type") == "MultiHyperNet":
+            hypernet = MultiHyperNet.load(str(resume_encoder_file), device=str(device))
+        else:
+            hypernet = HyperNet.load(str(resume_encoder_file), device=str(device))
+        hypernet.eval()
+    elif use_ensemble:
+        if rw_config.enabled:
+            from graph_hdc.hypernet.configs import create_config_with_rw
+            from graph_hdc.datasets.utils import scan_node_features_with_rw
+            e.log("Scanning dataset for observed RW-augmented node features (ensemble)...")
+            observed = scan_node_features_with_rw(e.DATASET.lower(), rw_config)
+            e.log(f"Found {len(observed)} unique node feature tuples with RW")
+            base_config = create_config_with_rw(
+                base_dataset=e.DATASET.lower(),
+                hv_dim=e.ENSEMBLE_CONFIGS[0][0],
+                rw_config=rw_config,
+                hypernet_depth=e.ENSEMBLE_CONFIGS[0][1],
+                prune_codebook=e.PRUNE_CODEBOOK,
+            )
+            hypernet = MultiHyperNet.from_dim_depth_pairs(
+                base_config=base_config,
+                dim_depth_pairs=e.ENSEMBLE_CONFIGS,
+                base_seed=e.SEED,
+                observed_node_features=observed if e.PRUNE_CODEBOOK else None,
+            )
+        else:
+            from graph_hdc.utils.experiment_helpers import create_hdc_config
+            base_config = create_hdc_config(
+                dataset=e.DATASET,
+                hv_dim=e.ENSEMBLE_CONFIGS[0][0],
+                depth=e.ENSEMBLE_CONFIGS[0][1],
+                device=str(device),
+            )
+            hypernet = MultiHyperNet.from_dim_depth_pairs(
+                base_config=base_config,
+                dim_depth_pairs=e.ENSEMBLE_CONFIGS,
+                base_seed=e.SEED,
+            )
+        hypernet = hypernet.to(device)
         hypernet.eval()
     else:
         hypernet = load_or_create_encoder(
@@ -346,12 +499,33 @@ def experiment(e: Experiment) -> None:
             hv_dim=e.HDC_DIM,
             depth=e.HDC_DEPTH,
             device=device,
+            rw_config=rw_config,
+            prune_codebook=e.PRUNE_CODEBOOK,
         )
 
-    actual_hdc_dim = hypernet.hv_dim
-    e.log(f"HyperNet initialized: hv_dim={actual_hdc_dim}, depth={hypernet.depth}")
-    e["config/actual_hdc_dim"] = actual_hdc_dim
-    e["config/actual_hdc_depth"] = hypernet.depth
+    # Compute dimensions
+    if isinstance(hypernet, MultiHyperNet):
+        primary_hdc_dim = hypernet.hv_dim  # primary's dim, used for order_0
+        ensemble_graph_dim = hypernet.ensemble_graph_dim  # sum of all dims for order_N
+        e.log(f"MultiHyperNet initialized: K={hypernet.num_hypernets}, "
+              f"primary_dim={primary_hdc_dim}, ensemble_graph_dim={ensemble_graph_dim}")
+        e.log(f"  Per-HyperNet: {[(hn.hv_dim, hn.depth, hn.seed) for hn in hypernet._hypernets]}")
+        e["config/actual_hdc_dim"] = primary_hdc_dim
+        e["config/ensemble_graph_dim"] = ensemble_graph_dim
+        actual_hdc_dim = primary_hdc_dim
+    else:
+        actual_hdc_dim = hypernet.hv_dim
+        ensemble_graph_dim = actual_hdc_dim  # single HyperNet: order_N dim == base dim
+        e.log(f"HyperNet initialized: hv_dim={actual_hdc_dim}, depth={hypernet.depth}")
+        e["config/actual_hdc_dim"] = actual_hdc_dim
+        e["config/actual_hdc_depth"] = hypernet.depth
+
+    # Compute node feature bins (includes RW bins when enabled)
+    feature_bins = get_node_feature_bins(hypernet.rw_config)
+    num_node_classes = sum(feature_bins)
+    e.log(f"Node feature bins: {feature_bins} ({num_node_classes}-dim)")
+    e["config/node_feature_bins"] = feature_bins
+    e["config/num_node_classes"] = num_node_classes
 
     # Save the encoder if we created a new one
     if not e.HDC_CONFIG_PATH and not resuming:
@@ -395,17 +569,23 @@ def experiment(e: Experiment) -> None:
 
     e.log("\nCreating FlowEdgeDecoder model...")
 
-    # HDC vector dimension is 2 * base_dim (concatenation of order_0 and order_N)
-    concat_hdc_dim = 2 * actual_hdc_dim
-    e.log(f"Concatenated HDC dim: {concat_hdc_dim} (order_0 + order_N)")
+    # HDC vector dimension = order_0 (primary dim) + order_N (ensemble dim)
+    # For single HyperNet: ensemble_graph_dim == actual_hdc_dim, so this is 2*dim
+    # For ensemble: ensemble_graph_dim == sum of all sub-HyperNet dims
+    concat_hdc_dim = actual_hdc_dim + ensemble_graph_dim
+    e.log(f"Concatenated HDC dim: {concat_hdc_dim} (order_0={actual_hdc_dim} + order_N={ensemble_graph_dim})")
     e.log(f"Condition dim after MLP: {e.CONDITION_DIM}")
     e.log(f"Time embedding dim: {e.TIME_EMBED_DIM}")
     e["config/concat_hdc_dim"] = concat_hdc_dim
     e["config/condition_dim"] = e.CONDITION_DIM
     e["config/time_embed_dim"] = e.TIME_EMBED_DIM
+    e["config/use_cross_attn"] = e.USE_CROSS_ATTN
+    e["config/cross_attn_tokens"] = e.CROSS_ATTN_TOKENS
+    e["config/cross_attn_heads"] = e.CROSS_ATTN_HEADS
+    e["config/node_hdc_embed_dim"] = e.NODE_HDC_EMBED_DIM
 
     model = FlowEdgeDecoder(
-        num_node_classes=NODE_FEATURE_DIM,  # 24-dim: atom + degree + charge + Hs + ring
+        num_node_classes=num_node_classes,  # dynamic: base 24 + optional RW bins
         num_edge_classes=5,
         hdc_dim=concat_hdc_dim,  # Input dim is 2x base (concatenated)
         condition_dim=e.CONDITION_DIM,  # Reduced dim after MLP
@@ -428,18 +608,12 @@ def experiment(e: Experiment) -> None:
         eta=e.ETA,
         omega=e.OMEGA,
         sample_time_distortion=e.SAMPLE_TIME_DISTORTION,
+        use_cross_attn=e.USE_CROSS_ATTN,
+        cross_attn_tokens=e.CROSS_ATTN_TOKENS,
+        cross_attn_heads=e.CROSS_ATTN_HEADS,
+        node_hdc_embed_dim=e.NODE_HDC_EMBED_DIM,
+        nodes_codebook=hypernet.nodes_codebook.clone() if e.NODE_HDC_EMBED_DIM > 0 else None,
     )
-
-    # Load weights if resuming
-    if resuming:
-        e.log(f"\nLoading model weights from checkpoint...")
-        checkpoint = torch.load(resume_ckpt_path, map_location=device)
-        state_dict = checkpoint.get("state_dict", checkpoint)
-        model.load_state_dict(state_dict, strict=True)
-        e.log("Model weights loaded successfully!")
-        if "epoch" in checkpoint:
-            e.log(f"  (Checkpoint was from epoch {checkpoint['epoch']})")
-            e["config/resume_from_epoch"] = checkpoint["epoch"]
 
     e.log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     e["model/num_parameters"] = sum(p.numel() for p in model.parameters())
@@ -471,13 +645,7 @@ def experiment(e: Experiment) -> None:
             save_on_train_epoch_end=True,
             enable_version_counter=False,
         ),
-        LearningRateMonitor(logging_interval="epoch"),
         LossTrackingCallback(experiment=e),
-        TrainingMetricsCallback(
-            experiment=e,
-            num_timestep_bins=10,
-            num_edge_classes=5,
-        ),
         ReconstructionVisualizationCallback(
             experiment=e,
             vis_samples=vis_samples,
@@ -486,6 +654,13 @@ def experiment(e: Experiment) -> None:
             omega=e.OMEGA,
             time_distortion=e.SAMPLE_TIME_DISTORTION,
             hypernet=hypernet,
+            num_repetitions=e.NUM_VALIDATION_REPETITIONS,
+            dataset=e.DATASET,
+        ),
+        TrainingMetricsCallback(
+            experiment=e,
+            num_timestep_bins=10,
+            num_edge_classes=5,
         ),
     ]
 
@@ -525,6 +700,8 @@ def experiment(e: Experiment) -> None:
     # =========================================================================
 
     e.log("\nStarting training...")
+    if resuming:
+        e.log(f"Resuming from checkpoint: {resume_ckpt_path}")
     e.log("(Press CTRL+C to gracefully stop)")
     e.log("-" * 40)
 
@@ -532,7 +709,10 @@ def experiment(e: Experiment) -> None:
     with GracefulInterruptHandler() as handler:
         handler.set_trainer(trainer)
         try:
-            trainer.fit(model, train_loader, valid_loader)
+            trainer.fit(
+                model, train_loader, valid_loader,
+                ckpt_path=str(resume_ckpt_path) if resuming else None,
+            )
         except KeyboardInterrupt:
             interrupted = True
             e.log("\nTraining interrupted by user (force quit)")
@@ -602,17 +782,17 @@ def experiment(e: Experiment) -> None:
         # Start timing
         sampling_start_time = time.time()
 
+        # ── Phase 1: Encode all molecules and decode nodes (sequential) ──
+        prepared = []  # list of dicts with encoding results
         for idx, sample_idx in enumerate(sample_indices):
-            e.log(f"\nSample {idx + 1}/{num_samples}:")
-
-            # Get original data
             original_data = raw_valid_ds[sample_idx]
-            original_smiles = original_data.smiles if hasattr(original_data, "smiles") else "N/A"
+            raw_smiles = original_data.smiles if hasattr(original_data, "smiles") else "N/A"
+            original_smiles = scrub_smiles(raw_smiles) if raw_smiles != "N/A" else "N/A"
+            if original_smiles is None:
+                original_smiles = raw_smiles
             original_mol = Chem.MolFromSmiles(original_smiles) if original_smiles != "N/A" else None
 
-            e.log(f"  Original SMILES: {original_smiles}")
-
-            # Encode with HyperNet - compute concatenated [order_0 | order_N]
+            # Encode with HyperNet
             data_for_encoding = original_data.clone()
             data_for_encoding = data_for_encoding.to(device)
             if not hasattr(data_for_encoding, "batch") or data_for_encoding.batch is None:
@@ -621,33 +801,23 @@ def experiment(e: Experiment) -> None:
                 )
 
             with torch.no_grad():
-                # Encode node properties
                 data_for_encoding = hypernet.encode_properties(data_for_encoding)
-
-                # Order-0: Bundle node hypervectors (no message passing)
                 order_zero = scatter_hd(
                     src=data_for_encoding.node_hv,
                     index=data_for_encoding.batch,
                     op="bundle"
                 )
-
-                # Order-N: Full graph embedding with message passing
                 encoder_output = hypernet.forward(data_for_encoding, normalize=True)
                 order_n = encoder_output["graph_embedding"]
-
-                # Concatenate [order_0 | order_N]
                 graph_embedding = torch.cat([order_zero, order_n], dim=-1).squeeze(0)
 
-            # Decode nodes from HDC embedding (using order_0 part)
             node_tuples, num_nodes = decode_nodes_from_hdc(
                 hypernet, graph_embedding.unsqueeze(0), actual_hdc_dim
             )
 
-            e.log(f"  Decoded {num_nodes} nodes: {node_tuples[:5]}{'...' if num_nodes > 5 else ''}")
-
-            # Handle case where no nodes were decoded
             if num_nodes == 0:
-                e.log("  WARNING: No nodes decoded from HDC embedding, skipping...")
+                e.log(f"\nSample {idx + 1}/{num_samples}: {original_smiles}")
+                e.log("  WARNING: No nodes decoded, skipping...")
                 results.append({
                     "sample_idx": sample_idx,
                     "original_smiles": original_smiles,
@@ -658,30 +828,77 @@ def experiment(e: Experiment) -> None:
                 })
                 continue
 
-            # Prepare inputs for FlowEdgeDecoder.sample()
-            node_features = node_tuples_to_onehot(node_tuples, device=device)
-            node_features = node_features.unsqueeze(0)  # (1, n, 24)
-            node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=device)
-            hdc_vectors = graph_embedding.unsqueeze(0)
+            node_features = node_tuples_to_onehot(node_tuples, device=device, feature_bins=feature_bins)
+            prepared.append({
+                "idx": idx,
+                "sample_idx": sample_idx,
+                "original_smiles": original_smiles,
+                "original_mol": original_mol,
+                "graph_embedding": graph_embedding,
+                "node_features": node_features,
+                "num_nodes": num_nodes,
+                "node_tuples": node_tuples,
+            })
 
-            # Generate edges
+        # ── Phase 2: Batch edge generation ──
+        recon_batch_size = e.RECONSTRUCTION_BATCH_SIZE
+        e.log(f"\nGenerating edges for {len(prepared)} molecules "
+              f"(batch_size={recon_batch_size}, {e.SAMPLE_STEPS} steps)...")
+
+        generated_results = [None] * len(prepared)
+        for batch_start in range(0, len(prepared), recon_batch_size):
+            batch_items = prepared[batch_start:batch_start + recon_batch_size]
+            bs = len(batch_items)
+            max_nodes = max(item["num_nodes"] for item in batch_items)
+            node_feature_dim = batch_items[0]["node_features"].size(-1)
+            hdc_dim = batch_items[0]["graph_embedding"].size(-1)
+
+            batch_hdc = torch.stack(
+                [item["graph_embedding"] for item in batch_items], dim=0
+            ).to(device)
+            batch_node_features = torch.zeros(
+                bs, max_nodes, node_feature_dim, device=device
+            )
+            batch_node_mask = torch.zeros(
+                bs, max_nodes, dtype=torch.bool, device=device
+            )
+            for i, item in enumerate(batch_items):
+                n = item["num_nodes"]
+                batch_node_features[i, :n] = item["node_features"].to(device)
+                batch_node_mask[i, :n] = True
+
             with torch.no_grad():
-                generated_samples = recon_model.sample(
-                    hdc_vectors=hdc_vectors,
-                    node_features=node_features,
-                    node_mask=node_mask,
+                batch_samples = recon_model.sample(
+                    hdc_vectors=batch_hdc,
+                    node_features=batch_node_features,
+                    node_mask=batch_node_mask,
                     sample_steps=e.SAMPLE_STEPS,
                     show_progress=False,
+                    device=device,
                 )
 
-            # Convert to RDKit molecule
-            generated_data = generated_samples[0]
+            for i, item in enumerate(batch_items):
+                generated_results[batch_start + i] = batch_samples[i]
+
+            e.log(f"  Batch {batch_start // recon_batch_size + 1}/"
+                  f"{(len(prepared) + recon_batch_size - 1) // recon_batch_size}: "
+                  f"generated {bs} molecules")
+
+        # ── Phase 3: Evaluate results ──
+        for i, item in enumerate(prepared):
+            idx = item["idx"]
+            sample_idx = item["sample_idx"]
+            original_smiles = item["original_smiles"]
+            original_mol = item["original_mol"]
+
+            generated_data = generated_results[i]
             generated_mol = pyg_to_mol(generated_data)
             generated_smiles = get_canonical_smiles(generated_mol)
 
-            e.log(f"  Generated SMILES: {generated_smiles or 'N/A'}")
+            e.log(f"\nSample {idx + 1}/{num_samples}:")
+            e.log(f"  Original:  {original_smiles}")
+            e.log(f"  Generated: {generated_smiles or 'N/A'}")
 
-            # Check validity and match
             is_valid = is_valid_mol(generated_mol)
             original_canonical = None
             if original_mol is not None:
@@ -706,7 +923,6 @@ def experiment(e: Experiment) -> None:
             status = "MATCH" if is_match else ("Valid" if is_valid else "Invalid")
             e.log(f"  Status: {status}")
 
-            # Create visualization
             if original_mol is not None:
                 plot_path = recon_dir / f"reconstruction_{idx + 1:03d}.png"
                 create_reconstruction_plot(
@@ -720,7 +936,6 @@ def experiment(e: Experiment) -> None:
                     save_path=plot_path,
                 )
 
-            # Store result
             results.append({
                 "sample_idx": sample_idx,
                 "original_smiles": original_smiles,

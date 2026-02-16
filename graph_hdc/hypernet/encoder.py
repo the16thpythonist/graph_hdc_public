@@ -31,6 +31,7 @@ from graph_hdc.hypernet.configs import (
     FallbackDecoderSettings,
     Features,
     IndexRange,
+    RWConfig,
 )
 from graph_hdc.hypernet.correction_utils import (
     CorrectionResult,
@@ -117,7 +118,12 @@ class HyperNet(pl.LightningModule):
 
     __allowed_vsa_models__: ClassVar[set[VSAModel]] = {VSAModel.MAP, VSAModel.FHRR, VSAModel.HRR}
 
-    def __init__(self, config: DSHDCConfig, depth: int | None = None):
+    def __init__(
+        self,
+        config: DSHDCConfig,
+        depth: int | None = None,
+        observed_node_features: set[tuple] | None = None,
+    ):
         """
         Initialize HyperNet from configuration.
 
@@ -127,6 +133,13 @@ class HyperNet(pl.LightningModule):
             Dataset and encoding configuration
         depth : int, optional
             Override message passing depth from config
+        observed_node_features : set[tuple], optional
+            Explicit set of observed node feature tuples for codebook
+            pruning. When provided, used instead of
+            ``get_dataset_info(base_dataset).node_features``. This is
+            needed when extra features (e.g. RW bins) have been appended
+            to the base node features, since the cached dataset info
+            only knows about the base features.
         """
         super().__init__()
 
@@ -138,6 +151,8 @@ class HyperNet(pl.LightningModule):
         self.normalize = config.normalize
         self.base_dataset: BaseDataset = config.base_dataset
         self._dtype = torch.float64 if config.dtype == "float64" else torch.float32
+        self.rw_config: RWConfig = config.rw_config
+        self.prune_codebook: bool = config.prune_codebook
 
         # Set seed for reproducible codebook generation
         if self.seed is not None:
@@ -156,7 +171,7 @@ class HyperNet(pl.LightningModule):
         )
 
         # Build derived codebooks eagerly
-        self._build_codebooks(device)
+        self._build_codebooks(device, observed_node_features=observed_node_features)
 
         # Decoding parameters (dataset-dependent)
         self._decoding_edge_limit = MAX_ALLOWED_DECODING_EDGES_QM9 if self.base_dataset == "qm9" else MAX_ALLOWED_DECODING_EDGES_ZINC
@@ -205,7 +220,11 @@ class HyperNet(pl.LightningModule):
             enc.indexer = self.nodes_indexer
 
 
-    def _build_codebooks(self, device: torch.device) -> None:
+    def _build_codebooks(
+        self,
+        device: torch.device,
+        observed_node_features: set[tuple] | None = None,
+    ) -> None:
         """Build all derived codebooks from encoder maps."""
         # Nodes codebook: Cartesian bind of all node feature codebooks
         node_codebooks = [enc.codebook for enc, _ in self.node_encoder_map.values()]
@@ -219,8 +238,12 @@ class HyperNet(pl.LightningModule):
             sizes = [e.num_categories for e, _ in self.node_encoder_map.values()]
             self.nodes_indexer = TupleIndexer(sizes)
 
-        # Limit codebook based on observed node types
-        self.limit_nodes_codebook(node_features=get_dataset_info(self.base_dataset).node_features)
+        # Limit codebook based on observed node types (unless pruning is disabled)
+        if self.prune_codebook:
+            if observed_node_features is not None:
+                self.limit_nodes_codebook(node_features=observed_node_features)
+            else:
+                self.limit_nodes_codebook(node_features=get_dataset_info(self.base_dataset).node_features)
 
 
         # Edge feature codebook (if edge features exist)
@@ -234,11 +257,35 @@ class HyperNet(pl.LightningModule):
             self.edge_feature_codebook = None
             self.edge_feature_indexer = None
 
-        # Edges codebook: Cartesian bind of (node, node) pairs
-        self.edges_codebook = cartesian_bind_tensor(
-            [self.nodes_codebook, self.nodes_codebook]
-        ).to(device)
-        self.edges_indexer = TupleIndexer([self.nodes_indexer.size(), self.nodes_indexer.size()])
+        # Edges codebook: deferred to first access (can be very large)
+        self._edges_codebook = None
+        self._edges_indexer = None
+
+    @property
+    def edges_codebook(self):
+        """Lazily build edges codebook on first access (can be very large)."""
+        if self._edges_codebook is None:
+            self._edges_codebook = cartesian_bind_tensor(
+                [self.nodes_codebook, self.nodes_codebook]
+            ).to(self.nodes_codebook.device)
+        return self._edges_codebook
+
+    @edges_codebook.setter
+    def edges_codebook(self, value):
+        self._edges_codebook = value
+
+    @property
+    def edges_indexer(self):
+        """Lazily build edges indexer on first access."""
+        if self._edges_indexer is None:
+            self._edges_indexer = TupleIndexer(
+                [self.nodes_indexer.size(), self.nodes_indexer.size()]
+            )
+        return self._edges_indexer
+
+    @edges_indexer.setter
+    def edges_indexer(self, value):
+        self._edges_indexer = value
 
     def to(self, device, dtype=None):
         """Move HyperNet to device."""
@@ -250,7 +297,8 @@ class HyperNet(pl.LightningModule):
 
         # Move codebooks
         self.nodes_codebook = self.nodes_codebook.to(device=device, dtype=self._dtype)
-        self.edges_codebook = self.edges_codebook.to(device=device, dtype=self._dtype)
+        if self._edges_codebook is not None:
+            self._edges_codebook = self._edges_codebook.to(device=device, dtype=self._dtype)
         if self.edge_feature_codebook is not None:
             self.edge_feature_codebook = self.edge_feature_codebook.to(device=device, dtype=self._dtype)
 
@@ -359,11 +407,13 @@ class HyperNet(pl.LightningModule):
 
         node_hv_stack = node_hv_stack.transpose(0, 1)
         node_hv = torchhd.multibundle(node_hv_stack)
+        node_terms = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
         graph_embedding = scatter_hd(src=node_hv, index=data.batch, op="bundle")
         edge_terms = scatter_hd(src=edge_terms, index=data.batch, op="bundle")
 
         return {
             "graph_embedding": graph_embedding,
+            "node_terms": node_terms,
             "edge_terms": edge_terms,
         }
 
@@ -1493,6 +1543,59 @@ class HyperNet(pl.LightningModule):
             correction_level=CorrectionLevel.FAIL,
         )
 
+    # ─────────────────────────── Distance ───────────────────────────
+
+    def calculate_order_n_distance(self, order_n_a: Tensor, order_n_b: Tensor) -> Tensor:
+        """
+        Core distance metric: cosine distance between order-N embeddings.
+
+        This is the low-level method that operates on **already-extracted**
+        order-N (graph embedding) vectors.  Use this when you have the
+        order-N portion in hand (e.g. from ``forward()["graph_embedding"]``).
+
+        For ``MultiHyperNet`` the override splits the concatenated
+        embedding into per-sub-HyperNet chunks and averages per-chunk
+        distances.  A single ``HyperNet`` computes one cosine distance
+        over the full vector.
+
+        Parameters
+        ----------
+        order_n_a, order_n_b : Tensor
+            Shape ``[batch, order_n_dim]``.  For a single HyperNet
+            ``order_n_dim == hv_dim``; for a ``MultiHyperNet`` it equals
+            ``ensemble_graph_dim`` (sum of all sub-HyperNet hv_dims).
+
+        Returns
+        -------
+        Tensor
+            Cosine distance ``1 - cos_sim``, shape ``[batch]``.
+        """
+        cos_sim = torch.nn.functional.cosine_similarity(
+            order_n_a.float(), order_n_b.float(), dim=-1,
+        )
+        return 1.0 - cos_sim
+
+    def calculate_distance(self, vec_a: Tensor, vec_b: Tensor) -> Tensor:
+        """
+        Convenience wrapper: cosine distance from full ``[order_0 | order_N]`` vectors.
+
+        Strips the order-0 prefix (first ``hv_dim`` dims) and delegates to
+        :meth:`calculate_order_n_distance`.
+
+        Parameters
+        ----------
+        vec_a, vec_b : Tensor
+            Shape ``[batch, 2 * hv_dim]`` (concatenated order-0 and order-N).
+
+        Returns
+        -------
+        Tensor
+            Cosine distance ``1 - cos_sim``, shape ``[batch]``.
+        """
+        return self.calculate_order_n_distance(
+            vec_a[:, self.hv_dim :], vec_b[:, self.hv_dim :],
+        )
+
     # ─────────────────────────── Save/Load ───────────────────────────
 
     def save(self, path: str | Path) -> None:
@@ -1514,6 +1617,12 @@ class HyperNet(pl.LightningModule):
                 "normalize": self.normalize,
                 "base_dataset": self.base_dataset,
                 "dtype": "float64" if self._dtype == torch.float64 else "float32",
+                "rw_config": {
+                    "enabled": self.rw_config.enabled,
+                    "k_values": self.rw_config.k_values,
+                    "num_bins": self.rw_config.num_bins,
+                },
+                "prune_codebook": self.prune_codebook,
             },
             "encoder_maps": {
                 "node": self._serialize_encoder_map(self.node_encoder_map),
@@ -1522,12 +1631,12 @@ class HyperNet(pl.LightningModule):
             },
             "codebooks": {
                 "nodes": self.nodes_codebook.cpu(),
-                "edges": self.edges_codebook.cpu(),
+                "edges": self._edges_codebook.cpu() if self._edges_codebook is not None else None,
                 "edge_features": self.edge_feature_codebook.cpu() if self.edge_feature_codebook is not None else None,
             },
             "indexers": {
                 "nodes": self.nodes_indexer.__dict__.copy(),
-                "edges": self.edges_indexer.__dict__.copy(),
+                "edges": self._edges_indexer.__dict__.copy() if self._edges_indexer is not None else None,
                 "edge_features": self.edge_feature_indexer.__dict__.copy() if self.edge_feature_indexer else None,
             },
         }
@@ -1586,6 +1695,9 @@ class HyperNet(pl.LightningModule):
         instance.normalize = cfg["normalize"]
         instance.base_dataset = cfg["base_dataset"]
         instance._dtype = torch.float64 if cfg.get("dtype", "float64") == "float64" else torch.float32
+        rw_dict = cfg.get("rw_config")
+        instance.rw_config = RWConfig(**rw_dict) if rw_dict else RWConfig()
+        instance.prune_codebook = cfg.get("prune_codebook", True)
         instance._decoding_edge_limit = 50 if instance.base_dataset == "qm9" else 122
         instance._max_step_delta = None
 
@@ -1596,7 +1708,10 @@ class HyperNet(pl.LightningModule):
 
         # Restore codebooks
         instance.nodes_codebook = state["codebooks"]["nodes"].to(device)
-        instance.edges_codebook = state["codebooks"]["edges"].to(device)
+        if state["codebooks"]["edges"] is not None:
+            instance._edges_codebook = state["codebooks"]["edges"].to(device)
+        else:
+            instance._edges_codebook = None
         instance.edge_feature_codebook = (
             state["codebooks"]["edge_features"].to(device)
             if state["codebooks"]["edge_features"] is not None
@@ -1607,8 +1722,11 @@ class HyperNet(pl.LightningModule):
         instance.nodes_indexer = TupleIndexer.__new__(TupleIndexer)
         instance.nodes_indexer.__dict__.update(state["indexers"]["nodes"])
 
-        instance.edges_indexer = TupleIndexer.__new__(TupleIndexer)
-        instance.edges_indexer.__dict__.update(state["indexers"]["edges"])
+        if state["indexers"]["edges"] is not None:
+            instance._edges_indexer = TupleIndexer.__new__(TupleIndexer)
+            instance._edges_indexer.__dict__.update(state["indexers"]["edges"])
+        else:
+            instance._edges_indexer = None
 
         if state["indexers"]["edge_features"] is not None:
             instance.edge_feature_indexer = TupleIndexer.__new__(TupleIndexer)

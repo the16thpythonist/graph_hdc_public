@@ -41,6 +41,21 @@ class FeatureConfig:
 
 
 @dataclass
+class RWConfig:
+    """Configuration for random walk return probability features.
+
+    When *bin_boundaries* is set, quantile-based binning is used instead
+    of uniform bins on ``[0, 1]``.  Use
+    :data:`graph_hdc.utils.rw_features.ZINC_RW_QUANTILE_BOUNDARIES` for
+    a ready-made preset derived from 5 000 ZINC training molecules.
+    """
+    enabled: bool = False
+    k_values: tuple[int, ...] = (3, 6)
+    num_bins: int = 10
+    bin_boundaries: dict[int, list[float]] | None = None
+
+
+@dataclass
 class DSHDCConfig:
     """Configuration for hyperdimensional encoding of a dataset."""
     name: str
@@ -58,6 +73,8 @@ class DSHDCConfig:
     base_dataset: BaseDataset = "qm9"
     hypernet_depth: int = 3
     normalize: bool = False
+    rw_config: RWConfig = field(default_factory=RWConfig)
+    prune_codebook: bool = True
 
 
 @dataclass
@@ -232,3 +249,86 @@ def get_config(dataset_name: str) -> DSHDCConfig:
         return SupportedDataset(dataset_name).default_cfg
     except ValueError:
         raise ValueError(f"Unknown dataset: {dataset_name}. Supported: {[e.value for e in SupportedDataset]}")
+
+
+# ── Dataset-specific base bins ──────────────────────────────────────
+
+_BASE_BINS: dict[BaseDataset, list[int]] = {
+    "qm9": [4, 5, 3, 5],
+    "zinc": [9, 6, 3, 4, 2],
+}
+
+_BASE_DEPTH: dict[BaseDataset, int] = {
+    "qm9": 3,
+    "zinc": 4,
+}
+
+
+def create_config_with_rw(
+    base_dataset: BaseDataset,
+    hv_dim: int,
+    rw_config: RWConfig | None = None,
+    **overrides,
+) -> DSHDCConfig:
+    """
+    Create a DSHDCConfig with optional RW feature augmentation.
+
+    This factory decouples the HDC representation from the dataset choice.
+    When ``rw_config.enabled`` is True, the node feature bins and index range
+    are extended with ``[num_bins] * len(k_values)`` additional dimensions.
+
+    Parameters
+    ----------
+    base_dataset : {"qm9", "zinc"}
+        Which dataset's base feature scheme to use.
+    hv_dim : int
+        Hypervector dimensionality.
+    rw_config : RWConfig, optional
+        Random walk configuration. Defaults to ``RWConfig()`` (disabled).
+    **overrides
+        Additional keyword arguments forwarded to ``DSHDCConfig``.
+
+    Returns
+    -------
+    DSHDCConfig
+    """
+    if rw_config is None:
+        rw_config = RWConfig()
+
+    bins = list(_BASE_BINS[base_dataset])
+    base_dim = len(bins)
+
+    if rw_config.enabled:
+        bins.extend([rw_config.num_bins] * len(rw_config.k_values))
+
+    total_dim = len(bins)
+
+    rw_suffix = "RW" if rw_config.enabled else ""
+    name = f"{base_dataset.upper()}{rw_suffix}HRR{hv_dim}"
+
+    cfg_kwargs = dict(
+        name=name,
+        base_dataset=base_dataset,
+        vsa=VSAModel.HRR,
+        hv_dim=hv_dim,
+        seed=42,
+        device=pick_device_str(),
+        node_feature_configs=OrderedDict([
+            (
+                Features.NODE_FEATURES,
+                FeatureConfig(
+                    count=math.prod(bins),
+                    encoder_cls=CombinatoricIntegerEncoder,
+                    index_range=IndexRange((0, total_dim)),
+                    bins=bins,
+                ),
+            ),
+        ]),
+        normalize=True,
+        hypernet_depth=_BASE_DEPTH[base_dataset],
+        dtype="float64",
+        hv_count=2,
+        rw_config=rw_config,
+    )
+    cfg_kwargs.update(overrides)
+    return DSHDCConfig(**cfg_kwargs)

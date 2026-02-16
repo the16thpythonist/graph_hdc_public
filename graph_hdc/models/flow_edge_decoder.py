@@ -145,29 +145,58 @@ NUM_EDGE_CLASSES = 5
 # =============================================================================
 
 
+def get_node_feature_bins(rw_config=None) -> List[int]:
+    """
+    Get the full list of feature bin sizes, optionally including RW bins.
+
+    Args:
+        rw_config: Optional RWConfig. When provided and enabled, appends
+                   ``[num_bins] * len(k_values)`` to the base ZINC bins.
+
+    Returns:
+        List of class counts per feature position.
+        Base: [9, 6, 3, 4, 2] (24-dim).
+        With RW(k=(3,6), bins=10): [9, 6, 3, 4, 2, 10, 10] (44-dim).
+    """
+    bins = list(NODE_FEATURE_BINS)
+    if rw_config is not None and getattr(rw_config, "enabled", False):
+        bins.extend([rw_config.num_bins] * len(rw_config.k_values))
+    return bins
+
+
 def node_tuple_to_onehot(
     node_tuple: Tuple[int, ...],
     device: Optional[torch.device] = None,
+    feature_bins: Optional[List[int]] = None,
 ) -> Tensor:
     """
     Convert a single node tuple to concatenated one-hot encoding.
 
+    Encodes every position in the tuple according to ``feature_bins``.
+    When ``feature_bins`` is ``None``, falls back to the base 5-feature
+    ``NODE_FEATURE_BINS`` for backward compatibility.
+
     Args:
-        node_tuple: Tuple of (atom_idx, degree, charge, num_hs, is_ring)
-        device: Target device for the tensor
+        node_tuple: Tuple of integer feature indices, e.g.
+                    (atom_idx, degree, charge, num_hs, is_ring) for base, or
+                    (atom_idx, degree, charge, num_hs, is_ring, rw_k3, rw_k6)
+                    when RW features are present.
+        device: Target device for the tensor.
+        feature_bins: List of class counts per position. Length must match the
+                      tuple length. Use ``get_node_feature_bins(rw_config)``
+                      to obtain this from a HyperNet's RW configuration.
 
     Returns:
-        One-hot tensor of shape (NODE_FEATURE_DIM,) = (24,)
+        One-hot tensor of shape (sum(feature_bins),)
     """
-    atom_idx, degree, charge, num_hs, is_ring = node_tuple
+    if feature_bins is None:
+        feature_bins = NODE_FEATURE_BINS
 
-    onehot = torch.cat([
-        F.one_hot(torch.tensor(atom_idx), num_classes=NUM_ATOM_CLASSES),
-        F.one_hot(torch.tensor(degree), num_classes=NUM_DEGREE_CLASSES),
-        F.one_hot(torch.tensor(charge), num_classes=NUM_CHARGE_CLASSES),
-        F.one_hot(torch.tensor(num_hs), num_classes=NUM_HS_CLASSES),
-        F.one_hot(torch.tensor(is_ring), num_classes=NUM_RING_CLASSES),
-    ], dim=-1).float()
+    parts = []
+    for i, num_classes in enumerate(feature_bins):
+        parts.append(F.one_hot(torch.tensor(node_tuple[i]), num_classes=num_classes))
+
+    onehot = torch.cat(parts, dim=-1).float()
 
     if device is not None:
         onehot = onehot.to(device)
@@ -177,45 +206,60 @@ def node_tuple_to_onehot(
 def node_tuples_to_onehot(
     node_tuples: List[Tuple[int, ...]],
     device: Optional[torch.device] = None,
+    feature_bins: Optional[List[int]] = None,
 ) -> Tensor:
     """
     Convert list of node tuples to concatenated one-hot tensor.
 
     Args:
-        node_tuples: List of tuples, each (atom_idx, degree, charge, num_hs, is_ring)
-        device: Target device for the tensor
+        node_tuples: List of integer-index tuples (one per node).
+        device: Target device for the tensor.
+        feature_bins: List of class counts per position (see
+                      ``node_tuple_to_onehot``). Defaults to
+                      ``NODE_FEATURE_BINS``.
 
     Returns:
-        One-hot tensor of shape (n, NODE_FEATURE_DIM) = (n, 24)
+        One-hot tensor of shape (n, sum(feature_bins))
     """
+    if feature_bins is None:
+        feature_bins = NODE_FEATURE_BINS
+
+    total_dim = sum(feature_bins)
     if not node_tuples:
-        t = torch.zeros(0, NODE_FEATURE_DIM)
+        t = torch.zeros(0, total_dim)
         return t.to(device) if device is not None else t
 
-    onehots = [node_tuple_to_onehot(t, device) for t in node_tuples]
+    onehots = [node_tuple_to_onehot(t, device, feature_bins) for t in node_tuples]
     return torch.stack(onehots, dim=0)
 
 
 def raw_features_to_onehot(
     raw_features: Tensor,
     device: Optional[torch.device] = None,
+    feature_bins: Optional[List[int]] = None,
 ) -> Tensor:
     """
     Convert raw node features tensor to concatenated one-hot encoding.
 
     Args:
-        raw_features: Tensor of shape (n, 5) with integer indices for each feature
-                      Columns: [atom_type, degree, charge, num_hs, is_ring]
-        device: Target device for the tensor
+        raw_features: Tensor of shape (n, num_features) with integer indices.
+                      Columns correspond to ``feature_bins`` positions.
+        device: Target device for the tensor.
+        feature_bins: List of class counts per column. Defaults to
+                      ``NODE_FEATURE_BINS``.
 
     Returns:
-        One-hot tensor of shape (n, NODE_FEATURE_DIM) = (n, 24)
+        One-hot tensor of shape (n, sum(feature_bins))
     """
+    if feature_bins is None:
+        feature_bins = NODE_FEATURE_BINS
+
+    total_dim = sum(feature_bins)
     n_atoms = raw_features.size(0)
-    x_onehot = torch.zeros(n_atoms, NODE_FEATURE_DIM, dtype=torch.float32)
+    x_onehot = torch.zeros(n_atoms, total_dim, dtype=torch.float32)
 
     offset = 0
-    for feat_idx, num_classes in enumerate(NODE_FEATURE_BINS):
+    for feat_idx, num_classes in enumerate(feature_bins):
         feat_vals = raw_features[:, feat_idx].long()
         onehot = F.one_hot(feat_vals, num_classes=num_classes).float()
         x_onehot[:, offset:offset + num_classes] = onehot
@@ -224,6 +268,34 @@ def raw_features_to_onehot(
     if device is not None:
         x_onehot = x_onehot.to(device)
     return x_onehot
+
+
+def onehot_to_raw_features(
+    x_onehot: Tensor,
+    feature_bins: Optional[List[int]] = None,
+) -> Tensor:
+    """
+    Reverse concatenated one-hot encoding back to raw integer features.
+
+    Args:
+        x_onehot: One-hot tensor of shape (n, sum(feature_bins))
+        feature_bins: List of class counts per position. Defaults to
+                      ``NODE_FEATURE_BINS`` ([9, 6, 3, 4, 2] = 24-dim).
+
+    Returns:
+        Tensor of shape (n, len(feature_bins)) with integer indices.
+    """
+    if feature_bins is None:
+        feature_bins = NODE_FEATURE_BINS
+
+    parts = []
+    offset = 0
+    for num_classes in feature_bins:
+        block = x_onehot[:, offset:offset + num_classes]
+        parts.append(block.argmax(dim=-1))
+        offset += num_classes
+
+    return torch.stack(parts, dim=-1).float()
 
 
 # =============================================================================
@@ -268,6 +340,14 @@ class FlowEdgeDecoderConfig:
     eta: float = 0.0
     omega: float = 0.0
     sample_time_distortion: str = "polydec"
+
+    # Cross-attention conditioning
+    use_cross_attn: bool = False
+    cross_attn_tokens: int = 8
+    cross_attn_heads: int = 4
+
+    # Per-node HDC codebook embedding
+    node_hdc_embed_dim: int = 0  # 0=disabled, >0=project codebook HVs to this dim
 
 
 # Default config for ZINC dataset (24-dim node features)
@@ -350,6 +430,108 @@ class DistributionNodes:
         self.histogram = self.histogram.to(device)
         self.n_nodes = self.n_nodes.to(device)
         return self
+
+
+# =============================================================================
+# HDC Cross-Attention Conditioner
+# =============================================================================
+
+
+class HDCCrossAttentionConditioner(nn.Module):
+    """
+    Cross-attention conditioning module for HDC vectors.
+
+    Decomposes a raw HDC vector into K learnable tokens, lets node features
+    cross-attend to these tokens, then combines node-pair representations
+    to produce edge-specific conditioning signals.
+
+    This replaces the broadcast FiLM-only approach with edge-specific
+    conditioning: different edges receive different conditioning based on
+    which node pair they connect and what the HDC vector encodes.
+
+    Args:
+        hdc_dim: Raw HDC vector dimension (e.g. 512)
+        node_input_dim: Node feature input dimension (e.g. 34 = 24 node + 10 RRWP)
+        edge_cond_dim: Output dimension per edge pair
+        num_tokens: Number of HDC tokens to decompose into
+        n_heads: Number of attention heads for cross-attention
+    """
+
+    def __init__(
+        self,
+        hdc_dim: int,
+        node_input_dim: int,
+        edge_cond_dim: int,
+        num_tokens: int = 8,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        self.num_tokens = num_tokens
+        # Use a projected dimension that is divisible by n_heads
+        self.attn_dim = num_tokens * n_heads
+
+        # Project node features to attention dimension
+        self.q_proj = nn.Linear(node_input_dim, self.attn_dim)
+
+        # HDC → K tokens of dimension attn_dim
+        self.hdc_to_tokens = nn.Sequential(
+            nn.Linear(hdc_dim, num_tokens * self.attn_dim),
+            nn.ReLU(),
+            nn.Linear(num_tokens * self.attn_dim, num_tokens * self.attn_dim),
+        )
+
+        # Node cross-attention: Q=projected nodes, K/V=HDC tokens
+        self.node_cross_attn = nn.MultiheadAttention(
+            embed_dim=self.attn_dim, num_heads=n_heads, batch_first=True
+        )
+        self.node_norm = nn.LayerNorm(self.attn_dim)
+
+        # Edge projection: concat(node_i, node_j) → edge_cond_dim
+        self.edge_proj = nn.Sequential(
+            nn.Linear(2 * self.attn_dim, edge_cond_dim),
+            nn.ReLU(),
+            nn.Linear(edge_cond_dim, edge_cond_dim),
+        )
+
+    def forward(
+        self,
+        X: Tensor,
+        hdc_raw: Tensor,
+        node_mask: Tensor,
+    ) -> Tensor:
+        """
+        Compute edge-specific conditioning from HDC vector and node features.
+
+        Args:
+            X: Node features (bs, n, node_input_dim)
+            hdc_raw: Raw HDC vector (bs, hdc_dim)
+            node_mask: Valid node mask (bs, n)
+
+        Returns:
+            Edge conditioning tensor (bs, n, n, edge_cond_dim)
+        """
+        bs, n, _ = X.shape
+
+        # 1. Generate HDC tokens
+        tokens = self.hdc_to_tokens(hdc_raw)
+        tokens = tokens.view(bs, self.num_tokens, self.attn_dim)
+
+        # 2. Project node features and cross-attend to HDC tokens
+        Q = self.q_proj(X)  # (bs, n, attn_dim)
+        node_cond, _ = self.node_cross_attn(Q, tokens, tokens)
+        node_cond = self.node_norm(node_cond)  # (bs, n, attn_dim)
+        node_cond = node_cond * node_mask.unsqueeze(-1).float()
+
+        # 3. Edge conditioning from node pairs
+        node_i = node_cond.unsqueeze(2).expand(-1, -1, n, -1)  # (bs, n, n, attn_dim)
+        node_j = node_cond.unsqueeze(1).expand(-1, n, -1, -1)  # (bs, n, n, attn_dim)
+        edge_cond = self.edge_proj(torch.cat([node_i, node_j], dim=-1))
+
+        # Mask invalid edges
+        edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
+        edge_cond = edge_cond * edge_mask.unsqueeze(-1).float()
+
+        return edge_cond
 
 
 # =============================================================================
@@ -438,9 +620,14 @@ class FlowEdgeDecoder(pl.LightningModule):
         eta: float = 0.0,
         omega: float = 0.0,
         sample_time_distortion: str = "polydec",
+        use_cross_attn: bool = False,
+        cross_attn_tokens: int = 8,
+        cross_attn_heads: int = 4,
+        node_hdc_embed_dim: int = 0,
+        nodes_codebook: Optional[Tensor] = None,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["nodes_codebook"])
 
         # Store dimensions
         self.num_node_classes = num_node_classes
@@ -459,6 +646,32 @@ class FlowEdgeDecoder(pl.LightningModule):
         self.default_eta = eta
         self.default_omega = omega
         self.default_sample_time_distortion = sample_time_distortion
+
+        # Per-node HDC codebook embedding
+        self.node_hdc_embed_dim = node_hdc_embed_dim
+        if node_hdc_embed_dim > 0:
+            assert nodes_codebook is not None, (
+                "nodes_codebook must be provided when node_hdc_embed_dim > 0"
+            )
+            # Convert to plain Tensor — codebook may be a VSATensor subclass
+            # from torchhd which doesn't support deepcopy (breaks PL checkpointing).
+            cb = nodes_codebook.detach().clone()
+            if type(cb) is not torch.Tensor:
+                cb = cb.as_subclass(torch.Tensor)
+            self.register_buffer("_nodes_codebook", cb)
+            codebook_hv_dim = nodes_codebook.shape[1]
+            self.node_hdc_proj = nn.Linear(codebook_hv_dim, node_hdc_embed_dim)
+            # Strides for flat index computation from NODE_FEATURE_BINS
+            strides = []
+            s = 1
+            for b in reversed(NODE_FEATURE_BINS):
+                strides.append(s)
+                s *= b
+            strides.reverse()
+            self.register_buffer(
+                "_codebook_strides",
+                torch.tensor(strides, dtype=torch.long),
+            )
 
         # Create limit distribution for edges
         # For nodes, use uniform (won't be used since nodes are fixed)
@@ -489,6 +702,22 @@ class FlowEdgeDecoder(pl.LightningModule):
         )
         extra_dims = self.extra_features.output_dims()
 
+        # Cross-attention conditioning
+        self.use_cross_attn = use_cross_attn
+        if self.use_cross_attn:
+            node_input_dim = num_node_classes + extra_dims["X"] + node_hdc_embed_dim
+            edge_cond_dim = hidden_dim // 4  # match de
+            self.hdc_conditioner = HDCCrossAttentionConditioner(
+                hdc_dim=hdc_dim,
+                node_input_dim=node_input_dim,
+                edge_cond_dim=edge_cond_dim,
+                num_tokens=cross_attn_tokens,
+                n_heads=cross_attn_heads,
+            )
+            cross_attn_edge_dim = edge_cond_dim
+        else:
+            cross_attn_edge_dim = 0
+
         # MLP to reduce HDC conditioning dimension
         # Input: concatenated [order_0 | order_N] with dim = hdc_dim (which is 2x base_hdc_dim)
         # Output: condition_dim
@@ -511,8 +740,8 @@ class FlowEdgeDecoder(pl.LightningModule):
 
         # Input dimensions: nodes + edges + global (time_embed + reduced HDC + extra)
         self.input_dims = {
-            "X": num_node_classes + extra_dims["X"],
-            "E": num_edge_classes + extra_dims["E"],
+            "X": num_node_classes + extra_dims["X"] + node_hdc_embed_dim,
+            "E": num_edge_classes + extra_dims["E"] + cross_attn_edge_dim,
             "y": time_embed_dim + extra_dims["y"] + condition_dim,  # time_embed + extra + reduced HDC
         }
 
@@ -609,6 +838,31 @@ class FlowEdgeDecoder(pl.LightningModule):
         else:
             raise ValueError(f"Unknown noise_type: {noise_type}. Use 'uniform' or 'marginal'.")
 
+    def _lookup_node_hdc_embeddings(self, X_t: Tensor) -> Tensor:
+        """Look up per-node HDC codebook vectors and project them.
+
+        Args:
+            X_t: One-hot node features (bs, n, num_node_classes). Only the
+                 first NODE_FEATURE_DIM dimensions are used for the lookup.
+
+        Returns:
+            Projected embeddings of shape (bs, n, node_hdc_embed_dim).
+        """
+        x_base = X_t[..., :NODE_FEATURE_DIM]  # (bs, n, 24)
+        # Argmax per feature group to recover raw integer indices
+        offset = 0
+        raw_parts = []
+        for num_classes in NODE_FEATURE_BINS:
+            raw_parts.append(x_base[..., offset:offset + num_classes].argmax(dim=-1))
+            offset += num_classes
+        raw = torch.stack(raw_parts, dim=-1)  # (bs, n, 5)
+        # Flat index via precomputed strides
+        flat_idx = (raw * self._codebook_strides).sum(dim=-1).long()  # (bs, n)
+        flat_idx = flat_idx.clamp(0, self._nodes_codebook.shape[0] - 1)
+        # Lookup and project (cast to float32 since codebook may be float64)
+        node_hdc = self._nodes_codebook[flat_idx].float()  # (bs, n, hv_dim)
+        return self.node_hdc_proj(node_hdc)  # (bs, n, node_hdc_embed_dim)
+
     def forward(
         self,
         noisy_data: Dict[str, Tensor],
@@ -629,6 +883,16 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Concatenate noisy data with extra features
         X = torch.cat([noisy_data["X_t"], extra_data.X], dim=-1)
         E = torch.cat([noisy_data["E_t"], extra_data.E], dim=-1)
+
+        # Per-node HDC codebook embeddings
+        if self.node_hdc_embed_dim > 0:
+            node_hdc_embed = self._lookup_node_hdc_embeddings(noisy_data["X_t"])
+            X = torch.cat([X, node_hdc_embed], dim=-1)
+
+        # Cross-attention edge conditioning
+        if self.use_cross_attn and "hdc_raw" in noisy_data:
+            edge_cond = self.hdc_conditioner(X, noisy_data["hdc_raw"], node_mask)
+            E = torch.cat([E, edge_cond], dim=-1)
 
         # Global features: time embedding + HDC vector + extra
         t = noisy_data["t"]  # (bs, 1) from time distorter
@@ -740,6 +1004,7 @@ class FlowEdgeDecoder(pl.LightningModule):
             "E_t": E_t,
             "y_t": y_t,
             "node_mask": node_mask,
+            "hdc_raw": hdc_vectors,
         }
 
     def training_step(
@@ -788,14 +1053,13 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Log detached loss to allow deepcopy in checkpoint callback
         self.log("train/loss", loss.detach(), prog_bar=True, batch_size=batch.num_graphs)
 
-        # Store batch metrics for TrainingMetricsCallback
-        # These are used for detailed analysis (confusion matrix, timestep-binned loss, etc.)
+        # Store batch metrics for TrainingMetricsCallback (moved to CPU to avoid GPU accumulation)
         self.batch_metrics = {
-            "t": noisy_data["t"].detach(),  # (bs,) or (bs, 1) timesteps
-            "pred_classes": pred.E.argmax(dim=-1).detach(),  # (bs, n, n) predicted edge classes
-            "true_classes": E.argmax(dim=-1).detach(),  # (bs, n, n) ground truth edge classes
-            "node_mask": node_mask.detach(),  # (bs, n) valid node mask
-            "loss": loss.detach(),  # scalar loss for this batch
+            "t": noisy_data["t"].detach().cpu(),
+            "pred_classes": pred.E.argmax(dim=-1).detach().cpu(),
+            "true_classes": E.argmax(dim=-1).detach().cpu(),
+            "node_mask": node_mask.detach().cpu(),
+            "loss": loss.detach().cpu(),
         }
 
         return {"loss": loss}
@@ -825,9 +1089,9 @@ class FlowEdgeDecoder(pl.LightningModule):
 
         loss = self.train_loss(pred.E, E, node_mask)
 
-        # Log and return detached loss to allow deepcopy in checkpoint callback
+        # Log and return detached loss (on CPU to avoid accumulation across val batches)
         self.log("val/loss", loss.detach(), prog_bar=True, batch_size=batch.num_graphs)
-        return {"val_loss": loss.detach()}
+        return {"val_loss": loss.detach().cpu()}
 
     def _get_hdc_vectors_from_batch(self, batch: Batch) -> Tensor:
         """Extract per-graph HDC vectors from batch."""
@@ -854,6 +1118,7 @@ class FlowEdgeDecoder(pl.LightningModule):
         y_t: Tensor,
         node_mask: Tensor,
         deterministic: bool = False,
+        hdc_raw: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Sample z_s given z_t - ONLY update edges.
@@ -867,6 +1132,8 @@ class FlowEdgeDecoder(pl.LightningModule):
             node_mask: Valid node mask
             deterministic: If True, use argmax instead of sampling for
                           fully deterministic trajectories given the same initial noise
+            hdc_raw: Raw HDC vectors for cross-attention conditioning (bs, hdc_dim).
+                    Required when use_cross_attn=True, ignored otherwise.
 
         Returns:
             (X_s, E_s, y_s, pred_E) - X_s = X_t (unchanged), E_s = new edges,
@@ -883,6 +1150,8 @@ class FlowEdgeDecoder(pl.LightningModule):
             "y_t": y_t,
             "node_mask": node_mask,
         }
+        if hdc_raw is not None:
+            noisy_data["hdc_raw"] = hdc_raw
 
         # Compute extra features
         extra_data = self._compute_extra_data(noisy_data)
@@ -966,6 +1235,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         show_progress: bool = True,
         step_callback: Optional[Callable[[int, float, Tensor, Tensor, Tensor, Optional[Tensor]], None]] = None,
         deterministic: bool = False,
+        initial_edges: Optional[Tensor] = None,
+        start_time: float = 0.0,
     ) -> List[Data]:
         """
         Generate edges conditioned on HDC vectors and fixed nodes.
@@ -990,6 +1261,14 @@ class FlowEdgeDecoder(pl.LightningModule):
             deterministic: If True, use argmax instead of sampling at each denoising step
                           for fully deterministic trajectories given the same initial noise.
                           Initial noise is still sampled; use torch seeds for reproducibility.
+            initial_edges: Optional pre-computed one-hot edge tensor
+                          (num_samples, n_max, n_max, de). When provided, skips noise
+                          sampling and uses these edges as the starting state. Used for
+                          refinement passes where the output of a previous run serves
+                          as initialization.
+            start_time: Normalized start time in [0.0, 1.0). When > 0.0, the denoising
+                       loop skips all steps before this time. Useful for warm-starting
+                       from a partially denoised state. Default 0.0 (full schedule).
 
         Returns:
             List of PyG Data objects with generated edges
@@ -1031,25 +1310,33 @@ class FlowEdgeDecoder(pl.LightningModule):
         num_samples = hdc_vectors.size(0)
         n_max = X.size(1)
 
-        # Sample initial noise for edges only (using possibly overridden limit dist)
-        e_limit = sampling_limit_dist.E.to(device)
-        e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
-            num_samples, n_max, n_max, -1
-        )
-        prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
-        E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
-        E_label = E_label_flat.reshape(num_samples, n_max, n_max)
-
-        # Make symmetric
-        E_label = torch.triu(E_label, diagonal=1)
-        E_label = E_label + E_label.transpose(1, 2)
-
-        # Convert to one-hot
-        E = F.one_hot(E_label, num_classes=self.num_edge_classes).float()
-
-        # Apply mask
+        # Initialize edges: use provided initial_edges or sample noise
         edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
-        E = E * edge_mask.unsqueeze(-1).float()
+        if initial_edges is not None:
+            E = initial_edges.to(device).float()
+            E = E * edge_mask.unsqueeze(-1).float()
+        else:
+            # Sample initial noise for edges only (using possibly overridden limit dist)
+            e_limit = sampling_limit_dist.E.to(device)
+            e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+                num_samples, n_max, n_max, -1
+            )
+            prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
+            E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+            E_label = E_label_flat.reshape(num_samples, n_max, n_max)
+
+            # Make symmetric
+            E_label = torch.triu(E_label, diagonal=1)
+            E_label = E_label + E_label.transpose(1, 2)
+
+            # Convert to one-hot
+            E = F.one_hot(E_label, num_classes=self.num_edge_classes).float()
+
+            # Apply mask
+            E = E * edge_mask.unsqueeze(-1).float()
+
+        # Keep raw HDC vectors for cross-attention conditioning
+        hdc_raw = hdc_vectors if self.use_cross_attn else None
 
         # HDC vectors reduced through MLP as y
         y = self.condition_mlp(hdc_vectors)
@@ -1059,11 +1346,15 @@ class FlowEdgeDecoder(pl.LightningModule):
         if show_progress:
             iterator = tqdm(iterator, desc="Sampling edges")
 
-        # Callback for initial state (t=0, noisy edges, no prediction yet)
+        # Callback for initial state (noisy edges, no prediction yet)
         if step_callback is not None:
-            step_callback(0, 0.0, X.clone(), E.clone(), node_mask, None)
+            step_callback(0, start_time, X.clone(), E.clone(), node_mask, None)
 
         for t_int in iterator:
+            # Skip steps before start_time (for warm-starting / refinement)
+            if t_int / sample_steps < start_time:
+                continue
+
             t_norm = torch.tensor([t_int / sample_steps], device=device)
             s_norm = torch.tensor([(t_int + 1) / sample_steps], device=device)
 
@@ -1076,7 +1367,7 @@ class FlowEdgeDecoder(pl.LightningModule):
             s = s_norm.expand(num_samples, 1)
 
             # Sample step - X stays fixed, only E changes
-            X, E, y, pred_E = self._sample_step(t, s, X, E, y, node_mask, deterministic)
+            X, E, y, pred_E = self._sample_step(t, s, X, E, y, node_mask, deterministic, hdc_raw=hdc_raw)
 
             # Callback after each step (includes model's prediction)
             if step_callback is not None:
@@ -1091,6 +1382,64 @@ class FlowEdgeDecoder(pl.LightningModule):
             self.rate_matrix_designer.limit_dist = original_limit_dist
 
         return samples
+
+    def sample_best_of_n(
+        self,
+        hdc_vectors: Tensor,
+        node_features: Tensor,
+        node_mask: Tensor,
+        num_repetitions: int,
+        score_fn: Callable[[Data], float],
+        **sample_kwargs,
+    ) -> Tuple[Data, float]:
+        """
+        Generate edges N times in parallel and keep the best result.
+
+        Expands the single-sample inputs to ``num_repetitions`` copies,
+        runs a single batched :meth:`sample` call, scores each result with
+        ``score_fn``, and returns the sample with the lowest score.
+
+        Args:
+            hdc_vectors: HDC conditioning vector for **one** molecule (1, hdc_dim).
+            node_features: One-hot node features for **one** molecule (1, n, dx).
+            node_mask: Valid-node mask for **one** molecule (1, n).
+            num_repetitions: Number of parallel decodings (best-of-N).
+            score_fn: Scoring callable applied to each generated ``Data`` object.
+                Lower is better. Return ``float('inf')`` to discard a sample.
+            **sample_kwargs: Forwarded to :meth:`sample` (eta, omega,
+                sample_steps, time_distortion, device, initial_edges, …).
+                ``initial_edges``, if present, is automatically expanded to
+                match ``num_repetitions``.
+
+        Returns:
+            Tuple of (best_sample, best_score).
+        """
+        # Expand single molecule to num_repetitions copies
+        batch_hdc = hdc_vectors.expand(num_repetitions, -1)
+        batch_nf = node_features.expand(num_repetitions, -1, -1)
+        batch_mask = node_mask.expand(num_repetitions, -1)
+
+        # Expand initial_edges if provided (1, n, n, de) -> (N, n, n, de)
+        if "initial_edges" in sample_kwargs and sample_kwargs["initial_edges"] is not None:
+            sample_kwargs["initial_edges"] = sample_kwargs["initial_edges"].expand(
+                num_repetitions, -1, -1, -1
+            )
+
+        all_samples = self.sample(
+            hdc_vectors=batch_hdc,
+            node_features=batch_nf,
+            node_mask=batch_mask,
+            **sample_kwargs,
+        )
+
+        # Score each repetition and pick the best
+        scores = [score_fn(s) for s in all_samples]
+        best_idx = int(min(range(num_repetitions), key=lambda i: scores[i]))
+        best_sample = all_samples[best_idx]
+        best_score = scores[best_idx]
+        # Free non-selected GPU samples
+        del all_samples, scores
+        return best_sample, best_score
 
     # =========================================================================
     # HDC-Guided Sampling Methods
@@ -1228,44 +1577,54 @@ class FlowEdgeDecoder(pl.LightningModule):
         candidate_hdcs: Tensor,
         target_order_n: Tensor,
         candidates: Tensor,
+        hypernet=None,
     ) -> Tensor:
         """
-        Select candidate with smallest cosine distance to target.
+        Select the candidate whose order-N embedding is closest to the target.
+
+        Distances are computed via ``hypernet.calculate_order_n_distance()``,
+        which correctly handles both single ``HyperNet`` (one cosine
+        distance) and ``MultiHyperNet`` (per-sub-HyperNet averaged cosine
+        distance).  When *hypernet* is ``None``, falls back to a plain
+        cosine distance over the full embedding.
 
         Args:
-            candidate_hdcs: Candidate order_N embeddings (K, bs, hdc_dim)
-            target_order_n: Target order_N (bs, hdc_dim)
-            candidates: Edge candidates (K, bs, n, n) class indices
+            candidate_hdcs: Candidate order_N embeddings (K, bs, order_n_dim).
+            target_order_n: Target order_N (bs, order_n_dim).
+            candidates: Edge candidates (K, bs, n, n) class indices.
+            hypernet: HyperNet or MultiHyperNet whose
+                ``calculate_order_n_distance`` method defines the metric.
+                When ``None``, a single cosine distance is used as fallback.
 
         Returns:
-            E_guide: Best candidate edges as one-hot (bs, n, n, de)
+            E_guide: Best candidate edges as one-hot (bs, n, n, de).
         """
-        K, bs, hdc_dim = candidate_hdcs.shape
+        K, bs, order_n_dim = candidate_hdcs.shape
         n = candidates.shape[2]
         device = candidates.device
 
-        # Compute element-wise cosine similarity for each candidate
-        # candidate_hdcs: (K, bs, hdc_dim)
-        # target_order_n: (bs, hdc_dim)
+        # Expand target to match candidates: (K, bs, order_n_dim)
+        target_expanded = target_order_n.unsqueeze(0).expand(K, -1, -1)
 
-        # Normalize for cosine similarity
-        candidate_hdcs_norm = F.normalize(candidate_hdcs, dim=-1)  # (K, bs, hdc_dim)
-        target_norm = F.normalize(target_order_n, dim=-1)  # (bs, hdc_dim)
+        # Flatten to (K*bs, order_n_dim) for batched distance computation
+        cand_flat = candidate_hdcs.reshape(K * bs, order_n_dim)
+        tgt_flat = target_expanded.reshape(K * bs, order_n_dim)
 
-        # Expand target for broadcasting: (1, bs, hdc_dim)
-        target_expanded = target_norm.unsqueeze(0)
+        # Delegate distance computation to the hypernet so that
+        # MultiHyperNet's per-chunk averaging is used automatically.
+        if hypernet is not None:
+            distances_flat = hypernet.calculate_order_n_distance(cand_flat, tgt_flat)
+        else:
+            distances_flat = 1.0 - F.cosine_similarity(
+                cand_flat.float(), tgt_flat.float(), dim=-1,
+            )
 
-        # Element-wise dot product along hdc_dim: (K, bs)
-        similarities = (candidate_hdcs_norm * target_expanded).sum(dim=-1)
-
-        # Convert to distance (1 - similarity)
-        distances = 1.0 - similarities  # (K, bs)
+        distances = distances_flat.reshape(K, bs)  # (K, bs)
 
         # Find best candidate per batch sample (minimum distance)
         best_indices = torch.argmin(distances, dim=0)  # (bs,)
 
         # Gather best candidates: (bs, n, n)
-        # best_indices: (bs,) -> need to gather from candidates (K, bs, n, n)
         best_edges = torch.zeros(bs, n, n, dtype=torch.long, device=device)
         for b in range(bs):
             best_edges[b] = candidates[best_indices[b].item(), b]
@@ -1365,16 +1724,103 @@ class FlowEdgeDecoder(pl.LightningModule):
             "Z_t_E": Z_t_E,
         }
 
+    # =========================================================================
+    # Soft HDC Gradient Guidance
+    # =========================================================================
+
+    @staticmethod
+    def _fft_bind(a: Tensor, b: Tensor) -> Tensor:
+        """
+        HRR circular convolution via FFT (differentiable).
+
+        Equivalent to ``torchhd.bind`` for HRR tensors but operates on plain
+        float tensors so that ``torch.autograd.grad`` can backpropagate
+        through the operation.
+
+        Args:
+            a: Tensor of shape (..., D).
+            b: Tensor of shape (..., D).
+
+        Returns:
+            Circular convolution result, same shape as inputs.
+        """
+        return torch.fft.ifft(torch.fft.fft(a) * torch.fft.fft(b)).real
+
+    @staticmethod
+    def _soft_hdc_encode(
+        soft_A: Tensor,
+        node_hvs: Tensor,
+        node_mask: Tensor,
+        depth: int,
+        normalize: bool,
+    ) -> Tensor:
+        """
+        Differentiable soft HDC encoding using a soft adjacency matrix.
+
+        Mirrors the message passing loop of ``HyperNet.forward()``
+        (encoder.py L345-362) but replaces the sparse
+        ``scatter_hd(messages, srcs, op="bundle")`` with a dense matrix
+        multiply ``bmm(soft_A, node_hvs)``.  Since bundle = element-wise
+        sum and matrix multiplication is a weighted sum, this is an exact
+        relaxation.
+
+        The bind step (circular convolution) is implemented via FFT and is
+        fully differentiable.
+
+        Args:
+            soft_A: Soft adjacency matrix (bs, n, n), values in [0, 1].
+            node_hvs: Pre-computed node hypervectors (bs, n, D).
+            node_mask: Valid node mask (bs, n).
+            depth: Number of message passing layers (= hypernet.depth).
+            normalize: Whether to L2-normalize after each layer.
+
+        Returns:
+            Graph embedding (bs, D).
+        """
+        bs, n, D = node_hvs.shape
+
+        # Build layer list (avoids in-place tensor ops for autograd)
+        hv_layers = [node_hvs]  # layer 0
+
+        for layer in range(depth):
+            prev_hv = hv_layers[-1]  # (bs, n, D)
+
+            # Soft message passing: weighted sum of neighbor HVs
+            aggregated = torch.bmm(soft_A, prev_hv)  # (bs, n, D)
+
+            # Bind: circular convolution of prev_hv with aggregated
+            hr = FlowEdgeDecoder._fft_bind(prev_hv, aggregated)  # (bs, n, D)
+
+            if normalize:
+                hr = hr / (hr.norm(dim=-1, keepdim=True) + 1e-8)
+
+            hv_layers.append(hr)
+
+        # Multi-bundle across layers: sum over stacked layer dimension
+        # Equivalent to torchhd.multibundle for HRR
+        stacked = torch.stack(hv_layers, dim=1)  # (bs, depth+1, n, D)
+        node_emb = stacked.sum(dim=1)  # (bs, n, D)
+
+        # Mask invalid nodes
+        node_emb = node_emb * node_mask.unsqueeze(-1).float()
+
+        # Graph readout: sum over nodes (= scatter_hd with op="bundle")
+        graph_emb = node_emb.sum(dim=1)  # (bs, D)
+
+        return graph_emb
+
     @torch.no_grad()
-    def sample_with_hdc_guidance(
+    def sample_with_soft_hdc_guidance(
         self,
         hdc_vectors: Tensor,
         node_features: Tensor,
         node_mask: Tensor,
-        original_node_features: Tensor,
         hypernet,
-        gamma: float = 1.0,
-        num_candidates: int = 4,
+        raw_node_features: Tensor,
+        gamma: float = 0.5,
+        tau: float = 0.5,
+        integration_mode: str = "blend",
+        schedule: str = "linear_decay",
         eta: Optional[float] = None,
         omega: Optional[float] = None,
         sample_steps: Optional[int] = None,
@@ -1382,38 +1828,69 @@ class FlowEdgeDecoder(pl.LightningModule):
         noise_type_override: Optional[str] = None,
         device: Optional[torch.device] = None,
         show_progress: bool = True,
+        step_callback: Optional[Callable[[int, float, Tensor, Tensor, Tensor, Optional[Tensor]], None]] = None,
+        deterministic: bool = False,
+        initial_edges: Optional[Tensor] = None,
+        start_time: float = 0.0,
     ) -> List[Data]:
         """
-        Generate edges with HDC-guided sampling.
+        Generate edges with soft HDC gradient guidance.
 
-        At each timestep:
-        1. Sample K candidates from pred_E (model's clean graph estimate)
-        2. Encode each candidate with HyperNet to get order_N
-        3. Select candidate with smallest cosine distance to target order_N
-        4. Add R^HDC term to rate matrix (analogous to R^TG with omega)
+        At each timestep the model's predicted edge logits are relaxed into
+        a differentiable soft adjacency matrix.  A lightweight soft HDC
+        encoder (matrix-multiply message passing + FFT circular convolution)
+        maps this to a graph embedding.  The cosine distance to the target
+        order_N is back-propagated to obtain per-edge, per-class gradients
+        that steer sampling toward HDC-consistent configurations.
+
+        Two integration modes are supported:
+
+        * ``"blend"``: the gradient-derived target distribution is mixed
+          with the model's prediction *before* rate matrix computation.
+        * ``"rate_matrix"``: an additive ``R^HDC`` term constructed from
+          the negative gradient is added to the rate matrix *after* the
+          standard computation.
 
         Args:
-            hdc_vectors: Full HDC vectors [order_0 | order_N] (num_samples, hdc_dim)
-            node_features: Fixed node types one-hot (num_samples, max_n, num_node_classes)
-            node_mask: Valid node mask (num_samples, max_n)
-            original_node_features: Original node features for HyperNet (num_samples, max_n, feat_dim)
-            hypernet: HyperNet encoder for candidate evaluation
-            gamma: HDC guidance strength (default: 1.0)
-            num_candidates: Number of candidates K to sample (default: 4)
-            eta: Stochasticity parameter (None = use default)
-            omega: Target guidance strength (None = use default)
-            sample_steps: Number of denoising steps (None = use default)
-            time_distortion: Time distortion type (None = use default)
-            noise_type_override: Override noise type for initialization
-            device: Device to run on
-            show_progress: Whether to show progress bar
+            hdc_vectors: Full HDC vectors [order_0 | order_N]
+                         (num_samples, hdc_dim).
+            node_features: Fixed node types one-hot
+                           (num_samples, max_n, num_node_classes).
+            node_mask: Valid node mask (num_samples, max_n).
+            hypernet: HyperNet encoder (used for codebook lookup and depth).
+            raw_node_features: Raw integer node features for codebook lookup
+                               (num_samples, max_n, num_raw_features).
+            gamma: Guidance strength (default 0.5).
+            tau: Softmax temperature for soft edge probabilities and for
+                 converting the negative gradient into a distribution
+                 (default 0.5).
+            integration_mode: ``"blend"`` or ``"rate_matrix"`` (default
+                              ``"blend"``).
+            schedule: Time-dependent strength schedule.  ``"constant"``
+                      uses *gamma* at every step; ``"linear_decay"`` uses
+                      ``gamma * (1 - t)`` (more guidance early);
+                      ``"linear_ramp"`` uses ``gamma * t`` (more guidance
+                      late).  Default ``"linear_decay"``.
+            eta: Stochasticity parameter (None = use default).
+            omega: Target guidance strength (None = use default).
+            sample_steps: Number of denoising steps (None = use default).
+            time_distortion: Time distortion type (None = use default).
+            noise_type_override: Override noise type for initialization.
+            device: Device to run on (defaults to CPU).
+            show_progress: Whether to show progress bar.
+            step_callback: Optional callback invoked at each step with
+                           ``(step, t, X, E, node_mask, pred_E)``.
+            deterministic: If True, use argmax instead of sampling.
+            initial_edges: Optional pre-computed one-hot edge tensor for
+                           warm-starting.
+            start_time: Normalized start time in [0.0, 1.0).
 
         Returns:
-            List of PyG Data objects with generated edges
+            List of PyG Data objects with generated edges.
         """
         self.eval()
 
-        # Use defaults if not specified
+        # ----- defaults -----
         if eta is None:
             eta = self.default_eta
         if omega is None:
@@ -1423,7 +1900,6 @@ class FlowEdgeDecoder(pl.LightningModule):
         if time_distortion is None:
             time_distortion = self.default_sample_time_distortion
 
-        # Update rate matrix designer
         self.rate_matrix_designer.eta = eta
         self.rate_matrix_designer.omega = omega
 
@@ -1436,169 +1912,188 @@ class FlowEdgeDecoder(pl.LightningModule):
             sampling_limit_dist = self.limit_dist
             original_limit_dist = None
 
-        # Setup device
         device = device or torch.device("cpu")
         self.to(device)
-        hypernet = hypernet.to(device)
-        hypernet.eval()
 
         hdc_vectors = hdc_vectors.to(device).float()
         X = node_features.to(device).float()
         node_mask = node_mask.to(device)
-        original_node_features = original_node_features.to(device).float()
+        raw_node_features = raw_node_features.to(device)
 
         num_samples = hdc_vectors.size(0)
         n_max = X.size(1)
 
-        # Extract target order_N (second half of HDC vector)
-        hdc_dim = hdc_vectors.shape[-1]
-        target_order_n = hdc_vectors[:, hdc_dim // 2:]  # (num_samples, hdc_dim//2)
+        # ----- pre-compute node HVs from codebook (one-time) -----
+        # For MultiHyperNet, use the primary sub-HyperNet for guidance
+        from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
+        if isinstance(hypernet, MultiHyperNet):
+            primary = hypernet.primary
+        else:
+            primary = hypernet
 
-        # Sample initial noise for edges
-        e_limit = sampling_limit_dist.E.to(device)
-        e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
-            num_samples, n_max, n_max, -1
-        )
-        prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
-        E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
-        E_label = E_label_flat.reshape(num_samples, n_max, n_max)
+        D = primary.hv_dim
 
-        # Make symmetric
-        E_label = torch.triu(E_label, diagonal=1)
-        E_label = E_label + E_label.transpose(1, 2)
+        # Extract target order_N for the primary HyperNet only.
+        # Layout is [order_0(D) | order_N_primary(D) | order_N_rest(...)]
+        target_order_n = hdc_vectors[:, D : 2 * D]  # (num_samples, D)
+        depth = primary.depth
+        normalize_hdc = primary.normalize
+        node_hvs = torch.zeros(num_samples, n_max, D, device=device)
 
-        # Convert to one-hot
-        E = F.one_hot(E_label, num_classes=self.num_edge_classes).float()
+        for b in range(num_samples):
+            n_valid = node_mask[b].sum().int().item()
+            for i in range(n_valid):
+                tup = tuple(raw_node_features[b, i].long().tolist())
+                idx = primary.nodes_indexer.get_idx(tup)
+                if idx is not None:
+                    node_hvs[b, i] = primary.nodes_codebook[idx].float().to(device)
+                # else: leave as zeros (unknown node type, no guidance)
 
-        # Apply mask
+        # ----- initialize edges -----
         edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
-        E = E * edge_mask.unsqueeze(-1).float()
+        if initial_edges is not None:
+            E = initial_edges.to(device).float()
+            E = E * edge_mask.unsqueeze(-1).float()
+        else:
+            e_limit = sampling_limit_dist.E.to(device)
+            e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+                num_samples, n_max, n_max, -1
+            )
+            prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
+            E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+            E_label = E_label_flat.reshape(num_samples, n_max, n_max)
+            E_label = torch.triu(E_label, diagonal=1)
+            E_label = E_label + E_label.transpose(1, 2)
+            E = F.one_hot(E_label, num_classes=self.num_edge_classes).float()
+            E = E * edge_mask.unsqueeze(-1).float()
 
-        # HDC vectors reduced through MLP as y
+        hdc_raw = hdc_vectors if self.use_cross_attn else None
         y = self.condition_mlp(hdc_vectors)
 
-        # Sampling loop
+        # ----- sampling loop -----
         iterator = range(sample_steps)
         if show_progress:
-            iterator = tqdm(iterator, desc="HDC-guided sampling")
+            iterator = tqdm(iterator, desc="Soft HDC-guided sampling")
+
+        if step_callback is not None:
+            step_callback(0, start_time, X.clone(), E.clone(), node_mask, None)
+
+        de = self.num_edge_classes
 
         for t_int in iterator:
+            if t_int / sample_steps < start_time:
+                continue
+
             t_norm = torch.tensor([t_int / sample_steps], device=device)
             s_norm = torch.tensor([(t_int + 1) / sample_steps], device=device)
-
-            # Apply time distortion
             t_norm = self.time_distorter.sample_ft(t_norm, time_distortion)
             s_norm = self.time_distorter.sample_ft(s_norm, time_distortion)
 
-            # Expand to batch size
             t = t_norm.expand(num_samples, 1)
             s = s_norm.expand(num_samples, 1)
             dt = (s - t)[0]
 
-            # Prepare noisy data dict
+            # Compute alpha from schedule (use un-distorted fraction)
+            t_frac = t_int / sample_steps
+            if schedule == "constant":
+                alpha = gamma
+            elif schedule == "linear_decay":
+                alpha = gamma * (1.0 - t_frac)
+            elif schedule == "linear_ramp":
+                alpha = gamma * t_frac
+            else:
+                raise ValueError(f"Unknown schedule: {schedule!r}")
+
+            # ----- forward pass -----
             noisy_data = {
-                "t": t,
-                "X_t": X,
-                "E_t": E,
-                "y_t": y,
-                "node_mask": node_mask,
+                "t": t, "X_t": X, "E_t": E, "y_t": y, "node_mask": node_mask,
             }
+            if hdc_raw is not None:
+                noisy_data["hdc_raw"] = hdc_raw
 
-            # Compute extra features
             extra_data = self._compute_extra_data(noisy_data)
-
-            # Forward pass
             pred = self.forward(noisy_data, extra_data, node_mask)
 
-            # Get predictions as probability distributions
             pred_X = F.softmax(pred.X, dim=-1)
-            pred_E = F.softmax(pred.E, dim=-1)
+            pred_E_logits = pred.E  # keep raw logits for gradient
+            pred_E = F.softmax(pred_E_logits, dim=-1)
 
-            # === HDC Guidance ===
-            # 1. Sample K candidates from pred_E
-            candidates = self._sample_k_candidates(pred_E, num_candidates, node_mask)
+            # ----- soft HDC gradient -----
+            if alpha > 0:
+                with torch.enable_grad():
+                    logits_g = pred_E_logits.detach().clone().requires_grad_(True)
+                    soft_probs = F.softmax(logits_g / tau, dim=-1)
+                    # Soft adjacency: probability of any bond existing
+                    soft_A = soft_probs[:, :, :, 1:].sum(dim=-1)  # (bs, n, n)
+                    # Symmetrize
+                    soft_A = torch.triu(soft_A, diagonal=1)
+                    soft_A = soft_A + soft_A.transpose(1, 2)
+                    soft_A = soft_A * edge_mask.float()
 
-            # 2. Encode each candidate with HyperNet
-            candidate_hdcs = self._encode_candidates_to_order_n(
-                candidates, original_node_features, node_mask, hypernet
-            )
+                    graph_emb = self._soft_hdc_encode(
+                        soft_A, node_hvs, node_mask, depth, normalize_hdc,
+                    )
 
-            # 3. Select best candidate
-            E_guide = self._select_best_candidate(
-                candidate_hdcs, target_order_n, candidates
-            )
+                    graph_emb_n = F.normalize(graph_emb, dim=-1)
+                    target_n = F.normalize(target_order_n.float(), dim=-1)
+                    loss = (1.0 - (graph_emb_n * target_n).sum(dim=-1)).sum()
 
-            # === Compute Rate Matrices ===
+                    grad = torch.autograd.grad(loss, logits_g)[0]  # (bs, n, n, de)
+                # Outside enable_grad: grad is a regular detached tensor
+
+                if integration_mode == "blend":
+                    guidance_dist = F.softmax(-grad / tau, dim=-1)
+                    pred_E = (1.0 - alpha) * pred_E + alpha * guidance_dist
+                    pred_E = pred_E / pred_E.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # ----- rate matrices -----
             E_t_label = torch.argmax(E, dim=-1)
 
-            # Standard rate matrix (R* + R^DB + R^TG)
             R_t_X, R_t_E = self.rate_matrix_designer.compute_rate_matrices(
-                t, node_mask, X, E, pred_X, pred_E
+                t, node_mask, X, E, pred_X, pred_E,
             )
 
-            # Sample E_1 for dfm variables (needed for R^HDC denominator)
-            prob_E_flat_sample = pred_E.reshape(-1, self.num_edge_classes)
-            E_1_sampled_flat = torch.multinomial(prob_E_flat_sample, 1).squeeze(-1)
-            E_1_sampled = E_1_sampled_flat.reshape(num_samples, n_max, n_max)
+            if alpha > 0 and integration_mode == "rate_matrix":
+                grad_n = grad / (grad.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+                R_hdc = F.relu(-grad_n) * alpha
+                R_hdc.scatter_(-1, E_t_label.unsqueeze(-1), 0.0)
+                R_t_E = R_t_E + R_hdc
 
-            # Compute dfm variables for R^HDC
-            dfm_vars = self._compute_dfm_variables_for_edges(t, E_t_label, E_1_sampled)
-
-            # 4. Add R^HDC term
-            R_hdc = self._compute_Rhdc(
-                E_guide,
-                E_t_label,
-                dfm_vars["Z_t_E"],
-                dfm_vars["pt_vals_at_Et"],
-                gamma,
-            )
-            R_t_E = R_t_E + R_hdc
-
-            # === Sample Next State ===
-            # Compute step probabilities
+            # ----- sample next state -----
             step_probs_E = R_t_E * dt.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-
-            # Add diagonal (stay probability)
-            step_probs_E.scatter_(
-                -1,
-                E_t_label.unsqueeze(-1),
-                0.0,
-            )
+            step_probs_E.scatter_(-1, E_t_label.unsqueeze(-1), 0.0)
             stay_prob = 1.0 - step_probs_E.sum(dim=-1, keepdim=True).clamp(min=0)
-            step_probs_E.scatter_(
-                -1,
-                E_t_label.unsqueeze(-1),
-                stay_prob,
-            )
+            step_probs_E.scatter_(-1, E_t_label.unsqueeze(-1), stay_prob)
 
-            # Clamp to valid probabilities
             step_probs_E = step_probs_E.clamp(min=0)
             step_probs_E = step_probs_E / step_probs_E.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-            # At final step, use predicted marginals directly
             if s[0].item() >= 1.0 - 1e-6:
                 step_probs_E = pred_E
 
-            # Sample next edge state
-            prob_E_flat = step_probs_E.reshape(-1, self.num_edge_classes)
-            E_s_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
+            prob_E_flat = step_probs_E.reshape(-1, de)
+            if deterministic:
+                E_s_label_flat = torch.argmax(prob_E_flat, dim=-1)
+            else:
+                E_s_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
             E_s_label = E_s_label_flat.reshape(num_samples, n_max, n_max)
 
-            # Make symmetric
             E_s_label = torch.triu(E_s_label, diagonal=1)
             E_s_label = E_s_label + E_s_label.transpose(1, 2)
 
-            # Convert to one-hot
-            E = F.one_hot(E_s_label, num_classes=self.num_edge_classes).float()
-
-            # Apply mask
+            E = F.one_hot(E_s_label, num_classes=de).float()
             E = E * edge_mask.unsqueeze(-1).float()
 
-        # Convert to PyG Data objects
+            if step_callback is not None:
+                step_callback(
+                    t_int + 1, s_norm.item(),
+                    X.clone(), E.clone(), node_mask, pred_E.clone(),
+                )
+
+        # ----- finalize -----
         n_nodes = node_mask.sum(dim=1).int()
         samples = dense_to_pyg(X, E, torch.zeros_like(y[:, :0]), node_mask, n_nodes)
 
-        # Restore original limit_dist if overridden
         if original_limit_dist is not None:
             self.rate_matrix_designer.limit_dist = original_limit_dist
 
@@ -1690,9 +2185,11 @@ class FlowEdgeDecoder(pl.LightningModule):
         num_samples = hdc_vectors.size(0)
         n_max = X.size(1)
 
-        # Extract target order_N (second half of HDC vector)
-        hdc_dim = hdc_vectors.shape[-1]
-        target_order_n = hdc_vectors[:, hdc_dim // 2:]  # (num_samples, hdc_dim//2)
+        # Extract target order_N.  For a single HyperNet the layout is
+        # [order_0(D) | order_N(D)]; for a MultiHyperNet it is
+        # [order_0(D) | order_N_1(D1) | … | order_N_K(DK)].
+        # In both cases order_N starts at offset ``hypernet.hv_dim``.
+        target_order_n = hdc_vectors[:, hypernet.hv_dim:]  # (num_samples, order_n_dim)
 
         # Initialize best tracking
         best_E = None  # Will store (bs, n, n) edge labels
@@ -1717,6 +2214,9 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Apply mask
         edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
         E = E * edge_mask.unsqueeze(-1).float()
+
+        # Keep raw HDC vectors for cross-attention conditioning
+        hdc_raw = hdc_vectors if self.use_cross_attn else None
 
         # HDC vectors reduced through MLP as y
         y = self.condition_mlp(hdc_vectors)
@@ -1746,6 +2246,8 @@ class FlowEdgeDecoder(pl.LightningModule):
                 "y_t": y,
                 "node_mask": node_mask,
             }
+            if hdc_raw is not None:
+                noisy_data["hdc_raw"] = hdc_raw
 
             # Compute extra features
             extra_data = self._compute_extra_data(noisy_data)
@@ -1770,10 +2272,11 @@ class FlowEdgeDecoder(pl.LightningModule):
                 E_pred_label.unsqueeze(0), original_node_features, node_mask, hypernet
             ).squeeze(0)  # (bs, hdc_dim)
 
-            # Compute cosine distance
-            pred_norm = F.normalize(pred_order_n, dim=-1)
-            target_norm = F.normalize(target_order_n, dim=-1)
-            distances = 1.0 - (pred_norm * target_norm).sum(dim=-1)  # (bs,)
+            # Compute cosine distance using the hypernet's own metric.
+            # For MultiHyperNet this averages per-sub-HyperNet distances.
+            distances = hypernet.calculate_order_n_distance(
+                pred_order_n, target_order_n,
+            )  # (bs,)
 
             # Update best for samples where this is better
             improved = distances < best_distances
@@ -1792,7 +2295,7 @@ class FlowEdgeDecoder(pl.LightningModule):
 
             # === Standard Sampling Step (no R^HDC) ===
             # Use _sample_step which handles everything except HDC guidance
-            X, E, y, _ = self._sample_step(t, s, X, E, y, node_mask)
+            X, E, y, _ = self._sample_step(t, s, X, E, y, node_mask, hdc_raw=hdc_raw)
 
         # Determine which samples found a good match (below threshold)
         found_good_match = best_distances < distance_threshold
@@ -1888,7 +2391,7 @@ def preprocess_for_flow_edge_decoder(
     Preprocess a PyG Data object for FlowEdgeDecoder training (ZINC only).
 
     Adds/replaces:
-    - x: 24-dim one-hot encoding (atom_type, degree, charge, Hs, ring)
+    - x: One-hot encoding (24-dim base, or extended with RW bins when enabled)
     - edge_attr: 5-class bond type one-hot encoding
     - hdc_vector: Pre-computed HDC embedding
     - original_x: Raw feature indices for HDC-guided sampling
@@ -1909,9 +2412,24 @@ def preprocess_for_flow_edge_decoder(
     if data.edge_index.numel() == 0:
         return None
 
-    # 1. Convert raw features to 24-dim one-hot encoding
-    # data.x has shape (n, 5): [atom_type, degree, charge, num_hs, is_in_ring]
-    x_onehot = raw_features_to_onehot(data.x)
+    # 1. Build node features — base 5-dim ZINC features, optionally extended
+    #    with binned RW return probabilities when the encoder uses them.
+    rw_config = getattr(hypernet, "rw_config", None)
+    feature_bins = get_node_feature_bins(rw_config)
+
+    raw_feats = data.x.clone()  # (n, 5) base ZINC features
+    if rw_config is not None and rw_config.enabled:
+        from graph_hdc.utils.rw_features import (
+            bin_rw_probabilities,
+            compute_rw_return_probabilities,
+        )
+        rw_probs = compute_rw_return_probabilities(
+            data.edge_index, data.x.size(0), rw_config.k_values,
+        )
+        rw_binned = bin_rw_probabilities(rw_probs, rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, k_values=rw_config.k_values)
+        raw_feats = torch.cat([raw_feats, rw_binned], dim=-1)
+
+    x_onehot = raw_features_to_onehot(raw_feats, feature_bins=feature_bins)
 
     # 2. Create 5-class edge attributes from SMILES
     mol = Chem.MolFromSmiles(data.smiles)
@@ -1936,6 +2454,18 @@ def preprocess_for_flow_edge_decoder(
     # Add batch attribute for single graph (required by HyperNet)
     if data_for_hdc.batch is None:
         data_for_hdc.batch = torch.zeros(data_for_hdc.x.size(0), dtype=torch.long, device=device)
+
+    # Augment with RW features if the encoder was built with them
+    if hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled:
+        from graph_hdc.utils.rw_features import augment_data_with_rw
+
+        data_for_hdc = augment_data_with_rw(
+            data_for_hdc,
+            k_values=hypernet.rw_config.k_values,
+            num_bins=hypernet.rw_config.num_bins,
+            bin_boundaries=hypernet.rw_config.bin_boundaries,
+        )
+
     with torch.no_grad():
         # First encode node properties to get node hypervectors
         data_for_hdc = hypernet.encode_properties(data_for_hdc)
@@ -1956,7 +2486,7 @@ def preprocess_for_flow_edge_decoder(
 
     # 4. Create new Data object
     new_data = Data(
-        x=x_onehot,  # 24-dim one-hot
+        x=x_onehot,  # one-hot: base 24-dim, or extended when RW enabled
         edge_index=edge_index.clone(),
         edge_attr=edge_attr_onehot,
         hdc_vector=hdc_vector,

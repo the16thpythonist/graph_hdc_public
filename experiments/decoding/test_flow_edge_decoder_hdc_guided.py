@@ -1,28 +1,31 @@
 #!/usr/bin/env python
 """
-Test FlowEdgeDecoder with HDC Distance Tracking and Early Stopping.
+Test FlowEdgeDecoder with Soft HDC Gradient Guidance.
 
 This experiment extends test_flow_edge_decoder.py (base test experiment) and
-overrides the generate_edges hook to use the sample_with_hdc() method which:
-1. Performs standard sampling (no R^HDC guidance term)
-2. At each timestep, computes deterministic argmax edges and encodes with HyperNet
-3. Tracks the best match (lowest cosine distance) per sample
-4. Early stops when all samples have distance below threshold
-5. Returns the best-seen edges (not final edges)
+overrides the generate_edges hook to use soft HDC gradient guidance.
 
-This is useful for testing reconstruction quality - if the model can find
-edge configurations that closely match the target HDC encoding.
+At each timestep during sampling:
+1. The model's predicted edge logits are relaxed into a soft adjacency matrix
+2. A differentiable soft HDC encoder computes a graph embedding via
+   matrix-multiply message passing + FFT circular convolution
+3. The cosine distance to the target order_N is back-propagated to get
+   per-edge, per-class gradients
+4. These gradients steer sampling toward HDC-consistent edge configurations,
+   either by blending into the predicted distribution or by adding an R^HDC
+   rate matrix term
 
 Usage:
     # Test with SMILES list
-    python test_flow_edge_decoder_hdc.py \\
+    python test_flow_edge_decoder_hdc_guided.py \\
         --HDC_ENCODER_PATH /path/to/encoder.ckpt \\
         --FLOW_DECODER_PATH /path/to/decoder.ckpt \\
         --DATASET qm9 \\
-        --DISTANCE_THRESHOLD 0.001
+        --GAMMA 0.5 \\
+        --INTEGRATION_MODE blend
 
     # Quick test
-    python test_flow_edge_decoder_hdc.py --__TESTING__ True
+    python test_flow_edge_decoder_hdc_guided.py --__TESTING__ True
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from graph_hdc.models.flow_edge_decoder import FlowEdgeDecoder
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Model Paths (same defaults as base, can be overridden)
+# Model Paths
 # -----------------------------------------------------------------------------
 
 # :param HDC_ENCODER_PATH:
@@ -56,36 +59,77 @@ HDC_ENCODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/de
 FLOW_DECODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/last.ckpt"
 
 # -----------------------------------------------------------------------------
+# Input SMILES (smaller default list for guided sampling which is slower)
+# -----------------------------------------------------------------------------
+
+# :param SMILES_LIST:
+#     List of SMILES strings to test. Guided sampling is slower per molecule,
+#     so the default list is smaller.
+SMILES_LIST: list[str] = [
+    "CCO",      # Ethanol
+    "CC(=O)O",  # Acetic acid
+    "c1ccccc1", # Benzene
+    "CCN",      # Ethylamine
+    "CC=O",     # Acetaldehyde
+    "CCN(Cc1ccc(OC)c(OC)c1)C(=O)c2cscc2",
+    "C(NCC1=CC=C(C)C=C1)1=NC=NC(N2C3CC(C)(C)CC(C)(C3)C2)=C1N",
+    "C(=O)1N(C)CC(NC(C2SC=CC=2)C2CC2)C1",
+    "C1C(C(C#N)N2C(C3=CC=CC=C3)CC(C)=N2)=COC=1",
+]
+
+# -----------------------------------------------------------------------------
 # Sampling Configuration (override base defaults)
 # -----------------------------------------------------------------------------
 
 # :param SAMPLE_STEPS:
-#     Number of denoising steps. HDC variant uses fewer steps since early
-#     stopping may terminate before completing all steps.
-SAMPLE_STEPS: int = 1000
+#     Number of denoising steps during sampling.
+SAMPLE_STEPS: int = 100
 
 # :param SAMPLE_TIME_DISTORTION:
 #     Time distortion schedule for sampling.
 SAMPLE_TIME_DISTORTION: str = "polydec"
 
-# -----------------------------------------------------------------------------
-# HDC Early Stopping Configuration
-# -----------------------------------------------------------------------------
-
-# :param DISTANCE_THRESHOLD:
-#     Cosine distance threshold for early stopping. Lower values require
-#     closer HDC match before stopping. Set to a very small value for
-#     maximum reconstruction accuracy.
-DISTANCE_THRESHOLD: float = 0.00001
+# :param NOISE_TYPE_OVERRIDE:
+#     Override noise type. HDC-guided variant defaults to marginal noise.
+NOISE_TYPE_OVERRIDE: Optional[str] = "marginal"
 
 # -----------------------------------------------------------------------------
-# Disable GIF (not supported with sample_with_hdc)
+# Soft HDC Gradient Guidance Configuration
+# -----------------------------------------------------------------------------
+
+# :param GAMMA:
+#     HDC guidance strength. 0.0 = no guidance, higher values bias sampling
+#     more strongly toward HDC-consistent edge configurations.
+GAMMA: float = 0.5
+
+# :param TAU:
+#     Softmax temperature for the soft edge probabilities and for converting
+#     the negative gradient into a distribution. Lower values make the soft
+#     edges sharper (closer to discrete) but the gradient becomes noisier.
+TAU: float = 0.5
+
+# :param INTEGRATION_MODE:
+#     How to apply the gradient signal. Options:
+#       - "blend": mix gradient-derived target distribution with model's
+#         prediction before rate matrix computation (most principled).
+#       - "rate_matrix": add R^HDC = relu(-grad) * alpha to the rate matrix
+#         after standard computation.
+INTEGRATION_MODE: str = "blend"
+
+# :param SCHEDULE:
+#     Time-dependent guidance strength schedule. Options:
+#       - "constant": alpha = gamma at every step.
+#       - "linear_decay": alpha = gamma * (1 - t), more guidance early.
+#       - "linear_ramp": alpha = gamma * t, more guidance late.
+SCHEDULE: str = "linear_decay"
+
+# -----------------------------------------------------------------------------
+# GIF Animation (now supported via step_callback)
 # -----------------------------------------------------------------------------
 
 # :param GENERATE_GIF:
-#     GIF generation is disabled for HDC variant since sample_with_hdc()
-#     does not support step callbacks.
-GENERATE_GIF: bool = False
+#     Whether to generate animated GIFs showing the sampling trajectory.
+GENERATE_GIF: bool = True
 
 # -----------------------------------------------------------------------------
 # Debug/Testing Modes
@@ -118,7 +162,7 @@ experiment = Experiment.extend(
 
 
 @experiment.hook("generate_edges", default=False, replace=True)
-def generate_edges_hdc(
+def generate_edges_hdc_guided(
     e: Experiment,
     decoder: FlowEdgeDecoder,
     hypernet: HyperNet,
@@ -134,26 +178,27 @@ def generate_edges_hdc(
     plots_dir: Path,
 ) -> Optional[List[Data]]:
     """
-    Generate edges using HDC distance tracking with early stopping.
+    Generate edges using soft HDC gradient guidance.
 
-    Calls ``decoder.sample_with_hdc()`` which tracks the best-seen edges
-    (lowest cosine distance to target HDC encoding) and early stops when
-    the distance is below the threshold.
+    Converts the decoded ``node_tuples`` to raw integer features for
+    codebook lookup, then calls
+    ``decoder.sample_with_soft_hdc_guidance()`` which computes a
+    differentiable soft HDC encoding at each timestep and uses the
+    gradient to steer sampling.
 
-    Requires that the decoded node count matches the original molecule's
-    node count, since HyperNet re-encoding during sampling needs the
-    original node features. Returns None (skip) on mismatch.
+    Unlike the old K-candidate approach, this does **not** require the
+    decoded node count to match the original molecule's node count.
 
     Args:
         e: Experiment instance.
         decoder: FlowEdgeDecoder model.
-        hypernet: HyperNet encoder for HDC distance computation.
+        hypernet: HyperNet encoder (for codebook and depth).
         hdc_vectors: Concatenated HDC vectors (1, 2*hdc_dim).
         node_features: One-hot node features (1, n, 24).
         node_mask: Valid node mask (1, n).
-        node_tuples: Decoded node tuples.
+        node_tuples: Decoded node tuples [(atom, deg, chg, hs, ring), ...].
         num_nodes: Number of decoded nodes.
-        original_data: Original PyG Data with raw node features.
+        original_data: Original PyG Data (unused by soft approach).
         base_hdc_dim: Base hypervector dimension.
         device: Device for computation.
         idx: Current molecule index.
@@ -162,43 +207,46 @@ def generate_edges_hdc(
     Returns:
         List of generated PyG Data objects, or None to skip this molecule.
     """
-    # Check node count match (required for HyperNet re-encoding)
-    original_num_nodes = original_data.x.shape[0]
-    if num_nodes != original_num_nodes:
-        e.log(f"  WARNING: Node count mismatch ({num_nodes} decoded vs {original_num_nodes} original), skipping...")
-        return None
-
-    # Use original node features for HyperNet encoding during sampling
-    original_x_for_hypernet = original_data.x.unsqueeze(0)
+    # Build raw_node_features from decoded node_tuples for codebook lookup
+    raw_node_features = torch.tensor(
+        [list(t) for t in node_tuples],
+        dtype=torch.float32,
+        device=device,
+    ).unsqueeze(0)  # (1, n, 5)
 
     with torch.no_grad():
-        generated_samples = decoder.sample_with_hdc(
+        generated_samples = decoder.sample_with_soft_hdc_guidance(
             hdc_vectors=hdc_vectors,
             node_features=node_features,
             node_mask=node_mask,
-            original_node_features=original_x_for_hypernet,
             hypernet=hypernet,
-            distance_threshold=e.DISTANCE_THRESHOLD,
+            raw_node_features=raw_node_features,
+            gamma=e.GAMMA,
+            tau=e.TAU,
+            integration_mode=e.INTEGRATION_MODE,
+            schedule=e.SCHEDULE,
             eta=e.ETA,
             omega=e.OMEGA,
             sample_steps=e.SAMPLE_STEPS,
             time_distortion=e.SAMPLE_TIME_DISTORTION,
             noise_type_override=e.NOISE_TYPE_OVERRIDE,
-            show_progress=True,
+            show_progress=False,
+            deterministic=e.DETERMINISTIC,
+            device=device,
         )
 
     return generated_samples
 
 
 @experiment.hook("create_summary_visualization", default=False, replace=True)
-def create_summary_visualization_hdc(
+def create_summary_visualization_guided(
     e: Experiment,
     match_count: int,
     valid_count: int,
     invalid_count: int,
     total_count: int,
 ) -> None:
-    """Create summary visualization with HDC-specific title."""
+    """Create summary visualization with soft HDC-guided-specific title."""
     from graph_hdc.utils.experiment_helpers import create_summary_bar_chart
 
     if total_count > 0:
@@ -209,7 +257,7 @@ def create_summary_visualization_hdc(
             invalid_count=invalid_count,
             total_count=total_count,
             save_path=summary_plot_path,
-            title_prefix="HDC Early-Stop",
+            title_prefix="Soft HDC-Guided",
         )
         e.log(f"Summary chart saved to: {summary_plot_path}")
 
@@ -221,11 +269,14 @@ def create_summary_visualization_hdc(
 
 @experiment.testing
 def testing(e: Experiment) -> None:
-    """Quick test mode with reduced parameters for HDC variant."""
+    """Quick test mode with reduced parameters for soft HDC-guided variant."""
     e.SAMPLE_STEPS = 10
     e.SMILES_LIST = ["CCO", "CC=O"]
     e.DATASET = "zinc"
-    e.DISTANCE_THRESHOLD = 0.5  # Higher threshold for faster testing
+    e.GAMMA = 0.5
+    e.TAU = 0.5
+    e.INTEGRATION_MODE = "blend"
+    e.SCHEDULE = "linear_decay"
     e.GENERATE_GIF = False
 
 

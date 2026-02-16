@@ -31,9 +31,11 @@ from graph_hdc.models.flow_edge_decoder import (
     NODE_FEATURE_DIM,
     NODE_FEATURE_BINS,
     NUM_EDGE_CLASSES,
+    get_node_feature_bins,
     node_tuple_to_onehot,
     node_tuples_to_onehot,
     raw_features_to_onehot,
+    onehot_to_raw_features,
 )
 
 __all__ = [
@@ -64,7 +66,9 @@ __all__ = [
     "NODE_FEATURE_DIM",
     "NODE_FEATURE_BINS",
     "NUM_EDGE_CLASSES",
+    "get_node_feature_bins",
     "node_tuple_to_onehot",
     "node_tuples_to_onehot",
     "raw_features_to_onehot",
+    "onehot_to_raw_features",
 ]

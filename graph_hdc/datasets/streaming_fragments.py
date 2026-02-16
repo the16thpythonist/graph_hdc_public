@@ -23,13 +23,15 @@ from torch import Tensor
 from torch_geometric.data import Batch, Data
 from tqdm.auto import tqdm
 
-from graph_hdc.utils.helpers import scatter_hd
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # BRICS compatibility rules: which isotope labels can connect
 # Based on RDKit BRICS.py environsTable
+# Label 0 is a universal wildcard used for enumerated attachment points
+# (positions added by enumerate_attachment_positions, not from BRICS cuts).
+_BRICS_LABELS = range(0, 17)
 BRICS_COMPATIBLE_PAIRS = {
     (1, 3), (1, 5), (1, 10),
     (2, 12), (2, 14), (2, 16),
@@ -48,11 +50,105 @@ BRICS_COMPATIBLE_PAIRS = {
     (15, 3), (15, 5), (15, 6), (15, 8), (15, 9), (15, 10), (15, 11), (15, 13), (15, 14), (15, 15), (15, 16),
     (16, 2), (16, 3), (16, 5), (16, 6), (16, 8), (16, 9), (16, 10), (16, 11), (16, 13), (16, 14), (16, 15), (16, 16),
 }
+# Add universal wildcard pairs: label 0 is compatible with every label (both directions)
+for _label in _BRICS_LABELS:
+    BRICS_COMPATIBLE_PAIRS.add((0, _label))
+    BRICS_COMPATIBLE_PAIRS.add((_label, 0))
 
 
 def _brics_compatible(iso1: int, iso2: int) -> bool:
     """Check if two BRICS attachment points are compatible."""
     return (iso1, iso2) in BRICS_COMPATIBLE_PAIRS
+
+
+# Universal wildcard label for enumerated attachment points.
+# Unlike BRICS labels 1-16 which encode specific retrosynthetic bond environments,
+# label 0 is compatible with every other label, allowing new attachment points to
+# bond freely. Valence correctness is enforced by SanitizeMol at combination time.
+WILDCARD_LABEL = 0
+
+
+def enumerate_attachment_positions(
+    frag: Chem.Mol,
+    max_new_points: int = 3,
+) -> List[Chem.Mol]:
+    """
+    Generate fragment variants with attachment points at additional H-bearing positions.
+
+    For each hydrogen-bearing non-dummy atom that doesn't already have an attachment
+    point, creates a new fragment variant with a dummy atom (*) at that position.
+    Only single-site additions are generated (one new * per variant).
+
+    New attachment points use the universal wildcard label (0) which is compatible
+    with all BRICS labels. This avoids the problem of environment-specific labels
+    being too restrictive (e.g. label 1 for aliphatic C only connects to 3 partners).
+
+    Variants are deduplicated by canonical SMILES to avoid redundant entries from
+    symmetric positions (e.g. equivalent carbons on a cyclohexane ring).
+
+    Args:
+        frag: A BRICS fragment (Mol with existing dummy atoms).
+        max_new_points: Maximum number of unique variants to return.
+            If there are more candidate positions than this, a random subset is chosen
+            (after deduplication).
+
+    Returns:
+        List of new fragment Mol variants (does NOT include the original).
+    """
+    # Find atoms that already neighbor a dummy atom — skip these
+    existing_attachment_neighbors = set()
+    for atom in frag.GetAtoms():
+        if atom.GetSymbol() == "*":
+            for nbr in atom.GetNeighbors():
+                existing_attachment_neighbors.add(nbr.GetIdx())
+
+    # Find candidate positions: H-bearing, non-dummy, not already an attachment site
+    candidates = []
+    for atom in frag.GetAtoms():
+        if atom.GetSymbol() == "*":
+            continue
+        if atom.GetIdx() in existing_attachment_neighbors:
+            continue
+        if atom.GetTotalNumHs() == 0:
+            continue
+        candidates.append(atom.GetIdx())
+
+    if not candidates:
+        return []
+
+    # Generate all variants first, then deduplicate
+    seen_smiles = set()
+    variants = []
+    for target_idx in candidates:
+        try:
+            rw = Chem.RWMol(frag)
+            # Add a dummy atom with universal wildcard label
+            dummy_idx = rw.AddAtom(Chem.Atom(0))  # atomic num 0 = *
+            rw.GetAtomWithIdx(dummy_idx).SetIsotope(WILDCARD_LABEL)
+            # Bond it to the target atom (single bond)
+            rw.AddBond(target_idx, dummy_idx, Chem.BondType.SINGLE)
+            # Reduce hydrogen count on target atom
+            target_atom = rw.GetAtomWithIdx(target_idx)
+            n_explicit = target_atom.GetNumExplicitHs()
+            if n_explicit > 0:
+                target_atom.SetNumExplicitHs(n_explicit - 1)
+            else:
+                target_atom.SetNoImplicit(False)
+            mol = rw.GetMol()
+            Chem.SanitizeMol(mol)
+            # Deduplicate by canonical SMILES
+            canon = Chem.MolToSmiles(mol)
+            if canon not in seen_smiles:
+                seen_smiles.add(canon)
+                variants.append(mol)
+        except Exception:
+            continue
+
+    # Subsample if too many unique variants
+    if len(variants) > max_new_points:
+        variants = random.sample(variants, max_new_points)
+
+    return variants
 
 
 def _get_attachment_points(mol: Chem.Mol) -> List[Tuple[int, int, int]]:
@@ -296,6 +392,9 @@ class FragmentLibrary:
         self,
         min_atoms: int = 2,
         max_atoms: int = 30,
+        remove_hydrogens: bool = True,
+        remove_stereo: bool = True,
+        remove_charges: bool = False,
     ):
         """
         Initialize fragment library.
@@ -303,11 +402,40 @@ class FragmentLibrary:
         Args:
             min_atoms: Minimum fragment size to keep
             max_atoms: Maximum fragment size to keep
+            remove_hydrogens: Remove explicit hydrogens from fragments
+            remove_stereo: Remove all stereochemistry (chiral centers and E/Z)
+            remove_charges: Remove formal charges; discard fragments that fail
+                sanitization after charge removal
         """
         self.min_atoms = min_atoms
         self.max_atoms = max_atoms
+        self.remove_hydrogens = remove_hydrogens
+        self.remove_stereo = remove_stereo
+        self.remove_charges = remove_charges
         self.fragments: List[str] = []  # Store as SMILES for memory efficiency
         self._fragment_mols: Optional[List[Chem.Mol]] = None  # Lazy cache
+
+    def _clean_fragment(self, mol: Chem.Mol) -> Optional[Chem.Mol]:
+        """
+        Apply configured cleaning steps to a fragment molecule.
+
+        Returns cleaned Mol or None if the fragment becomes invalid.
+        """
+        if self.remove_hydrogens:
+            mol = Chem.RemoveHs(mol)
+
+        if self.remove_stereo:
+            Chem.RemoveStereochemistry(mol)
+
+        if self.remove_charges:
+            for atom in mol.GetAtoms():
+                atom.SetFormalCharge(0)
+            try:
+                Chem.SanitizeMol(mol)
+            except Exception:
+                return None
+
+        return mol
 
     def build_from_dataset(
         self,
@@ -351,6 +479,10 @@ class FragmentLibrary:
                     if frag_mol is None:
                         continue
 
+                    frag_mol = self._clean_fragment(frag_mol)
+                    if frag_mol is None:
+                        continue
+
                     n_atoms = frag_mol.GetNumAtoms()
                     if self.min_atoms <= n_atoms <= self.max_atoms:
                         # Check all atoms are in the supported set
@@ -359,7 +491,9 @@ class FragmentLibrary:
                             for atom in frag_mol.GetAtoms()
                         )
                         if valid:
-                            fragment_set.add(frag_smiles)
+                            # Re-canonicalize after cleaning
+                            clean_smiles = Chem.MolToSmiles(frag_mol)
+                            fragment_set.add(clean_smiles)
             except Exception as e:
                 logger.debug(f"BRICS decomposition failed for {smiles}: {e}")
                 continue
@@ -376,6 +510,9 @@ class FragmentLibrary:
         state = {
             "min_atoms": self.min_atoms,
             "max_atoms": self.max_atoms,
+            "remove_hydrogens": self.remove_hydrogens,
+            "remove_stereo": self.remove_stereo,
+            "remove_charges": self.remove_charges,
             "fragments": self.fragments,
         }
         with open(path, "wb") as f:
@@ -391,9 +528,48 @@ class FragmentLibrary:
         library = cls(
             min_atoms=state["min_atoms"],
             max_atoms=state["max_atoms"],
+            remove_hydrogens=state.get("remove_hydrogens", True),
+            remove_stereo=state.get("remove_stereo", True),
+            remove_charges=state.get("remove_charges", True),
         )
         library.fragments = state["fragments"]
         return library
+
+    def expand_with_enumerated_positions(self, max_new_points: int = 3) -> int:
+        """
+        Expand the library by enumerating new attachment positions on existing fragments.
+
+        For each fragment, generates variants with additional attachment points at
+        H-bearing positions using the universal wildcard label. Variants are
+        deduplicated against the existing library and against each other.
+
+        Args:
+            max_new_points: Maximum number of new variants to generate per fragment.
+
+        Returns:
+            Number of new fragments added.
+        """
+        existing = set(self.fragments)
+        new_fragments = []
+
+        for smiles in self.fragments:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue
+            variants = enumerate_attachment_positions(mol, max_new_points=max_new_points)
+            for v in variants:
+                v_smiles = Chem.MolToSmiles(v)
+                if v_smiles not in existing:
+                    existing.add(v_smiles)
+                    new_fragments.append(v_smiles)
+
+        self.fragments.extend(new_fragments)
+        self._fragment_mols = None  # Reset cache
+        logger.info(
+            f"Expanded fragment library with {len(new_fragments)} enumerated variants "
+            f"(total: {len(self.fragments)})"
+        )
+        return len(new_fragments)
 
     def _get_fragment_mols(self) -> List[Chem.Mol]:
         """Get cached fragment Mol objects."""
@@ -537,14 +713,21 @@ def _worker_process(
     log_msg("Starting worker process...")
 
     try:
-        # Import HyperNet here to avoid import issues in main process
-        from graph_hdc.hypernet.encoder import HyperNet
+        from graph_hdc.hypernet import load_hypernet
 
         log_msg(f"Loading HyperNet from {hypernet_checkpoint_path}")
-
-        # Load HyperNet on CPU
-        hypernet = HyperNet.load(hypernet_checkpoint_path, device="cpu")
+        hypernet = load_hypernet(hypernet_checkpoint_path, device="cpu")
         hypernet.eval()
+
+        # Check if RW augmentation is needed
+        _use_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
+        if _use_rw:
+            from graph_hdc.utils.rw_features import augment_data_with_rw
+            _rw_k = hypernet.rw_config.k_values
+            _rw_bins = hypernet.rw_config.num_bins
+            _rw_boundaries = hypernet.rw_config.bin_boundaries
+            log_msg(f"RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, "
+                    f"quantile={'yes' if _rw_boundaries else 'no'}")
 
         log_msg(f"HyperNet loaded successfully (batch_size={encoding_batch_size})")
 
@@ -556,6 +739,8 @@ def _worker_process(
 
     iteration = 0
     retry_count = 0
+    sanitize_fail_count = 0  # Molecules that failed RDKit SanitizeMol
+    disconnected_count = 0   # Molecules with disconnected components
 
     log_msg("Worker ready, starting generation loop")
 
@@ -600,6 +785,17 @@ def _worker_process(
                 if "." in smiles:
                     t1 = time_module.perf_counter()
                     profile_validation += t1 - t0
+                    disconnected_count += 1
+                    retry_count += 1
+                    continue
+
+                # Verify chemical validity
+                try:
+                    Chem.SanitizeMol(mol)
+                except Exception:
+                    t1 = time_module.perf_counter()
+                    profile_validation += t1 - t0
+                    sanitize_fail_count += 1
                     retry_count += 1
                     continue
                 t1 = time_module.perf_counter()
@@ -630,6 +826,18 @@ def _worker_process(
                 t1 = time_module.perf_counter()
                 profile_conversion += t1 - t0
 
+                # Augment with RW features if needed
+                if _use_rw:
+                    zinc_data = augment_data_with_rw(zinc_data, k_values=_rw_k, num_bins=_rw_bins, bin_boundaries=_rw_boundaries)
+                    # Extend flow_data node features with one-hot RW bins
+                    rw_bin_cols = zinc_data.x[:, 5:]  # (n, len(k_values))
+                    rw_onehot_parts = []
+                    for col_idx in range(rw_bin_cols.size(1)):
+                        rw_onehot_parts.append(
+                            F.one_hot(rw_bin_cols[:, col_idx].long(), num_classes=_rw_bins).float()
+                        )
+                    flow_data.x = torch.cat([flow_data.x] + rw_onehot_parts, dim=-1)
+
                 # Add to batch
                 zinc_data_list.append(zinc_data)
                 flow_data_list.append(flow_data)
@@ -640,24 +848,13 @@ def _worker_process(
             # === Batched HyperNet encoding ===
             t0 = time_module.perf_counter()
             with torch.no_grad():
-                # Create batched data
+                # Create batched data and encode
                 zinc_batch = Batch.from_data_list(zinc_data_list)
-
-                # Encode node properties
-                zinc_batch = hypernet.encode_properties(zinc_batch)
-
-                # Order-0: Bundle node hypervectors per graph
-                order_zero = scatter_hd(
-                    src=zinc_batch.node_hv,
-                    index=zinc_batch.batch,
-                    op="bundle"
-                )
-
-                # Order-N: Full graph embedding with message passing
                 hdc_out = hypernet.forward(zinc_batch)
-                order_n = hdc_out["graph_embedding"]
 
-                # Concatenate [order_0 | order_N] for each graph
+                # Concatenate [node_terms | graph_embedding] for each graph
+                order_zero = hdc_out["node_terms"]
+                order_n = hdc_out["graph_embedding"]
                 hdc_vectors = torch.cat([order_zero, order_n], dim=-1).float()
 
             t1 = time_module.perf_counter()
@@ -711,11 +908,15 @@ def _worker_process(
                     pct_ser = 100 * profile_serialize / total_time
                     pct_queue = 100 * profile_queue / total_time
                     samples_per_sec = iteration / total_time if total_time > 0 else 0
+                    total_attempts = iteration + retry_count
                     log_msg(
                         f"Generated {iteration} samples, {retry_count} retries, {samples_per_sec:.1f} samples/sec\n"
                         f"  Fragment+BRICS: {pct_frag:.1f}% | Validation: {pct_val:.1f}% | "
                         f"Conversion: {pct_conv:.1f}% | HDC: {pct_hdc:.1f}% | "
-                        f"Serialize: {pct_ser:.1f}% | Queue: {pct_queue:.1f}%"
+                        f"Serialize: {pct_ser:.1f}% | Queue: {pct_queue:.1f}%\n"
+                        f"  Rejected: {disconnected_count} disconnected, "
+                        f"{sanitize_fail_count} invalid "
+                        f"({100 * (disconnected_count + sanitize_fail_count) / max(total_attempts, 1):.1f}% of attempts)"
                     )
 
         except Exception as e:
