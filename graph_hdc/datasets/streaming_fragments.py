@@ -61,6 +61,40 @@ def _brics_compatible(iso1: int, iso2: int) -> bool:
     return (iso1, iso2) in BRICS_COMPATIBLE_PAIRS
 
 
+def strip_dummy_atoms(mol: Chem.Mol) -> Optional[Chem.Mol]:
+    """Remove dummy (``*``) atoms from a fragment, returning a sanitized molecule.
+
+    BRICS fragments retain ``*`` atoms at cut points.  Stripping them and
+    re-sanitizing allows single-fragment molecules to be used as valid small
+    molecules in the training pipeline.
+
+    Returns ``None`` if the result is invalid (disconnected, too small, or
+    fails sanitization).
+    """
+    dummy_indices = sorted(
+        [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0],
+        reverse=True,  # remove from end to preserve earlier indices
+    )
+    if not dummy_indices:
+        return mol  # no dummies to strip
+    rw = Chem.RWMol(mol)
+    for idx in dummy_indices:
+        rw.RemoveAtom(idx)
+    try:
+        result = rw.GetMol()
+        Chem.SanitizeMol(result)
+        if result.GetNumAtoms() < 2:
+            return None
+        smiles = Chem.MolToSmiles(result)
+        if "." in smiles:
+            return None  # disconnected
+        # Round-trip through SMILES to force consistent aromaticity/kekulization
+        result = Chem.MolFromSmiles(smiles)
+        return result
+    except Exception:
+        return None
+
+
 # Universal wildcard label for enumerated attachment points.
 # Unlike BRICS labels 1-16 which encode specific retrosynthetic bond environments,
 # label 0 is compatible with every other label, allowing new attachment points to
@@ -221,6 +255,8 @@ def fast_combine_two_fragments(frag1: Chem.Mol, frag2: Chem.Mol) -> Optional[Che
     try:
         mol = edit_mol.GetMol()
         Chem.SanitizeMol(mol)
+        # Round-trip through SMILES to force consistent aromaticity/kekulization
+        mol = Chem.MolFromSmiles(Chem.MolToSmiles(mol))
         return mol
     except Exception:
         return None
@@ -616,7 +652,7 @@ class FragmentLibrary:
         if len(fragments) == 0:
             return None
         if len(fragments) == 1:
-            return fragments[0]
+            return strip_dummy_atoms(fragments[0])
 
         # Sequentially combine fragments using fast manual approach
         result = fragments[0]
@@ -706,6 +742,9 @@ def _worker_process(
     import sys
     import time as time_module
 
+    from rdkit import RDLogger as _RDLogger
+    _RDLogger.DisableLog('rdApp.*')
+
     def log_msg(msg: str) -> None:
         """Print to stderr for reliable subprocess logging."""
         print(f"[Worker {worker_id}] {msg}", file=sys.stderr, flush=True)
@@ -726,8 +765,9 @@ def _worker_process(
             _rw_k = hypernet.rw_config.k_values
             _rw_bins = hypernet.rw_config.num_bins
             _rw_boundaries = hypernet.rw_config.bin_boundaries
-            log_msg(f"RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, "
-                    f"quantile={'yes' if _rw_boundaries else 'no'}")
+            _rw_clip_range = hypernet.rw_config.clip_range
+            bin_mode = "quantile" if _rw_boundaries else ("clipped" if _rw_clip_range else "uniform")
+            log_msg(f"RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, mode={bin_mode}")
 
         log_msg(f"HyperNet loaded successfully (batch_size={encoding_batch_size})")
 
@@ -828,7 +868,7 @@ def _worker_process(
 
                 # Augment with RW features if needed
                 if _use_rw:
-                    zinc_data = augment_data_with_rw(zinc_data, k_values=_rw_k, num_bins=_rw_bins, bin_boundaries=_rw_boundaries)
+                    zinc_data = augment_data_with_rw(zinc_data, k_values=_rw_k, num_bins=_rw_bins, bin_boundaries=_rw_boundaries, clip_range=_rw_clip_range)
                     # Extend flow_data node features with one-hot RW bins
                     rw_bin_cols = zinc_data.x[:, 5:]  # (n, len(k_values))
                     rw_onehot_parts = []
@@ -1066,6 +1106,15 @@ class StreamingFragmentDataset(torch.utils.data.IterableDataset):
 
         # Create and start workers using the context's Process
         self._workers = []
+        # Hide GPU from worker processes — they only need CPU for HDC encoding.
+        # We set CUDA_VISIBLE_DEVICES before spawning so that the child
+        # processes inherit the empty value and never initialise a CUDA
+        # context (~300-500 MB VRAM per process).  The parent's value is
+        # restored immediately after all workers have been started.
+        import os
+        _prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
         for i in range(self.num_workers):
             worker = ctx.Process(
                 target=_worker_process,
@@ -1085,6 +1134,12 @@ class StreamingFragmentDataset(torch.utils.data.IterableDataset):
             )
             worker.start()
             self._workers.append(worker)
+
+        # Restore parent's CUDA visibility
+        if _prev_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _prev_cuda
 
         logger.info(f"Started {self.num_workers} workers")
         print(f"[StreamingDataset] Started {self.num_workers} workers (encoding_batch_size={self.encoding_batch_size})", flush=True)

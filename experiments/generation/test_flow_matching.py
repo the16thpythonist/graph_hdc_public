@@ -59,6 +59,7 @@ from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.models.flow_edge_decoder import (
     FlowEdgeDecoder,
     NODE_FEATURE_DIM,
+    get_node_feature_bins,
     node_tuples_to_onehot,
 )
 from graph_hdc.models.flow_matching import FlowMatchingModel, build_condition
@@ -113,7 +114,7 @@ NUM_REPETITIONS: int = 64
 
 # :param SAMPLE_STEPS:
 #     Number of ODE steps for FlowEdgeDecoder discrete flow sampling.
-SAMPLE_STEPS: int = 100
+SAMPLE_STEPS: int = 50
 
 # :param ETA:
 #     Stochasticity parameter for FlowEdgeDecoder sampling.
@@ -129,7 +130,7 @@ SAMPLE_TIME_DISTORTION: str = "polydec"
 
 # :param FM_SAMPLE_STEPS:
 #     Number of ODE steps for FlowMatchingModel sampling.
-FM_SAMPLE_STEPS: int = 1_000
+FM_SAMPLE_STEPS: int = 2_500
 
 # -----------------------------------------------------------------------------
 # Conditioning (optional)
@@ -166,6 +167,16 @@ DATASET_SUBSAMPLE: int = 1000
 # :param DEVICE:
 #     Device for model inference. "auto" prefers GPU.
 DEVICE: str = "cuda"
+
+# :param HDC_DEVICE:
+#     Device for the HyperNet HDC encoder. Options: "auto" (prefer GPU),
+#     "cpu", "cuda".
+HDC_DEVICE: str = "cpu"
+
+# :param RUN_DIAGNOSTIC:
+#     Whether to run the norm-decay diagnostic on real encoded molecules
+#     before generation. Useful for debugging but adds startup time.
+RUN_DIAGNOSTIC: bool = False
 
 # :param PLOT_NORM_DECAY:
 #     Save per-sample residual norm decay plots during node decoding.
@@ -581,9 +592,12 @@ def experiment(e: Experiment) -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(e.DEVICE)
-    hdc_device = torch.device("cpu")
+    if e.HDC_DEVICE == "auto":
+        hdc_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        hdc_device = torch.device(e.HDC_DEVICE)
     e.log(f"Decoder device: {device}")
-    e.log(f"HyperNet device: {hdc_device} (always CPU)")
+    e.log(f"HyperNet device: {hdc_device}")
 
     # =========================================================================
     # Step 1: Load Models
@@ -596,6 +610,7 @@ def experiment(e: Experiment) -> None:
 
     hypernet.to(hdc_device)
     hypernet.eval()
+    e.log(str(hypernet))
     decoder.to(device)
     decoder.eval()
     flow_model.to(device)
@@ -608,41 +623,58 @@ def experiment(e: Experiment) -> None:
     # Step 1b: Diagnostic — norm decay on real encoded molecules
     # =========================================================================
 
-    e.log("\n" + "=" * 60)
-    e.log("Diagnostic: norm decay on real encoded molecules")
-    e.log("=" * 60)
+    if e.RUN_DIAGNOSTIC:
+        e.log("\n" + "=" * 60)
+        e.log("Diagnostic: norm decay on real encoded molecules")
+        e.log("=" * 60)
 
-    from graph_hdc.datasets.utils import get_split
-    from torch_geometric.data import Batch as PyGBatch
+        from graph_hdc.datasets.utils import get_split
+        from torch_geometric.data import Batch as PyGBatch
 
-    ref_dataset = get_split("train", dataset=e.DATASET)
-    n_diag = min(20, len(ref_dataset))
-    diag_indices = torch.randperm(len(ref_dataset))[:n_diag].tolist()
-    diag_data = [ref_dataset[i] for i in diag_indices]
+        ref_dataset = get_split("train", dataset=e.DATASET)
+        n_diag = min(20, len(ref_dataset))
+        diag_indices = torch.randperm(len(ref_dataset))[:n_diag].tolist()
+        diag_data = [ref_dataset[i] for i in diag_indices]
 
-    ref_norm_histories: List[List[float]] = []
-    with torch.no_grad():
-        batch = PyGBatch.from_data_list(diag_data).to(hdc_device)
-        enc_out = hypernet.forward(batch)
-        node_terms = enc_out["node_terms"].cpu()
-        graph_emb = enc_out["graph_embedding"].cpu()
+        ref_norm_histories: List[List[float]] = []
+        with torch.no_grad():
+            # Augment with RW features if the hypernet expects them
+            if hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled:
+                from graph_hdc.utils.rw_features import augment_data_with_rw
+                diag_data = [
+                    augment_data_with_rw(
+                        d.clone(),
+                        k_values=hypernet.rw_config.k_values,
+                        num_bins=hypernet.rw_config.num_bins,
+                        bin_boundaries=hypernet.rw_config.bin_boundaries,
+                        clip_range=hypernet.rw_config.clip_range,
+                    )
+                    for d in diag_data
+                ]
 
-        for i in range(n_diag):
-            hdc_vec = torch.cat([node_terms[i], graph_emb[i]], dim=-1)
-            _, _, norms, _ = decode_nodes_from_hdc(
-                hypernet, hdc_vec.unsqueeze(0), base_hdc_dim, debug=True
-            )
-            ref_norm_histories.append(norms)
-            smiles = diag_data[i].smiles if hasattr(diag_data[i], "smiles") else "?"
-            e.log(
-                f"  Real mol {i}: {smiles:30s}  "
-                f"init_norm={norms[0]:.2f}  final_norm={norms[-1]:.2f}  "
-                f"nodes_decoded={len(norms)-1}"
-            )
+            batch = PyGBatch.from_data_list(diag_data).to(hdc_device)
+            enc_out = hypernet.forward(batch)
+            node_terms = enc_out["node_terms"].cpu()
+            graph_emb = enc_out["graph_embedding"].cpu()
 
-    diag_path = Path(e.path) / "norm_decay_reference.png"
-    plot_norm_decay(ref_norm_histories, diag_path)
-    e.log(f"  Reference norm decay saved: {diag_path}")
+            for i in range(n_diag):
+                hdc_vec = torch.cat([node_terms[i], graph_emb[i]], dim=-1)
+                _, _, norms, _ = decode_nodes_from_hdc(
+                    hypernet, hdc_vec.unsqueeze(0), base_hdc_dim, debug=True
+                )
+                ref_norm_histories.append(norms)
+                smiles = diag_data[i].smiles if hasattr(diag_data[i], "smiles") else "?"
+                e.log(
+                    f"  Real mol {i}: {smiles:30s}  "
+                    f"init_norm={norms[0]:.2f}  final_norm={norms[-1]:.2f}  "
+                    f"nodes_decoded={len(norms)-1}"
+                )
+
+        diag_path = Path(e.path) / "norm_decay_reference.png"
+        plot_norm_decay(ref_norm_histories, diag_path)
+        e.log(f"  Reference norm decay saved: {diag_path}")
+    else:
+        e.log("\nDiagnostic skipped (RUN_DIAGNOSTIC=False)")
 
     # =========================================================================
     # Step 2: Sample HDC Vectors
@@ -708,7 +740,8 @@ def experiment(e: Experiment) -> None:
             continue
 
         # 3b. Convert node tuples to one-hot features
-        node_features = node_tuples_to_onehot(node_tuples, device=device).unsqueeze(0)
+        feature_bins = get_node_feature_bins(hypernet.rw_config)
+        node_features = node_tuples_to_onehot(node_tuples, device=device, feature_bins=feature_bins).unsqueeze(0)
         node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=device)
         hdc_vec_device = hdc_vector.unsqueeze(0).to(device)
 
@@ -732,7 +765,7 @@ def experiment(e: Experiment) -> None:
                         hypernet, device, dataset=e.DATASET,
                     )
 
-                best_sample, best_distance = decoder.sample_best_of_n(
+                best_sample, best_distance, _avg_distance = decoder.sample_best_of_n(
                     hdc_vectors=hdc_vec_device,
                     node_features=node_features,
                     node_mask=node_mask,

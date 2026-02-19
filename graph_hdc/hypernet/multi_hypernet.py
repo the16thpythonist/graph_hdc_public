@@ -77,6 +77,30 @@ class MultiHyperNet(pl.LightningModule):
         self._hypernets = hypernets
         self._primary = hypernets[0]
 
+    def __str__(self) -> str:
+        lines = [
+            f"MultiHyperNet(",
+            f"  num_hypernets={self.num_hypernets},",
+            f"  hv_dim={self.hv_dim}, ensemble_graph_dim={self.ensemble_graph_dim},",
+            f"  dataset={self.base_dataset}, depth={self.depth},",
+            f"  sub-HyperNet dims={[hn.hv_dim for hn in self._hypernets]},",
+            f"  primary: {type(self._primary).__name__},",
+        ]
+        # Include primary's codebook info
+        lines.append(
+            f"  nodes_codebook: {self.nodes_codebook.shape[0]} entries x {self.nodes_codebook.shape[1]} dim,"
+        )
+        if hasattr(self._primary, "nodes_codebook_full"):
+            cb_full = self._primary.nodes_codebook_full
+            lines.append(
+                f"  nodes_codebook_full (RRWP): {cb_full.shape[0]} entries x {cb_full.shape[1]} dim,"
+            )
+        lines.append(")")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
     @classmethod
     def from_config(
         cls,
@@ -265,6 +289,11 @@ class MultiHyperNet(pl.LightningModule):
             Same object with ``node_hv`` (and optionally ``edge_hv``) set.
         """
         return self._primary.encode_properties(data)
+
+    def rebuild_unpruned_codebook(self) -> None:
+        """Rebuild the full unpruned codebook for every sub-HyperNet."""
+        for hn in self._hypernets:
+            hn.rebuild_unpruned_codebook()
 
     def forward(
         self,
@@ -518,6 +547,7 @@ class MultiHyperNet(pl.LightningModule):
                         "k_values": hn.rw_config.k_values,
                         "num_bins": hn.rw_config.num_bins,
                         "bin_boundaries": hn.rw_config.bin_boundaries,
+                        "clip_range": hn.rw_config.clip_range,
                     },
                     "codebooks": {
                         "nodes_full": hn.nodes_codebook_full.cpu(),

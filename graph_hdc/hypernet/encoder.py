@@ -153,6 +153,7 @@ class HyperNet(pl.LightningModule):
         self._dtype = torch.float64 if config.dtype == "float64" else torch.float32
         self.rw_config: RWConfig = config.rw_config
         self.prune_codebook: bool = config.prune_codebook
+        self.normalize_graph_embedding: bool = getattr(config, "normalize_graph_embedding", False)
 
         # Set seed for reproducible codebook generation
         if self.seed is not None:
@@ -176,6 +177,30 @@ class HyperNet(pl.LightningModule):
         # Decoding parameters (dataset-dependent)
         self._decoding_edge_limit = MAX_ALLOWED_DECODING_EDGES_QM9 if self.base_dataset == "qm9" else MAX_ALLOWED_DECODING_EDGES_ZINC
         self._max_step_delta: float | None = None
+
+    def __str__(self) -> str:
+        lines = [
+            f"{type(self).__name__}(",
+            f"  vsa={self.vsa.value}, hv_dim={self.hv_dim}, depth={self.depth},",
+            f"  dataset={self.base_dataset}, normalize={self.normalize},",
+            f"  dtype={self._dtype},",
+            f"  nodes_codebook: {self.nodes_codebook.shape[0]} entries x {self.nodes_codebook.shape[1]} dim,",
+        ]
+        if hasattr(self, "nodes_indexer") and hasattr(self.nodes_indexer, "sizes"):
+            lines.append(f"  node_feature_bins={self.nodes_indexer.sizes},")
+        if hasattr(self, "edge_feature_codebook") and self.edge_feature_codebook is not None:
+            lines.append(
+                f"  edge_codebook: {self.edge_feature_codebook.shape[0]} entries x {self.edge_feature_codebook.shape[1]} dim,"
+            )
+        else:
+            lines.append("  edge_codebook: not initialized,")
+        lines.append(f"  rw_config: enabled={self.rw_config.enabled},")
+        lines.append(f"  prune_codebook={self.prune_codebook},")
+        lines.append(")")
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return self.__str__()
 
     def _validate_vsa(self, vsa: VSAModel) -> VSAModel:
         """Validate VSA model is supported."""
@@ -218,6 +243,54 @@ class HyperNet(pl.LightningModule):
         for _, (enc, _) in self.node_encoder_map.items():
             enc.codebook = self.nodes_codebook
             enc.indexer = self.nodes_indexer
+
+    def rebuild_unpruned_codebook(self) -> None:
+        """Rebuild the full unpruned codebook from the original seed.
+
+        When a HyperNet was saved with ``prune_codebook=True``, the
+        encoder codebook and indexer only cover feature tuples observed
+        during training.  This method regenerates the full codebook
+        (using the stored seed for reproducibility) so that *any* valid
+        feature tuple can be encoded.
+        """
+        device = self.nodes_codebook.device
+        # Use the HyperNet-level dtype (correctly saved/loaded) rather
+        # than the encoder's dtype attribute which may be wrong in old
+        # checkpoints that didn't serialize it.
+        dtype_str = "float64" if self._dtype == torch.float64 else "float32"
+
+        # Regenerate the full codebook with the exact same seed state
+        # that was used during __init__: seed is set, then the node
+        # encoder codebook is the first random draw.
+        torch.manual_seed(self.seed)
+
+        for _feat, (enc, _idx_range) in self.node_encoder_map.items():
+            # Fix the encoder's dtype to match the HyperNet (may differ
+            # in old checkpoints where dtype wasn't serialized).
+            enc.dtype = dtype_str
+            # Regenerate original full-size codebook (uses num_categories
+            # which is never modified by pruning)
+            enc.codebook = enc.generate_codebook().to(device)
+            # Rebuild the full Cartesian-product indexer from the stored
+            # bin sizes (also unmodified by pruning)
+            enc.indexer = TupleIndexer(enc.indexer.sizes)
+
+        # Rebuild the top-level nodes codebook / indexer
+        node_codebooks = [e.codebook for e, _ in self.node_encoder_map.values()]
+        self.nodes_codebook = cartesian_bind_tensor(node_codebooks).to(device)
+
+        enc0 = self.node_encoder_map[Features.NODE_FEATURES][0]
+        if isinstance(enc0, CombinatoricIntegerEncoder):
+            self.nodes_indexer = enc0.indexer
+        else:
+            sizes = [e.num_categories for e, _ in self.node_encoder_map.values()]
+            self.nodes_indexer = TupleIndexer(sizes)
+
+        # Invalidate cached edges codebook (depends on nodes_codebook)
+        self._edges_codebook = None
+        self._edges_indexer = None
+
+        self.prune_codebook = False
 
 
     def _build_codebooks(
@@ -414,6 +487,8 @@ class HyperNet(pl.LightningModule):
         node_hv = torchhd.multibundle(node_hv_stack)
         node_terms = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
         graph_embedding = scatter_hd(src=node_hv, index=data.batch, op="bundle")
+        if self.normalize_graph_embedding:
+            graph_embedding = graph_embedding / (graph_embedding.norm(dim=-1, keepdim=True) + 1e-8)
         edge_terms = scatter_hd(src=edge_terms, index=data.batch, op="bundle")
 
         return {
@@ -1628,6 +1703,7 @@ class HyperNet(pl.LightningModule):
                     "num_bins": self.rw_config.num_bins,
                 },
                 "prune_codebook": self.prune_codebook,
+                "normalize_graph_embedding": self.normalize_graph_embedding,
             },
             "encoder_maps": {
                 "node": self._serialize_encoder_map(self.node_encoder_map),
@@ -1658,6 +1734,7 @@ class HyperNet(pl.LightningModule):
                     "vsa": encoder.vsa,
                     "num_categories": encoder.num_categories,
                     "idx_offset": encoder.idx_offset,
+                    "dtype": encoder.dtype,
                 },
                 "index_range": idx_range,
                 "codebook": encoder.codebook.cpu(),
@@ -1703,6 +1780,7 @@ class HyperNet(pl.LightningModule):
         rw_dict = cfg.get("rw_config")
         instance.rw_config = RWConfig(**rw_dict) if rw_dict else RWConfig()
         instance.prune_codebook = cfg.get("prune_codebook", True)
+        instance.normalize_graph_embedding = cfg.get("normalize_graph_embedding", False)
         instance._decoding_edge_limit = 50 if instance.base_dataset == "qm9" else 122
         instance._max_step_delta = None
 

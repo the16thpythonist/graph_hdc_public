@@ -61,14 +61,14 @@ HV_DIMS: list[int] = [512, 768, 1024, 1536, 2048]
 #     Dataset name for evaluation. Supported: "qm9", "zinc".
 BASE_DATASET: str = "zinc"
 
-# :param SUBSAMPLE_RATIO:
-#     Fraction of each split to evaluate on (0, 1]. Default 1 uses the full
-#     dataset. E.g. 0.1 randomly samples 10% of each split.
-SUBSAMPLE_RATIO: float = 0.2
+# :param SAMPLES_PER_SPLIT:
+#     Number of molecules to randomly sample from each split. Set to 0 to
+#     use the full split.
+SAMPLES_PER_SPLIT: int = 1000
 
 # :param BATCH_SIZE:
 #     Batch size for batched HDC encoding during evaluation.
-BATCH_SIZE: int = 128
+BATCH_SIZE: int = 256
 
 # :param DEVICE:
 #     Device for HDC encoding. Set to "auto" (default) to pick CUDA if
@@ -89,12 +89,12 @@ USE_RW: bool = True
 # :param RW_K_VALUES:
 #     Random walk steps at which to compute return probabilities. Only used
 #     when USE_RW is True.
-RW_K_VALUES: tuple[int, ...] = (3, 6)
+RW_K_VALUES: tuple[int, ...] = (2, 6, 16)
 
 # :param RW_NUM_BINS:
 #     Number of uniform bins for discretising RW return probabilities on [0,1].
 #     Only used when USE_RW is True.
-RW_NUM_BINS: int = 10
+RW_NUM_BINS: int = 6
 
 # :param PRUNE_CODEBOOK:
 #     Whether to prune the HDC codebook to only feature tuples observed in the
@@ -201,7 +201,7 @@ def experiment(e: Experiment) -> None:
     e.log(f"Dataset: {e.BASE_DATASET}")
     e.log(f"Use RW features: {e.USE_RW}")
     e.log(f"Codebook pruning: {e.PRUNE_CODEBOOK}")
-    e.log(f"Subsample ratio: {e.SUBSAMPLE_RATIO}")
+    e.log(f"Samples per split: {e.SAMPLES_PER_SPLIT or 'all'}")
 
     rw_config = RWConfig(
         enabled=e.USE_RW,
@@ -218,9 +218,8 @@ def experiment(e: Experiment) -> None:
         ds = list(get_split(split, dataset=e.BASE_DATASET))
         if e.__TESTING__:
             ds = ds[:100]
-        elif e.SUBSAMPLE_RATIO < 1.0:
-            n = max(1, int(len(ds) * e.SUBSAMPLE_RATIO))
-            ds = _random.sample(ds, n)
+        elif e.SAMPLES_PER_SPLIT > 0 and len(ds) > e.SAMPLES_PER_SPLIT:
+            ds = _random.sample(ds, e.SAMPLES_PER_SPLIT)
         datasets[split] = ds
         e.log(f"  {split}: {len(ds)} samples")
 
@@ -235,7 +234,7 @@ def experiment(e: Experiment) -> None:
         for split, ds in datasets.items():
             for data in tqdm(ds, desc=f"  Scanning {split}", disable=not e.__DEBUG__):
                 d = data.clone()
-                d = augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries)
+                d = augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, clip_range=rw_config.clip_range)
                 for row in d.x.int():
                     observed_node_features.add(tuple(row.tolist()))
         e.log(f"  Found {len(observed_node_features)} unique node feature tuples (with RW)")
@@ -281,7 +280,7 @@ def experiment(e: Experiment) -> None:
                 if rw_config.enabled:
                     data_list = batch.to_data_list()
                     data_list = [
-                        augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries)
+                        augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, clip_range=rw_config.clip_range)
                         for d in data_list
                     ]
                     batch = Batch.from_data_list(data_list)

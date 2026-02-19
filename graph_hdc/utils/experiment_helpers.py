@@ -118,6 +118,7 @@ def load_or_create_encoder(
     rw_config=None,
     prune_codebook: bool = True,
     use_rrwp_hypernet: bool = False,
+    normalize_graph_embedding: bool = False,
 ) -> HyperNet:
     """
     Load encoder from checkpoint or create a new one.
@@ -134,6 +135,7 @@ def load_or_create_encoder(
         prune_codebook: Whether to prune the codebook to observed tuples.
         use_rrwp_hypernet: When True, create RRWPHyperNet instead of HyperNet.
                           Requires rw_config to be enabled.
+        normalize_graph_embedding: Whether to L2-normalize graph embeddings.
 
     Returns:
         HyperNet encoder instance (in eval mode)
@@ -154,6 +156,7 @@ def load_or_create_encoder(
         config = create_config_with_rw(
             dataset.lower(), hv_dim, rw_config=rw_config, hypernet_depth=depth,
             prune_codebook=prune_codebook,
+            device=str(device),
         )
         if use_rrwp_hypernet:
             from graph_hdc.hypernet.rrwp_hypernet import RRWPHyperNet
@@ -167,6 +170,7 @@ def load_or_create_encoder(
         hypernet = HyperNet(config)
         hypernet = hypernet.to(device)
 
+    hypernet.normalize_graph_embedding = normalize_graph_embedding
     hypernet.eval()
     return hypernet
 
@@ -636,6 +640,7 @@ def compute_hdc_distance(
                 k_values=hypernet.rw_config.k_values,
                 num_bins=hypernet.rw_config.num_bins,
                 bin_boundaries=hypernet.rw_config.bin_boundaries,
+                clip_range=hypernet.rw_config.clip_range,
             )
 
         with torch.no_grad():
@@ -676,6 +681,7 @@ class ReconstructionVisualizationCallback(Callback):
         hypernet: Optional[HyperNet] = None,
         num_repetitions: int = 1,
         dataset: str = "zinc",
+        label: str = "",
     ):
         """
         Initialize the visualization callback.
@@ -690,6 +696,8 @@ class ReconstructionVisualizationCallback(Callback):
             hypernet: Optional HyperNet encoder for computing HDC cosine distance
             num_repetitions: Number of parallel decodings per molecule (best-of-N)
             dataset: Dataset type for HDC distance computation ("zinc" or "qm9")
+            label: Optional label prefix for tracked metric names and figure title.
+                When non-empty, metrics are tracked as ``{label}/metric_name``.
         """
         super().__init__()
         self.experiment = experiment
@@ -701,6 +709,7 @@ class ReconstructionVisualizationCallback(Callback):
         self.hypernet = hypernet
         self.num_repetitions = num_repetitions
         self.dataset = dataset
+        self.label = label
 
     def on_validation_epoch_end(
         self,
@@ -764,6 +773,9 @@ class ReconstructionVisualizationCallback(Callback):
                     base_hdc_dim = orig_hdc.size(-1) // 2
 
                     raw_x = getattr(self.vis_samples[i], "original_x", None)
+                    if raw_x is None:
+                        # vis_samples[i].x is raw features from the dataset
+                        raw_x = self.vis_samples[i].x
 
                     def score_fn(s, _orig=orig_hdc, _dim=base_hdc_dim, _raw_x=raw_x):
                         return compute_hdc_distance(
@@ -772,7 +784,7 @@ class ReconstructionVisualizationCallback(Callback):
                             original_x=_raw_x,
                         )
 
-                    best_sample, best_dist = pl_module.sample_best_of_n(
+                    best_sample, best_dist, _avg_dist = pl_module.sample_best_of_n(
                         hdc_vectors=hdc_vec,
                         node_features=nf,
                         node_mask=mask,
@@ -843,6 +855,7 @@ class ReconstructionVisualizationCallback(Callback):
                                 k_values=self.hypernet.rw_config.k_values,
                                 num_bins=self.hypernet.rw_config.num_bins,
                                 bin_boundaries=self.hypernet.rw_config.bin_boundaries,
+                                clip_range=self.hypernet.rw_config.clip_range,
                             )
                         recon_out = self.hypernet.forward(recon_data, normalize=True)
                         recon_emb = recon_out["graph_embedding"]
@@ -904,13 +917,14 @@ class ReconstructionVisualizationCallback(Callback):
                     recon_smiles = "Invalid"
 
             truncated_recon = recon_smiles[:20] + ("..." if len(recon_smiles) > 20 else "")
-            label = f"Recon (Tan={similarities[i]:.3f}"
+            cell_label = f"Recon (Tan={similarities[i]:.3f}"
             if hdc_cosine_distances:
-                label += f", HDC={hdc_cosine_distances[i]:.3f}"
-            label += f")\n{truncated_recon}"
-            axes[1, i].set_title(label, fontsize=8)
+                cell_label += f", HDC={hdc_cosine_distances[i]:.3f}"
+            cell_label += f")\n{truncated_recon}"
+            axes[1, i].set_title(cell_label, fontsize=8)
 
-        title = f"Validation Reconstructions (Epoch {trainer.current_epoch}, Avg Tanimoto: {avg_similarity:.3f}"
+        title_prefix = f"{self.label} — " if self.label else ""
+        title = f"{title_prefix}Validation Reconstructions (Epoch {trainer.current_epoch}, Avg Tanimoto: {avg_similarity:.3f}"
         if avg_hdc_cosine is not None:
             title += f", Avg HDC Cos: {avg_hdc_cosine:.3f}"
         title += ")"
@@ -918,10 +932,11 @@ class ReconstructionVisualizationCallback(Callback):
         plt.tight_layout()
 
         # Track figure and metric with PyComex
-        self.experiment.track("validation_reconstructions", fig)
-        self.experiment.track("tanimoto_similarity", avg_similarity)
+        metric_prefix = f"{self.label}_" if self.label else ""
+        self.experiment.track(f"{metric_prefix}validation_reconstructions", fig)
+        self.experiment.track(f"{metric_prefix}tanimoto_similarity", avg_similarity)
         if avg_hdc_cosine is not None:
-            self.experiment.track("hdc_cosine_similarity", avg_hdc_cosine)
+            self.experiment.track(f"{metric_prefix}hdc_cosine_similarity", avg_hdc_cosine)
 
         plt.close(fig)
 

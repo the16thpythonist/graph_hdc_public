@@ -366,8 +366,9 @@ ZINC_EDGE_DECODER_CONFIG = FlowEdgeDecoderConfig(
 class EdgeOnlyLoss(nn.Module):
     """Cross-entropy loss for edges only (nodes are fixed)."""
 
-    def __init__(self):
+    def __init__(self, per_sample_average: bool = False):
         super().__init__()
+        self.per_sample_average = per_sample_average
 
     def forward(
         self,
@@ -397,13 +398,19 @@ class EdgeOnlyLoss(nn.Module):
         if not edge_mask.any():
             return torch.tensor(0.0, device=pred_E.device, requires_grad=True)
 
-        # Flatten and select valid edges
-        pred_flat = pred_E[edge_mask]  # (num_valid, de)
-        true_flat = true_E[edge_mask]  # (num_valid, de)
+        log_probs = F.log_softmax(pred_E, dim=-1)
+        per_edge_loss = -(true_E * log_probs).sum(dim=-1)  # (bs, n, n)
+        per_edge_loss = per_edge_loss * edge_mask.float()  # zero out invalid
 
-        # Cross-entropy with soft targets
-        log_probs = F.log_softmax(pred_flat, dim=-1)
-        loss = -(true_flat * log_probs).sum(dim=-1).mean()
+        if self.per_sample_average:
+            # Average per-molecule first, then across batch
+            # This ensures small molecules contribute equally to the gradient
+            edges_per_mol = edge_mask.sum(dim=(1, 2)).float().clamp(min=1)  # (bs,)
+            per_mol_loss = per_edge_loss.sum(dim=(1, 2)) / edges_per_mol  # (bs,)
+            loss = per_mol_loss.mean()
+        else:
+            # Flat mean over all valid edges in the batch
+            loss = per_edge_loss.sum() / edge_mask.sum().float().clamp(min=1)
 
         return loss
 
@@ -625,9 +632,10 @@ class FlowEdgeDecoder(pl.LightningModule):
         cross_attn_heads: int = 4,
         node_hdc_embed_dim: int = 0,
         nodes_codebook: Optional[Tensor] = None,
+        size_edge_marginals: Optional[Tensor] = None,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["nodes_codebook"])
+        self.save_hyperparameters(ignore=["nodes_codebook", "size_edge_marginals"])
 
         # Store dimensions
         self.num_node_classes = num_node_classes
@@ -690,6 +698,14 @@ class FlowEdgeDecoder(pl.LightningModule):
             node_marginals=node_marginals,
             edge_marginals=edge_marginals,
         )
+
+        # Per-size edge marginals lookup table
+        if size_edge_marginals is not None:
+            self.register_buffer("size_edge_marginals", size_edge_marginals)
+        else:
+            # Fallback: repeat global marginals for all sizes (backward compatible)
+            fallback = edge_marginals.unsqueeze(0).expand(max_nodes + 1, -1).clone()
+            self.register_buffer("size_edge_marginals", fallback)
 
         # Node distribution for graph sizes
         self.node_dist = DistributionNodes(node_counts)
@@ -909,10 +925,26 @@ class FlowEdgeDecoder(pl.LightningModule):
         # ExtraFeatures expects a dict with X_t, E_t, y_t, node_mask
         return self.extra_features(noisy_data)
 
+    def _get_per_sample_marginals(self, node_mask: Tensor) -> Tensor:
+        """
+        Look up size-conditional edge marginals for each sample in the batch.
+
+        Args:
+            node_mask: Valid node mask (bs, n)
+
+        Returns:
+            Per-sample marginals shaped (bs, 1, 1, de) for broadcasting
+        """
+        sizes = node_mask.sum(dim=1).long()  # (bs,)
+        sizes = sizes.clamp(max=self.size_edge_marginals.size(0) - 1)
+        marginals = self.size_edge_marginals[sizes]  # (bs, de)
+        return marginals.unsqueeze(1).unsqueeze(1)  # (bs, 1, 1, de)
+
     def _p_Et_given_E1(
         self,
         E_1_label: Tensor,
         t: Tensor,
+        per_sample_marginals: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Compute p(E_t | E_1) for edge noise interpolation.
@@ -920,6 +952,8 @@ class FlowEdgeDecoder(pl.LightningModule):
         Args:
             E_1_label: Clean edge labels (bs, n, n)
             t: Timestep (bs, 1)
+            per_sample_marginals: Optional (bs, 1, 1, de) size-conditional
+                marginals. If None, uses the global limit distribution.
 
         Returns:
             Probability distribution over edge classes (bs, n, n, de)
@@ -931,8 +965,11 @@ class FlowEdgeDecoder(pl.LightningModule):
         # One-hot encode E_1
         E_1_onehot = F.one_hot(E_1_label, num_classes=de).float()
 
-        # Get limit distribution
-        limit_E = self.limit_dist.E.to(device)
+        # Get limit distribution — per-sample if available, else global
+        if per_sample_marginals is not None:
+            limit_E = per_sample_marginals.to(device)  # (bs, 1, 1, de)
+        else:
+            limit_E = self.limit_dist.E.to(device)  # (de,)
 
         # Reshape t for broadcasting: (bs, 1, 1, 1)
         t_time = t.view(bs, 1, 1, 1)
@@ -975,9 +1012,10 @@ class FlowEdgeDecoder(pl.LightningModule):
         # Nodes: NO NOISE - keep clean
         X_t = X
 
-        # Edges: Apply noise interpolation
+        # Edges: Apply noise interpolation (using size-conditional marginals)
         E_1_label = torch.argmax(E, dim=-1)  # (bs, n, n)
-        prob_E_t = self._p_Et_given_E1(E_1_label, t_float)
+        per_sample_marginals = self._get_per_sample_marginals(node_mask)
+        prob_E_t = self._p_Et_given_E1(E_1_label, t_float, per_sample_marginals)
 
         # Sample noisy edges
         prob_E_flat = prob_E_t.reshape(-1, self.num_edge_classes)
@@ -1310,17 +1348,25 @@ class FlowEdgeDecoder(pl.LightningModule):
         num_samples = hdc_vectors.size(0)
         n_max = X.size(1)
 
+        # Compute size-conditional marginals for the batch and swap into
+        # rate_matrix_designer so denoising dynamics match the initial noise
+        per_sample_marginals = self._get_per_sample_marginals(node_mask)  # (bs, 1, 1, de)
+        batch_marginals = per_sample_marginals.squeeze(1).squeeze(1).mean(dim=0)  # (de,)
+        saved_limit_E = self.rate_matrix_designer.limit_dist.E
+        if original_limit_dist is None:
+            # Only swap if not already overridden by noise_type_override
+            self.rate_matrix_designer.limit_dist.E = batch_marginals.to(device)
+
         # Initialize edges: use provided initial_edges or sample noise
         edge_mask = node_mask.unsqueeze(2) & node_mask.unsqueeze(1)
         if initial_edges is not None:
             E = initial_edges.to(device).float()
             E = E * edge_mask.unsqueeze(-1).float()
         else:
-            # Sample initial noise for edges only (using possibly overridden limit dist)
-            e_limit = sampling_limit_dist.E.to(device)
-            e_probs = e_limit.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(
+            # Sample initial noise per-sample using size-conditional marginals
+            e_probs = per_sample_marginals.expand(
                 num_samples, n_max, n_max, -1
-            )
+            )  # (bs, n_max, n_max, de)
             prob_E_flat = e_probs.reshape(-1, self.num_edge_classes)
             E_label_flat = torch.multinomial(prob_E_flat, 1).squeeze(-1)
             E_label = E_label_flat.reshape(num_samples, n_max, n_max)
@@ -1377,9 +1423,11 @@ class FlowEdgeDecoder(pl.LightningModule):
         n_nodes = node_mask.sum(dim=1).int()
         samples = dense_to_pyg(X, E, torch.zeros_like(y[:, :0]), node_mask, n_nodes)
 
-        # Restore original limit_dist if it was overridden
+        # Restore limit_dist state
         if original_limit_dist is not None:
             self.rate_matrix_designer.limit_dist = original_limit_dist
+        else:
+            self.rate_matrix_designer.limit_dist.E = saved_limit_E
 
         return samples
 
@@ -1391,7 +1439,7 @@ class FlowEdgeDecoder(pl.LightningModule):
         num_repetitions: int,
         score_fn: Callable[[Data], float],
         **sample_kwargs,
-    ) -> Tuple[Data, float]:
+    ) -> Tuple[Data, float, float]:
         """
         Generate edges N times in parallel and keep the best result.
 
@@ -1412,7 +1460,7 @@ class FlowEdgeDecoder(pl.LightningModule):
                 match ``num_repetitions``.
 
         Returns:
-            Tuple of (best_sample, best_score).
+            Tuple of (best_sample, best_score, avg_score).
         """
         # Expand single molecule to num_repetitions copies
         batch_hdc = hdc_vectors.expand(num_repetitions, -1)
@@ -1437,9 +1485,12 @@ class FlowEdgeDecoder(pl.LightningModule):
         best_idx = int(min(range(num_repetitions), key=lambda i: scores[i]))
         best_sample = all_samples[best_idx]
         best_score = scores[best_idx]
+        # Compute average over finite scores (inf means encoding failed)
+        finite_scores = [s for s in scores if s != float("inf")]
+        avg_score = sum(finite_scores) / len(finite_scores) if finite_scores else float("inf")
         # Free non-selected GPU samples
         del all_samples, scores
-        return best_sample, best_score
+        return best_sample, best_score, avg_score
 
     # =========================================================================
     # HDC-Guided Sampling Methods
@@ -2362,6 +2413,18 @@ class FlowEdgeDecoder(pl.LightningModule):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         hparams = checkpoint["hyper_parameters"]
 
+        # Restore nodes_codebook from state_dict — it is excluded from
+        # save_hyperparameters to avoid duplication, but the constructor
+        # asserts its presence when node_hdc_embed_dim > 0.
+        if hparams.get("node_hdc_embed_dim", 0) > 0:
+            hparams["nodes_codebook"] = checkpoint["state_dict"]["_nodes_codebook"]
+
+        # Restore size_edge_marginals from state_dict if present (excluded
+        # from save_hyperparameters).  Old checkpoints won't have it — the
+        # constructor will create a fallback table from global marginals.
+        if "size_edge_marginals" in checkpoint["state_dict"]:
+            hparams["size_edge_marginals"] = checkpoint["state_dict"]["size_edge_marginals"]
+
         model = cls(**hparams)
         model.load_state_dict(checkpoint["state_dict"])
 
@@ -2426,7 +2489,7 @@ def preprocess_for_flow_edge_decoder(
         rw_probs = compute_rw_return_probabilities(
             data.edge_index, data.x.size(0), rw_config.k_values,
         )
-        rw_binned = bin_rw_probabilities(rw_probs, rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, k_values=rw_config.k_values)
+        rw_binned = bin_rw_probabilities(rw_probs, rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, k_values=rw_config.k_values, clip_range=rw_config.clip_range)
         raw_feats = torch.cat([raw_feats, rw_binned], dim=-1)
 
     x_onehot = raw_features_to_onehot(raw_feats, feature_bins=feature_bins)
@@ -2568,6 +2631,65 @@ def compute_edge_marginals(data_list: List[Data]) -> Tensor:
     # Normalize
     marginals = edge_counts / edge_counts.sum()
     return marginals
+
+
+def compute_size_edge_marginals(
+    data_list: List[Data],
+    max_size: int,
+    min_molecules_per_size: int = 50,
+) -> Tensor:
+    """
+    Compute per-size edge marginals from preprocessed data.
+
+    Groups molecules by atom count and computes separate marginals for each
+    size.  Sizes with fewer than ``min_molecules_per_size`` molecules fall
+    back to the global marginal to avoid noisy estimates.
+
+    Args:
+        data_list: List of preprocessed Data objects
+        max_size: Maximum molecule size (table rows = max_size + 1)
+        min_molecules_per_size: Minimum molecule count to trust per-size
+            marginals.  Sizes below this threshold use the global marginal.
+
+    Returns:
+        Tensor of shape (max_size + 1, 5) with per-size edge class
+        probabilities.
+    """
+    # Accumulate per-size edge counts
+    size_edge_counts = torch.zeros(max_size + 1, NUM_EDGE_CLASSES)
+    size_mol_counts = torch.zeros(max_size + 1, dtype=torch.long)
+
+    for data in data_list:
+        n = data.x.size(0)
+        if n > max_size:
+            continue
+
+        size_mol_counts[n] += 1
+
+        if data.edge_attr is not None:
+            edge_types = data.edge_attr.argmax(dim=-1)
+            for et in edge_types:
+                size_edge_counts[n, et] += 1
+
+        all_pairs = n * (n - 1)
+        actual_edges = data.edge_index.size(1)
+        no_edge_count = all_pairs - actual_edges
+        size_edge_counts[n, 0] += no_edge_count
+
+    # Global marginal as fallback
+    global_counts = size_edge_counts.sum(dim=0)
+    global_marginals = global_counts / global_counts.sum().clamp(min=1)
+
+    # Build per-size marginals with fallback
+    size_marginals = torch.zeros(max_size + 1, NUM_EDGE_CLASSES)
+    for s in range(max_size + 1):
+        if size_mol_counts[s] >= min_molecules_per_size:
+            row_sum = size_edge_counts[s].sum()
+            size_marginals[s] = size_edge_counts[s] / row_sum.clamp(min=1)
+        else:
+            size_marginals[s] = global_marginals
+
+    return size_marginals
 
 
 def compute_node_counts(data_list: List[Data]) -> Tensor:

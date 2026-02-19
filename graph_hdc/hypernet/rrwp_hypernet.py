@@ -216,6 +216,34 @@ class RRWPHyperNet(HyperNet):
 
         return result
 
+    def __str__(self) -> str:
+        lines = [
+            f"{type(self).__name__}(",
+            f"  vsa={self.vsa.value}, hv_dim={self.hv_dim}, depth={self.depth},",
+            f"  dataset={self.base_dataset}, normalize={self.normalize},",
+            f"  dtype={self._dtype},",
+            f"  nodes_codebook (base): {self.nodes_codebook.shape[0]} entries x {self.nodes_codebook.shape[1]} dim,",
+        ]
+        if hasattr(self, "nodes_indexer") and hasattr(self.nodes_indexer, "sizes"):
+            lines.append(f"  base_feature_bins={self.nodes_indexer.sizes},")
+        lines.append(
+            f"  nodes_codebook_full (base+RRWP): {self.nodes_codebook_full.shape[0]} entries x {self.nodes_codebook_full.shape[1]} dim,"
+        )
+        lines.append(f"  full_feature_bins={self._full_bins},")
+        rw = self.rw_config
+        lines.append(
+            f"  rw_config: k_values={rw.k_values}, num_bins={rw.num_bins},"
+        )
+        if hasattr(self, "edge_feature_codebook") and self.edge_feature_codebook is not None:
+            lines.append(
+                f"  edge_codebook: {self.edge_feature_codebook.shape[0]} entries x {self.edge_feature_codebook.shape[1]} dim,"
+            )
+        else:
+            lines.append("  edge_codebook: not initialized,")
+        lines.append(f"  prune_codebook={self.prune_codebook},")
+        lines.append(")")
+        return "\n".join(lines)
+
     @property
     def order_zero_codebook(self):
         """Codebook used for order-0 (node_terms) decoding (full: base + RRWP)."""
@@ -362,6 +390,7 @@ class RRWPHyperNet(HyperNet):
                 "k_values": self.rw_config.k_values,
                 "num_bins": self.rw_config.num_bins,
                 "bin_boundaries": self.rw_config.bin_boundaries,
+                "clip_range": self.rw_config.clip_range,
             },
             "codebooks": {
                 "nodes_full": self.nodes_codebook_full.cpu(),

@@ -69,6 +69,7 @@ from graph_hdc.hypernet import load_hypernet
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.models.flow_edge_decoder import (
     FlowEdgeDecoder,
+    get_node_feature_bins,
     node_tuples_to_onehot,
 )
 from graph_hdc.utils.experiment_helpers import (
@@ -84,7 +85,6 @@ from graph_hdc.utils.experiment_helpers import (
     pyg_to_mol,
     smiles_to_pyg_data,
 )
-from graph_hdc.utils.helpers import scatter_hd
 
 
 # =============================================================================
@@ -241,7 +241,7 @@ SMILES_LIST: list[str] = [
 # :param SAMPLE_STEPS:
 #     Number of denoising steps during discrete flow matching sampling.
 #     Higher values give better results but are slower.
-SAMPLE_STEPS: int = 100
+SAMPLE_STEPS: int = 50
 
 # :param ETA:
 #     Stochasticity parameter for sampling. 0.0 = deterministic CTMC.
@@ -272,7 +272,7 @@ DETERMINISTIC: bool = False
 #     Number of independent edge generation attempts per molecule.
 #     When > 1, each attempt is scored by HDC cosine distance to the
 #     original order_N embedding, and the best result is kept.
-NUM_REPETITIONS: int = 64
+NUM_REPETITIONS: int = 128
 
 # :param INIT_MODE:
 #     Initialization mode for the edge matrix at the start of sampling.
@@ -314,8 +314,13 @@ SEED: int = 42
 
 # :param DEVICE:
 #     Device for the FlowEdgeDecoder inference. Options: "auto" (prefer GPU),
-#     "cpu", "cuda". The HyperNet encoder always runs on CPU.
+#     "cpu", "cuda".
 DEVICE: str = "cuda"
+
+# :param HDC_DEVICE:
+#     Device for the HyperNet HDC encoder. Options: "auto" (prefer GPU),
+#     "cpu", "cuda".
+HDC_DEVICE: str = "cuda"
 
 # -----------------------------------------------------------------------------
 # Debug/Testing Modes
@@ -651,14 +656,17 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
     e.log_parameters()
 
-    # Device setup: decoder runs on DEVICE, HyperNet always on CPU
+    # Device setup
     if e.DEVICE == "auto":
         decoder_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         decoder_device = torch.device(e.DEVICE)
-    hdc_device = torch.device("cpu")
+    if e.HDC_DEVICE == "auto":
+        hdc_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        hdc_device = torch.device(e.HDC_DEVICE)
     e.log(f"Decoder device: {decoder_device}")
-    e.log(f"HyperNet device: {hdc_device} (always CPU)")
+    e.log(f"HyperNet device: {hdc_device}")
     e["config/device"] = str(decoder_device)
 
     # =========================================================================
@@ -757,19 +765,21 @@ def experiment(e: Experiment) -> None:
         data = data.to(hdc_device)
         data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device=hdc_device)
 
+        # Augment with RW features if the hypernet expects them
+        if hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled:
+            from graph_hdc.utils.rw_features import augment_data_with_rw
+            data = augment_data_with_rw(
+                data,
+                k_values=hypernet.rw_config.k_values,
+                num_bins=hypernet.rw_config.num_bins,
+                bin_boundaries=hypernet.rw_config.bin_boundaries,
+                clip_range=hypernet.rw_config.clip_range,
+            )
+
         # Encode with HyperNet - compute concatenated [order_0 | order_N]
         with torch.no_grad():
-            data = hypernet.encode_properties(data)
-
-            # Ensure node_hv is on correct device
-            if data.node_hv.device != hdc_device:
-                data.node_hv = data.node_hv.to(hdc_device)
-
-            # Order-0: Bundle node hypervectors (no message passing)
-            order_zero = scatter_hd(src=data.node_hv, index=data.batch, op="bundle")
-
-            # Order-N: Full graph embedding with message passing
             encoder_output = hypernet.forward(data, normalize=True)
+            order_zero = encoder_output["node_terms"]
             order_n = encoder_output["graph_embedding"]
 
             # Concatenate [order_0 | order_N]
@@ -797,7 +807,8 @@ def experiment(e: Experiment) -> None:
             continue
 
         # Prepare inputs for edge generation (on decoder device)
-        node_features = node_tuples_to_onehot(node_tuples, device=decoder_device).unsqueeze(0)
+        feature_bins = get_node_feature_bins(hypernet.rw_config)
+        node_features = node_tuples_to_onehot(node_tuples, device=decoder_device, feature_bins=feature_bins).unsqueeze(0)
         node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=decoder_device)
         hdc_vectors = hdc_vector.unsqueeze(0).to(decoder_device)
 
@@ -1011,6 +1022,12 @@ def load_models(
         base_hdc_dim = hypernet.hv_dim
         e.log(f"  HyperNet hv_dim: {base_hdc_dim}")
 
+        # Rebuild full unpruned codebook so that any valid feature tuple
+        # can be encoded (not just the ones observed during training).
+        if hasattr(hypernet, "rebuild_unpruned_codebook"):
+            hypernet.rebuild_unpruned_codebook()
+            e.log("  Rebuilt unpruned codebook")
+
         e.log(f"Loading FlowEdgeDecoder from: {e.FLOW_DECODER_PATH}")
         decoder = FlowEdgeDecoder.load(e.FLOW_DECODER_PATH, device=device)
         e.log(f"  FlowEdgeDecoder hdc_dim: {decoder.hdc_dim}")
@@ -1126,7 +1143,12 @@ def generate_edges(
 
     if num_reps > 1:
         # ─── Batched best-of-N via sample_best_of_n ───
-        raw_x = getattr(original_data, "original_x", None)
+        # Use decoded node tuples as raw features for HDC distance computation.
+        # We cannot rely on onehot_to_raw_features(generated_data.x) because
+        # dense_to_pyg treats the 24-dim concatenated multi-feature one-hot as
+        # a single-class one-hot (argmax→one_hot), destroying all features
+        # except atom type.
+        raw_x = torch.tensor(node_tuples, dtype=torch.float)
 
         def score_fn(s):
             return compute_hdc_distance(
@@ -1136,7 +1158,7 @@ def generate_edges(
             )
 
         with torch.no_grad():
-            best_sample, best_distance = decoder.sample_best_of_n(
+            best_sample, best_distance, avg_distance = decoder.sample_best_of_n(
                 hdc_vectors=hdc_vectors,
                 node_features=node_features,
                 node_mask=node_mask,
@@ -1146,7 +1168,7 @@ def generate_edges(
             )
 
         best_samples = [best_sample]
-        e.log(f"  Best HDC distance across {num_reps} reps: {best_distance:.6f}")
+        e.log(f"  Best HDC distance across {num_reps} reps: {best_distance:.6f} (avg: {avg_distance:.6f})")
 
     else:
         # ─── Single repetition: preserve GIF / evolution grid support ───

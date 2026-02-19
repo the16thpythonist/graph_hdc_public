@@ -183,16 +183,26 @@ class TestFragmentLibraryCombination:
             smiles = Chem.MolToSmiles(result, canonical=True)
             assert "." not in smiles
 
-    def test_single_fragment_returned_as_is(self):
-        """Test that single fragment is returned unchanged."""
+    def test_single_fragment_returned_with_dummies_stripped(self):
+        """Test that single fragment has dummy atoms stripped."""
         library = FragmentLibrary()
         frag = Chem.MolFromSmiles("[1*]CC")
 
         result = library.combine_fragments([frag])
 
         assert result is not None
-        # Should be the same molecule
-        assert Chem.MolToSmiles(result) == Chem.MolToSmiles(frag)
+        # Dummy atoms should be removed
+        assert Chem.MolToSmiles(result) == "CC"
+
+    def test_single_fragment_without_dummies(self):
+        """Test that single fragment without dummies is returned as-is."""
+        library = FragmentLibrary()
+        frag = Chem.MolFromSmiles("CC")
+
+        result = library.combine_fragments([frag])
+
+        assert result is not None
+        assert Chem.MolToSmiles(result) == "CC"
 
     def test_empty_list_returns_none(self):
         """Test that empty fragment list returns None."""

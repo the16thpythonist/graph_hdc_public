@@ -38,6 +38,7 @@ from graph_hdc.datasets.utils import (
     get_split,
     post_compute_encodings,
 )
+from graph_hdc.hypernet import load_hypernet
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
 from graph_hdc.models.flow_matching import FlowMatchingModel, MultiCondition, build_condition
@@ -66,6 +67,16 @@ DATASET: str = "zinc"
 #     Path to a saved HyperNet encoder checkpoint (.ckpt). Required.
 ENCODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/hypernet_encoder.ckpt"
 
+# :param DEVICE:
+#     Device for model training and evaluation. Options: "auto" (prefer GPU),
+#     "cpu", "cuda".
+DEVICE: str = "cuda"
+
+# :param HDC_DEVICE:
+#     Device for the HyperNet HDC encoder (encoding step). Options: "auto"
+#     (prefer GPU), "cpu", "cuda".
+HDC_DEVICE: str = "cpu"
+
 # -----------------------------------------------------------------------------
 # Model Architecture
 # -----------------------------------------------------------------------------
@@ -76,7 +87,7 @@ HIDDEN_DIM: int = 512
 
 # :param NUM_BLOCKS:
 #     Number of residual FiLM blocks in the velocity MLP.
-NUM_BLOCKS: int = 8
+NUM_BLOCKS: int = 12
 
 # :param TIME_EMBED_DIM:
 #     Dimension of sinusoidal time embedding.
@@ -760,14 +771,24 @@ def experiment(e: Experiment) -> None:
     e.log(f"Training: {e.EPOCHS} epochs, batch size {e.BATCH_SIZE}")
     e.log("=" * 60)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    e.log(f"Device: {device}")
+    if e.DEVICE == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(e.DEVICE)
+
+    if e.HDC_DEVICE == "auto":
+        hdc_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        hdc_device = torch.device(e.HDC_DEVICE)
+
+    e.log(f"Device: {device}, HDC Device: {hdc_device}")
 
     # =========================================================================
     # Load encoder
     # =========================================================================
 
-    hypernet = e.apply_hook("load_encoder", device=device)
+    hypernet = e.apply_hook("load_encoder", device=hdc_device)
+    e.log(str(hypernet))
 
     hv_dim = hypernet.hv_dim
     if isinstance(hypernet, MultiHyperNet):
@@ -792,7 +813,7 @@ def experiment(e: Experiment) -> None:
     train_encoded, valid_encoded = e.apply_hook(
         "load_and_encode_data",
         hypernet=hypernet,
-        device=device,
+        device=hdc_device,
         conditioning=conditioning,
     )
 
@@ -902,7 +923,7 @@ def experiment(e: Experiment) -> None:
     logger = CSVLogger(e.path, name="logs")
     trainer = Trainer(
         max_epochs=e.EPOCHS,
-        accelerator="auto",
+        accelerator=device.type,
         devices=1,
         precision=e.PRECISION,
         callbacks=callbacks,
@@ -962,13 +983,7 @@ def experiment(e: Experiment) -> None:
 def load_encoder(e: Experiment, device: torch.device):
     """Load HyperNet or MultiHyperNet encoder from checkpoint."""
     if e.ENCODER_PATH and Path(e.ENCODER_PATH).exists():
-        # Peek at checkpoint to determine type
-        state = torch.load(e.ENCODER_PATH, map_location="cpu", weights_only=False)
-        if state.get("type") == "MultiHyperNet":
-            e.log("Detected MultiHyperNet checkpoint")
-            hypernet = MultiHyperNet.load(e.ENCODER_PATH, device=str(device))
-        else:
-            hypernet = HyperNet.load(e.ENCODER_PATH, device=str(device))
+        hypernet = load_hypernet(e.ENCODER_PATH, device=str(device))
     elif e.__TESTING__:
         # For testing: create a small encoder on-the-fly
         from graph_hdc.hypernet.configs import get_config

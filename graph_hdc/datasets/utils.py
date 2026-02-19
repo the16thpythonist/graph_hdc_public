@@ -218,9 +218,29 @@ def post_compute_encodings(
     hypernet = hypernet.to(device)
     hypernet.eval()
 
+    # Augment with RW features if the hypernet expects them
+    needs_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
+    if needs_rw:
+        from graph_hdc.utils.rw_features import augment_data_with_rw
+
     augmented: list[Data] = []
 
     for batch in tqdm(loader, desc="Encoding", unit="batch"):
+        if needs_rw:
+            data_list = batch.to_data_list()
+            data_list = [
+                augment_data_with_rw(
+                    d,
+                    k_values=hypernet.rw_config.k_values,
+                    num_bins=hypernet.rw_config.num_bins,
+                    bin_boundaries=hypernet.rw_config.bin_boundaries,
+                    clip_range=hypernet.rw_config.clip_range,
+                )
+                for d in data_list
+            ]
+            from torch_geometric.data import Batch as PyGBatch
+            batch = PyGBatch.from_data_list(data_list)
+
         batch = batch.to(device)
         out = hypernet.forward(batch, normalize=normalize_graph)
 
@@ -278,7 +298,7 @@ def scan_node_features_with_rw(
         ds = get_split(split=split, dataset=dataset_name)
         for data in tqdm(ds, desc=f"Scanning {split} with RW", unit="mol"):
             d = data.clone()
-            d = augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries)
+            d = augment_data_with_rw(d, k_values=rw_config.k_values, num_bins=rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, clip_range=rw_config.clip_range)
             for row in d.x.int():
                 node_features.add(tuple(row.tolist()))
             count += 1

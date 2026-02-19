@@ -53,6 +53,7 @@ from graph_hdc.datasets.utils import get_split
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.models.flow_edge_decoder import (
     compute_edge_marginals,
+    compute_size_edge_marginals,
     compute_node_counts,
     preprocess_dataset,
 )
@@ -78,7 +79,7 @@ HDC_CONFIG_PATH: str = ''
 # :param HDC_DIM:
 #     Hypervector dimension for the HyperNet encoder. Only used if HDC_CONFIG_PATH
 #     is empty. Typical values: 256, 512, 1024.
-HDC_DIM: int = 512
+HDC_DIM: int = 1024
 
 # :param HDC_DEPTH:
 #     Message passing depth for the HyperNet encoder. Only used if HDC_CONFIG_PATH
@@ -86,18 +87,34 @@ HDC_DIM: int = 512
 HDC_DEPTH: int = 8
 
 # :param USE_RW:
-#     Whether to augment HDC node features with random walk return probabilities.
+#     Whether to augment node features with random walk return probabilities.
 #     When True, each node's feature tuple is extended with binned RW return
-#     probabilities at each step in RW_K_VALUES, making the HDC conditioning
-#     vector more expressive about global graph topology. The FlowEdgeDecoder's
-#     24-dim one-hot node features are NOT affected — only the conditioning
-#     vector changes.
+#     probabilities at each step in RW_K_VALUES. This affects both the HDC
+#     conditioning vector and the FlowEdgeDecoder's one-hot node features
+#     (extended from 24-dim to 24 + RW_NUM_BINS * len(RW_K_VALUES)).
 USE_RW: bool = True
 
 # :param RW_K_VALUES:
 #     Random walk steps at which to compute return probabilities. Only used
 #     when USE_RW is True.
-RW_K_VALUES: tuple = (2, 4)
+RW_K_VALUES: tuple = (4, 6, 10, 16)
+
+# :param USE_QUANTILE_BINS:
+#     Whether to use precomputed quantile-based bin boundaries for RW features
+#     instead of uniform bins on [0,1]. Quantile binning distributes atoms
+#     equally across bins for each k value, avoiding the near-degenerate
+#     distributions that uniform binning produces at higher k (e.g. k=10 puts
+#     81% of atoms into bin 0 with uniform bins). Requires RW_NUM_BINS in
+#     {3, 4, 5, 6}. Only used when USE_RW is True.
+USE_QUANTILE_BINS: bool = True
+
+# :param RW_CLIP_RANGE:
+#     When set to a (lo, hi) tuple and USE_QUANTILE_BINS is False, uniform bins
+#     are placed over [lo, hi] instead of [0, 1]. Values outside this range are
+#     clamped to the first / last bin. This concentrates bin resolution in the
+#     region where most RW return probabilities fall. Ignored when
+#     USE_QUANTILE_BINS is True. Only used when USE_RW is True.
+RW_CLIP_RANGE: tuple | None = (0, 0.8)
 
 # :param RW_NUM_BINS:
 #     Number of uniform bins for discretising RW return probabilities on [0,1].
@@ -110,6 +127,14 @@ RW_NUM_BINS: int = 5
 #     False when training on generated molecules (e.g. streaming fragments) whose
 #     topology may produce novel feature combinations.
 PRUNE_CODEBOOK: bool = False
+
+# :param NORMALIZE_GRAPH_EMBEDDING:
+#     Whether to L2-normalize the graph embedding (order-N) output of each
+#     HyperNet before concatenation into the HDC conditioning vector. Without
+#     normalization, the embedding magnitude scales with ~sqrt(num_atoms),
+#     causing the decoder's conditioning signal to be systematically weaker
+#     for small molecules.
+NORMALIZE_GRAPH_EMBEDDING: bool = True
 
 # :param USE_RRWP_HYPERNET:
 #     When True (requires USE_RW=True), creates RRWPHyperNet which uses
@@ -126,7 +151,7 @@ USE_RRWP_HYPERNET: bool = True
 #     Seeds are auto-generated as SEED+0, SEED+1, etc.
 #     When empty/None, a single HyperNet with HDC_DIM/HDC_DEPTH is used instead.
 #     Example: [(256, 6), (512, 4), (256, 8)] creates 3 HyperNets.
-ENSEMBLE_CONFIGS: Optional[List[Tuple[int, int]]] = [(512, 8), (512, 4), (512, 2)]
+ENSEMBLE_CONFIGS: Optional[List[Tuple[int, int]]] = None
 
 # -----------------------------------------------------------------------------
 # Model Architecture (different from base)
@@ -288,12 +313,12 @@ NUM_VALIDATION_REPETITIONS: int = 10
 # :param RESUME_CHECKPOINT_PATH:
 #     Path to PyTorch Lightning checkpoint (.ckpt) to resume training from.
 #     If set, RESUME_ENCODER_PATH must also be provided.
-RESUME_CHECKPOINT_PATH: Optional[str] = None#"/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/started/last.ckpt"
+RESUME_CHECKPOINT_PATH: Optional[str] = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/last.ckpt"
 
 # :param RESUME_ENCODER_PATH:
 #     Path to HyperNet encoder checkpoint when resuming training.
 #     Required if RESUME_CHECKPOINT_PATH is set.
-RESUME_ENCODER_PATH: Optional[str] = None#"/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/started/hypernet_encoder.ckpt"
+RESUME_ENCODER_PATH: Optional[str] = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/hypernet_encoder.ckpt"
 
 # =============================================================================
 # STREAMING-SPECIFIC PARAMETERS (must be defined BEFORE Experiment.extend())
@@ -304,9 +329,10 @@ RESUME_ENCODER_PATH: Optional[str] = None#"/media/ssd2/Programming/graph_hdc_pub
 # -----------------------------------------------------------------------------
 
 # :param BUFFER_SIZE:
-#     Number of samples to keep in the streaming buffer. Larger buffers provide
-#     more diversity but use more memory.
-BUFFER_SIZE: int = 3000
+#     Number of samples to keep in the streaming buffer. Larger buffers smooth
+#     throughput by absorbing production/consumption rate mismatches, but use
+#     more memory.
+BUFFER_SIZE: int = 2000
 
 # :param NUM_FRAGMENT_WORKERS:
 #     Number of worker processes generating samples from fragments.
@@ -353,11 +379,11 @@ STEPS_PER_EPOCH: int = 1000
 #     Relative weight for small molecule samples in mixed streaming.
 #     Default 0.1 means ~10% of training samples come from small molecules.
 #     Set to 0.0 to disable small molecule mixing entirely.
-SMALL_MOL_MIXING_WEIGHT: float = 0.1
+SMALL_MOL_MIXING_WEIGHT: float = 0.2
 
 # :param FRAGMENT_MIXING_WEIGHT:
 #     Relative weight for fragment-based samples in mixed streaming.
-FRAGMENT_MIXING_WEIGHT: float = 0.9
+FRAGMENT_MIXING_WEIGHT: float = 0.8
 
 # :param NUM_SMALL_MOL_WORKERS:
 #     Number of worker processes for small molecule streaming.
@@ -377,11 +403,11 @@ SMALL_MOL_CSV_PATH: str = "data/small_molecules.csv"
 
 # :param NUM_VALID_SAMPLES:
 #     Number of ZINC samples to use for validation.
-NUM_VALID_SAMPLES: int = 1000
+NUM_VALID_SAMPLES: int = 2000
 
 # :param NUM_MARGINAL_SAMPLES:
 #     Number of ZINC samples for computing edge marginals.
-NUM_MARGINAL_SAMPLES: int = 100_000
+NUM_MARGINAL_SAMPLES: int = 50_000
 
 # -----------------------------------------------------------------------------
 # Debug/Testing Modes
@@ -393,7 +419,7 @@ __DEBUG__: bool = True
 
 # :param __TESTING__:
 #     Testing mode - runs with minimal iterations for validation.
-__TESTING__: bool = True
+__TESTING__: bool = False
 
 
 # =============================================================================
@@ -631,7 +657,7 @@ def load_valid_data(
     e: Experiment,
     hypernet: HyperNet,
     device: torch.device,
-) -> Tuple[List[Data], DataLoader, List[Data]]:
+) -> Tuple[List[Data], DataLoader, List[Data], List[Data]]:
     """
     Load ZINC subset for validation.
 
@@ -641,7 +667,7 @@ def load_valid_data(
         device: Device for computation
 
     Returns:
-        Tuple of (valid_data list, valid_loader, vis_samples)
+        Tuple of (valid_data, valid_loader, vis_samples, vis_samples_small)
     """
     e.log("\nPreparing validation data from ZINC...")
 
@@ -672,7 +698,11 @@ def load_valid_data(
     vis_samples = valid_data[:num_vis]
     e.log(f"Selected {num_vis} samples for visualization")
 
-    return valid_data, valid_loader, vis_samples
+    # Select small molecule visualization samples (4-10 atoms)
+    vis_samples_small = [d for d in valid_data if 4 <= d.x.size(0) <= 10][:num_vis]
+    e.log(f"Selected {len(vis_samples_small)} small molecule samples (4-10 atoms) for visualization")
+
+    return valid_data, valid_loader, vis_samples, vis_samples_small
 
 
 @experiment.hook("compute_statistics", default=False, replace=True)
@@ -695,7 +725,7 @@ def compute_statistics(
         device: Device for computation
 
     Returns:
-        Tuple of (edge_marginals, node_counts, max_nodes)
+        Tuple of (edge_marginals, node_counts, max_nodes, size_edge_marginals)
     """
     e.log("\nComputing edge marginals from ZINC...")
 
@@ -703,10 +733,13 @@ def compute_statistics(
     num_marginal = min(e.NUM_MARGINAL_SAMPLES, len(zinc_train))
     zinc_for_marginals = list(zinc_train)[:num_marginal]
 
+    # Force CPU to avoid moving hypernet to GPU as a side effect of
+    # preprocess_dataset (which calls hypernet.to(device) in-place).
+    # Marginals only need graph structure, not GPU acceleration.
     marginal_data = preprocess_dataset(
         zinc_for_marginals,
         hypernet,
-        device=device,
+        device=torch.device("cpu"),
         show_progress=True,
     )
 
@@ -718,7 +751,10 @@ def compute_statistics(
     max_nodes = max(max_nodes, e.MAX_GENERATED_NODES)
     e.log(f"Max nodes: {max_nodes}")
 
-    return edge_marginals, node_counts, max_nodes
+    size_edge_marginals = compute_size_edge_marginals(marginal_data, max_nodes + 10)
+    e.log(f"Size-conditional marginals computed for {size_edge_marginals.size(0)} sizes")
+
+    return edge_marginals, node_counts, max_nodes, size_edge_marginals
 
 
 @experiment.hook("modify_callbacks", default=False, replace=True)

@@ -92,6 +92,23 @@ _ZINC_RW_QUANTILE_BOUNDARIES: dict[int, dict[int, list[float]]] = {
         15: [0.0, 0.0, 4.5e-05, 0.005945, 0.048552],
         16: [0.09981, 0.125639, 0.148607, 0.178501, 0.213473],
     },
+    7: {
+        2: [0.333333, 0.388889, 0.416667, 0.416667, 0.5, 0.555556],
+        3: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        4: [0.222222, 0.261574, 0.277778, 0.298611, 0.347222, 0.401235],
+        5: [0.0, 0.0, 0.0, 0.0, 0.0, 0.018519],
+        6: [0.171296, 0.205954, 0.22548, 0.249657, 0.280382, 0.329861],
+        7: [0.0, 0.0, 0.0, 0.0, 0.0, 0.03106],
+        8: [0.145006, 0.176988, 0.194354, 0.219895, 0.246854, 0.291956],
+        9: [0.0, 0.0, 0.0, 0.0, 0.002315, 0.040181],
+        10: [0.126008, 0.155368, 0.174808, 0.197188, 0.224782, 0.264515],
+        11: [0.0, 0.0, 0.0, 5.7e-05, 0.005447, 0.046542],
+        12: [0.112354, 0.13996, 0.159842, 0.18344, 0.210551, 0.24722],
+        13: [0.0, 0.0, 0.0, 0.000216, 0.00854, 0.050692],
+        14: [0.102474, 0.128354, 0.148099, 0.171443, 0.197762, 0.233135],
+        15: [0.0, 0.0, 0.0, 0.000496, 0.011525, 0.053064],
+        16: [0.095008, 0.119595, 0.138627, 0.162068, 0.18802, 0.221364],
+    },
 }
 
 # Backward-compatible alias (4-bin preset)
@@ -190,14 +207,19 @@ def bin_rw_probabilities(
     num_bins: int = 10,
     bin_boundaries: dict[int, list[float]] | None = None,
     k_values: tuple[int, ...] | None = None,
+    clip_range: tuple[float, float] | None = None,
 ) -> Tensor:
     """
     Discretise RW return probabilities into bin indices.
 
-    When *bin_boundaries* is ``None`` (default), uses uniform bins on
-    ``[0, 1]`` for backward compatibility.  When provided, uses
-    ``torch.bucketize`` with per-k boundary vectors for data-driven
-    (e.g. quantile-based) binning.
+    Three modes (checked in order of precedence):
+
+    1. **Quantile** – *bin_boundaries* is not ``None``: uses
+       ``torch.bucketize`` with per-k boundary vectors.
+    2. **Clipped uniform** – *clip_range* is set (and *bin_boundaries*
+       is ``None``): uniform bins over ``[lo, hi]`` with values outside
+       the range clamped to the first / last bin.
+    3. **Uniform** – neither is set: uniform bins on ``[0, 1]``.
 
     Parameters
     ----------
@@ -213,6 +235,10 @@ def bin_rw_probabilities(
     k_values : tuple of int, optional
         The k-values corresponding to each column of *rw_probs*.
         Required when *bin_boundaries* is not ``None``.
+    clip_range : tuple of (lo, hi), optional
+        When set, uniform bins span ``[lo, hi]`` instead of ``[0, 1]``.
+        Values below *lo* map to bin 0; values above *hi* map to the
+        last bin.  Ignored when *bin_boundaries* is provided.
 
     Returns
     -------
@@ -220,28 +246,34 @@ def bin_rw_probabilities(
         Integer bin indices (as float, matching ``data.x`` convention)
         of shape ``[N, F]`` with values in ``{0, ..., num_bins - 1}``.
     """
-    if bin_boundaries is None:
-        # Uniform binning on [0, 1] (original behaviour)
-        return (rw_probs * num_bins).long().clamp(0, num_bins - 1).float()
+    if bin_boundaries is not None:
+        # Quantile-based binning
+        if k_values is None:
+            raise ValueError("k_values is required when bin_boundaries is provided")
 
-    if k_values is None:
-        raise ValueError("k_values is required when bin_boundaries is provided")
+        result = torch.empty_like(rw_probs)
+        for col_idx, k in enumerate(k_values):
+            boundaries = bin_boundaries.get(k)
+            if boundaries is None:
+                result[:, col_idx] = (
+                    (rw_probs[:, col_idx] * num_bins).long().clamp(0, num_bins - 1).float()
+                )
+            else:
+                edges = torch.tensor(boundaries, dtype=rw_probs.dtype)
+                result[:, col_idx] = torch.bucketize(
+                    rw_probs[:, col_idx].contiguous(), edges, right=True,
+                ).clamp(0, num_bins - 1).float()
 
-    result = torch.empty_like(rw_probs)
-    for col_idx, k in enumerate(k_values):
-        boundaries = bin_boundaries.get(k)
-        if boundaries is None:
-            # Fall back to uniform for any k without precomputed boundaries
-            result[:, col_idx] = (
-                (rw_probs[:, col_idx] * num_bins).long().clamp(0, num_bins - 1).float()
-            )
-        else:
-            edges = torch.tensor(boundaries, dtype=rw_probs.dtype)
-            result[:, col_idx] = torch.bucketize(
-                rw_probs[:, col_idx].contiguous(), edges, right=True,
-            ).clamp(0, num_bins - 1).float()
+        return result
 
-    return result
+    if clip_range is not None:
+        # Clipped uniform binning on [lo, hi]
+        lo, hi = clip_range
+        scaled = (rw_probs - lo) / (hi - lo)  # 0..1 within [lo, hi]
+        return (scaled * num_bins).long().clamp(0, num_bins - 1).float()
+
+    # Uniform binning on [0, 1] (original behaviour)
+    return (rw_probs * num_bins).long().clamp(0, num_bins - 1).float()
 
 
 def augment_data_with_rw(
@@ -249,6 +281,7 @@ def augment_data_with_rw(
     k_values: tuple[int, ...] = (3, 6),
     num_bins: int = 10,
     bin_boundaries: dict[int, list[float]] | None = None,
+    clip_range: tuple[float, float] | None = None,
 ) -> Data:
     """
     Augment a PyG Data object with binned RW return probability features.
@@ -266,6 +299,8 @@ def augment_data_with_rw(
         Number of bins per RW feature.
     bin_boundaries : dict mapping k → list of floats, optional
         Per-step quantile boundaries.  See :func:`bin_rw_probabilities`.
+    clip_range : tuple of (lo, hi), optional
+        Clipped uniform binning range.  See :func:`bin_rw_probabilities`.
 
     Returns
     -------
@@ -280,6 +315,7 @@ def augment_data_with_rw(
         rw_probs, num_bins,
         bin_boundaries=bin_boundaries,
         k_values=k_values,
+        clip_range=clip_range,
     )
     data.x = torch.cat([data.x, rw_binned.to(data.x.device)], dim=-1)
     return data

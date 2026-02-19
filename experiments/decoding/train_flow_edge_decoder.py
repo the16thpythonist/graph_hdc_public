@@ -54,6 +54,7 @@ from graph_hdc.models.flow_edge_decoder import (
     NODE_FEATURE_DIM,
     FlowEdgeDecoder,
     compute_edge_marginals,
+    compute_size_edge_marginals,
     compute_node_counts,
     get_node_feature_bins,
     preprocess_dataset,
@@ -104,9 +105,9 @@ HDC_DEPTH: int = 6
 #     Whether to augment HDC node features with random walk return probabilities.
 #     When True, each node's feature tuple is extended with binned RW return
 #     probabilities at each step in RW_K_VALUES, making the HDC conditioning
-#     vector more expressive about global graph topology. The FlowEdgeDecoder's
-#     24-dim one-hot node features are NOT affected — only the conditioning
-#     vector changes.
+#     vector more expressive about global graph topology. When USE_RRWP_HYPERNET
+#     is also True, the FlowEdgeDecoder's one-hot node features are extended
+#     with the additional RW bins (e.g. 24-dim → 32-dim for 2 k-values × 4 bins).
 USE_RW: bool = True
 
 # :param RW_K_VALUES:
@@ -127,7 +128,15 @@ RW_NUM_BINS: int = 4
 #     distributions that uniform binning produces at higher k (e.g. k=10 puts
 #     81% of atoms into bin 0 with uniform bins). Requires RW_NUM_BINS in
 #     {3, 4, 5, 6}. Only used when USE_RW is True.
-USE_QUANTILE_BINS: bool = True
+USE_QUANTILE_BINS: bool = False
+
+# :param RW_CLIP_RANGE:
+#     When set to a (lo, hi) tuple and USE_QUANTILE_BINS is False, uniform bins
+#     are placed over [lo, hi] instead of [0, 1]. Values outside this range are
+#     clamped to the first / last bin. This concentrates bin resolution in the
+#     region where most RW return probabilities fall. Ignored when
+#     USE_QUANTILE_BINS is True. Only used when USE_RW is True.
+RW_CLIP_RANGE: tuple | None = (0, 0.8)
 
 # :param PRUNE_CODEBOOK:
 #     Whether to prune the HDC codebook to only feature tuples observed in the
@@ -143,6 +152,14 @@ PRUNE_CODEBOOK: bool = True
 #     information from interfering with structural binding. Works with both
 #     single HyperNet and MultiHyperNet ensembles.
 USE_RRWP_HYPERNET: bool = True
+
+# :param NORMALIZE_GRAPH_EMBEDDING:
+#     Whether to L2-normalize the graph embedding (order-N) output of each
+#     HyperNet before concatenation into the HDC conditioning vector. Without
+#     normalization, the embedding magnitude scales with ~sqrt(num_atoms),
+#     causing the decoder's conditioning signal to be systematically weaker
+#     for small molecules.
+NORMALIZE_GRAPH_EMBEDDING: bool = True
 
 # :param ENSEMBLE_CONFIGS:
 #     Optional list of (hv_dim, depth) tuples for a MultiHyperNet ensemble.
@@ -404,6 +421,7 @@ def experiment(e: Experiment) -> None:
         k_values=e.RW_K_VALUES,
         num_bins=e.RW_NUM_BINS,
         bin_boundaries=rw_bin_boundaries,
+        clip_range=None if rw_bin_boundaries else e.RW_CLIP_RANGE,
     )
 
     if e.USE_RRWP_HYPERNET and not e.USE_RW:
@@ -417,7 +435,7 @@ def experiment(e: Experiment) -> None:
     else:
         e.log(f"HDC dim: {e.HDC_DIM}, depth: {e.HDC_DEPTH}")
     if rw_config.enabled:
-        bin_mode = "quantile" if rw_config.bin_boundaries else "uniform"
+        bin_mode = "quantile" if rw_config.bin_boundaries else ("clipped" if rw_config.clip_range else "uniform")
         e.log(f"RW features: k={rw_config.k_values}, bins={rw_config.num_bins} ({bin_mode})")
     if e.USE_RRWP_HYPERNET:
         e.log(f"RRWP HyperNet: enabled (split order-0 encoding)")
@@ -441,6 +459,7 @@ def experiment(e: Experiment) -> None:
     e["config/rw_k_values"] = list(e.RW_K_VALUES)
     e["config/rw_num_bins"] = e.RW_NUM_BINS
     e["config/rw_quantile_bins"] = e.USE_QUANTILE_BINS
+    e["config/rw_clip_range"] = e.RW_CLIP_RANGE
     e["config/prune_codebook"] = e.PRUNE_CODEBOOK
     e["config/use_rrwp_hypernet"] = e.USE_RRWP_HYPERNET
     e["config/n_layers"] = e.N_LAYERS
@@ -461,11 +480,13 @@ def experiment(e: Experiment) -> None:
 
     e.log("\nLoading/Creating HyperNet encoder...")
 
+    hdc_device = torch.device("cpu")
+
     if resuming:
         # When resuming, load saved encoder (auto-detects type)
         from graph_hdc.hypernet import load_hypernet
         resume_encoder_file = Path(e.RESUME_ENCODER_PATH)
-        hypernet = load_hypernet(str(resume_encoder_file), device=str(device))
+        hypernet = load_hypernet(str(resume_encoder_file), device=str(hdc_device))
         hypernet.eval()
     elif use_ensemble:
         hn_cls = None
@@ -485,6 +506,8 @@ def experiment(e: Experiment) -> None:
                 rw_config=rw_config,
                 hypernet_depth=e.ENSEMBLE_CONFIGS[0][1],
                 prune_codebook=e.PRUNE_CODEBOOK,
+                normalize_graph_embedding=e.NORMALIZE_GRAPH_EMBEDDING,
+                device=str(hdc_device),
             )
             hypernet = MultiHyperNet.from_dim_depth_pairs(
                 base_config=base_config,
@@ -499,14 +522,15 @@ def experiment(e: Experiment) -> None:
                 dataset=e.DATASET,
                 hv_dim=e.ENSEMBLE_CONFIGS[0][0],
                 depth=e.ENSEMBLE_CONFIGS[0][1],
-                device=str(device),
+                device=str(hdc_device),
             )
+            base_config.normalize_graph_embedding = e.NORMALIZE_GRAPH_EMBEDDING
             hypernet = MultiHyperNet.from_dim_depth_pairs(
                 base_config=base_config,
                 dim_depth_pairs=e.ENSEMBLE_CONFIGS,
                 base_seed=e.SEED,
             )
-        hypernet = hypernet.to(device)
+        hypernet = hypernet.to(hdc_device)
         hypernet.eval()
     else:
         hypernet = load_or_create_encoder(
@@ -514,10 +538,11 @@ def experiment(e: Experiment) -> None:
             dataset=e.DATASET,
             hv_dim=e.HDC_DIM,
             depth=e.HDC_DEPTH,
-            device=device,
+            device=hdc_device,
             rw_config=rw_config,
             prune_codebook=e.PRUNE_CODEBOOK,
             use_rrwp_hypernet=e.USE_RRWP_HYPERNET,
+            normalize_graph_embedding=e.NORMALIZE_GRAPH_EMBEDDING,
         )
 
     # Compute dimensions
@@ -558,16 +583,16 @@ def experiment(e: Experiment) -> None:
     train_loader, train_data = e.apply_hook(
         "load_train_data",
         hypernet=hypernet,
-        device=device,
+        device=hdc_device,
     )
 
-    valid_data, valid_loader, vis_samples = e.apply_hook(
+    valid_data, valid_loader, vis_samples, vis_samples_small = e.apply_hook(
         "load_valid_data",
         hypernet=hypernet,
-        device=device,
+        device=hdc_device,
     )
 
-    edge_marginals, node_counts, max_nodes = e.apply_hook(
+    edge_marginals, node_counts, max_nodes, size_edge_marginals = e.apply_hook(
         "compute_statistics",
         train_data=train_data,
         hypernet=hypernet,
@@ -630,6 +655,7 @@ def experiment(e: Experiment) -> None:
         cross_attn_heads=e.CROSS_ATTN_HEADS,
         node_hdc_embed_dim=e.NODE_HDC_EMBED_DIM,
         nodes_codebook=hypernet.nodes_codebook.clone() if e.NODE_HDC_EMBED_DIM > 0 else None,
+        size_edge_marginals=size_edge_marginals,
     )
 
     e.log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -674,6 +700,18 @@ def experiment(e: Experiment) -> None:
             num_repetitions=e.NUM_VALIDATION_REPETITIONS,
             dataset=e.DATASET,
         ),
+        *([ReconstructionVisualizationCallback(
+            experiment=e,
+            vis_samples=vis_samples_small,
+            sample_steps=e.SAMPLE_STEPS,
+            eta=e.ETA,
+            omega=e.OMEGA,
+            time_distortion=e.SAMPLE_TIME_DISTORTION,
+            hypernet=hypernet,
+            num_repetitions=e.NUM_VALIDATION_REPETITIONS,
+            dataset=e.DATASET,
+            label="small_molecules",
+        )] if vis_samples_small else []),
         TrainingMetricsCallback(
             experiment=e,
             num_timestep_bins=10,
@@ -809,12 +847,12 @@ def experiment(e: Experiment) -> None:
                 original_smiles = raw_smiles
             original_mol = Chem.MolFromSmiles(original_smiles) if original_smiles != "N/A" else None
 
-            # Encode with HyperNet
+            # Encode with HyperNet (on CPU)
             data_for_encoding = original_data.clone()
-            data_for_encoding = data_for_encoding.to(device)
+            data_for_encoding = data_for_encoding.to(hdc_device)
             if not hasattr(data_for_encoding, "batch") or data_for_encoding.batch is None:
                 data_for_encoding.batch = torch.zeros(
-                    data_for_encoding.x.size(0), dtype=torch.long, device=device
+                    data_for_encoding.x.size(0), dtype=torch.long, device=hdc_device
                 )
 
             with torch.no_grad():
@@ -826,6 +864,7 @@ def experiment(e: Experiment) -> None:
                         k_values=hypernet.rw_config.k_values,
                         num_bins=hypernet.rw_config.num_bins,
                         bin_boundaries=hypernet.rw_config.bin_boundaries,
+                        clip_range=hypernet.rw_config.clip_range,
                     )
 
                 # forward() handles encode_properties internally and returns
@@ -1071,7 +1110,7 @@ def load_valid_data(
     e: Experiment,
     hypernet: HyperNet,
     device: torch.device,
-) -> Tuple[List[Data], DataLoader, List[Data]]:
+) -> Tuple[List[Data], DataLoader, List[Data], List[Data]]:
     """
     Load and preprocess validation data.
 
@@ -1083,7 +1122,7 @@ def load_valid_data(
         device: Device for HDC computation
 
     Returns:
-        Tuple of (valid_data list, valid_loader, vis_samples for visualization)
+        Tuple of (valid_data, valid_loader, vis_samples, vis_samples_small)
     """
     e.log("\nLoading validation data...")
     valid_ds = get_split("valid", dataset=e.DATASET.lower())
@@ -1111,7 +1150,11 @@ def load_valid_data(
     vis_samples = valid_data[:num_vis]
     e.log(f"Selected {num_vis} samples for validation visualization")
 
-    return valid_data, valid_loader, vis_samples
+    # Select small molecule visualization samples (4-10 atoms)
+    vis_samples_small = [d for d in valid_data if 4 <= d.x.size(0) <= 10][:num_vis]
+    e.log(f"Selected {len(vis_samples_small)} small molecule samples (4-10 atoms) for visualization")
+
+    return valid_data, valid_loader, vis_samples, vis_samples_small
 
 
 @experiment.hook("compute_statistics", default=True)
@@ -1134,7 +1177,7 @@ def compute_statistics(
         device: Device for computation
 
     Returns:
-        Tuple of (edge_marginals, node_counts, max_nodes)
+        Tuple of (edge_marginals, node_counts, max_nodes, size_edge_marginals)
     """
     if train_data is None:
         raise ValueError("train_data is required for base experiment statistics computation")
@@ -1147,7 +1190,10 @@ def compute_statistics(
     max_nodes = int(node_counts.nonzero()[-1].item()) if node_counts.sum() > 0 else 50
     e.log(f"Max nodes: {max_nodes}")
 
-    return edge_marginals, node_counts, max_nodes
+    size_edge_marginals = compute_size_edge_marginals(train_data, max_nodes + 10)
+    e.log(f"Size-conditional marginals computed for {size_edge_marginals.size(0)} sizes")
+
+    return edge_marginals, node_counts, max_nodes, size_edge_marginals
 
 
 @experiment.hook("modify_callbacks", default=True)

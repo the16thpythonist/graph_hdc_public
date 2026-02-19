@@ -118,7 +118,8 @@ def _small_mol_worker_process(
     import sys
     import time as time_module
 
-    from rdkit import Chem
+    from rdkit import Chem, RDLogger as _RDLogger
+    _RDLogger.DisableLog('rdApp.*')
 
     def log_msg(msg: str) -> None:
         print(f"[SmallMolWorker {worker_id}] {msg}", file=sys.stderr, flush=True)
@@ -139,8 +140,9 @@ def _small_mol_worker_process(
             _rw_k = hypernet.rw_config.k_values
             _rw_bins = hypernet.rw_config.num_bins
             _rw_boundaries = hypernet.rw_config.bin_boundaries
-            log_msg(f"RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, "
-                    f"quantile={'yes' if _rw_boundaries else 'no'}")
+            _rw_clip_range = hypernet.rw_config.clip_range
+            bin_mode = "quantile" if _rw_boundaries else ("clipped" if _rw_clip_range else "uniform")
+            log_msg(f"RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, mode={bin_mode}")
 
         log_msg(f"HyperNet loaded (batch_size={encoding_batch_size})")
     except Exception as e:
@@ -224,7 +226,7 @@ def _small_mol_worker_process(
 
                 # Augment with RW features if needed
                 if _use_rw:
-                    zinc_data = augment_data_with_rw(zinc_data, k_values=_rw_k, num_bins=_rw_bins, bin_boundaries=_rw_boundaries)
+                    zinc_data = augment_data_with_rw(zinc_data, k_values=_rw_k, num_bins=_rw_bins, bin_boundaries=_rw_boundaries, clip_range=_rw_clip_range)
                     # Extend flow_data node features with one-hot RW bins
                     rw_bin_cols = zinc_data.x[:, 5:]  # (n, len(k_values))
                     rw_onehot_parts = []
@@ -383,6 +385,12 @@ class SmallMoleculeStreamingDataset(torch.utils.data.IterableDataset):
         self._queue = ctx.Queue(maxsize=self._buffer_size)
         self._stop_event = ctx.Event()
 
+        # Hide GPU from worker processes — they only need CPU for HDC encoding.
+        # See streaming_fragments.py for detailed explanation.
+        import os
+        _prev_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
         self._workers = []
         for i in range(self.num_workers):
             worker = ctx.Process(
@@ -401,6 +409,12 @@ class SmallMoleculeStreamingDataset(torch.utils.data.IterableDataset):
             )
             worker.start()
             self._workers.append(worker)
+
+        # Restore parent's CUDA visibility
+        if _prev_cuda is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _prev_cuda
 
         logger.info(f"Started {self.num_workers} small-molecule workers")
         print(

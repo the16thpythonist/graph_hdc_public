@@ -265,7 +265,7 @@ class TestGetZincRwBoundaries:
             assert k in bounds
             assert len(bounds[k]) == num_bins - 1
 
-    @pytest.mark.parametrize("num_bins", [3, 4, 5, 6])
+    @pytest.mark.parametrize("num_bins", [3, 4, 5, 6, 7])
     def test_boundaries_sorted_all_bins(self, num_bins):
         """Boundaries should be non-decreasing for all bin counts."""
         bounds = get_zinc_rw_boundaries(num_bins)
@@ -277,14 +277,14 @@ class TestGetZincRwBoundaries:
 
     def test_invalid_bin_count_raises(self):
         with pytest.raises(ValueError, match="No precomputed boundaries"):
-            get_zinc_rw_boundaries(7)
+            get_zinc_rw_boundaries(8)
 
     def test_more_bins_means_more_boundaries(self):
         """Higher bin counts should have more boundary values."""
         for k in range(2, 17, 2):
             b3 = get_zinc_rw_boundaries(3)[k]
-            b6 = get_zinc_rw_boundaries(6)[k]
-            assert len(b3) < len(b6)
+            b7 = get_zinc_rw_boundaries(7)[k]
+            assert len(b3) < len(b7)
 
 
 # ── augment_data_with_rw ─────────────────────────────────────────────

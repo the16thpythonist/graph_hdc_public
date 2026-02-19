@@ -48,11 +48,16 @@ class RWConfig:
     of uniform bins on ``[0, 1]``.  Use
     :data:`graph_hdc.utils.rw_features.ZINC_RW_QUANTILE_BOUNDARIES` for
     a ready-made preset derived from 5 000 ZINC training molecules.
+
+    When *clip_range* is set (and *bin_boundaries* is ``None``), uniform
+    bins are placed over ``[lo, hi]`` instead of ``[0, 1]``.  Values
+    outside this range are clamped to the first / last bin.
     """
     enabled: bool = False
     k_values: tuple[int, ...] = (3, 6)
     num_bins: int = 10
     bin_boundaries: dict[int, list[float]] | None = None
+    clip_range: tuple[float, float] | None = None
 
 
 @dataclass
@@ -74,7 +79,8 @@ class DSHDCConfig:
     hypernet_depth: int = 3
     normalize: bool = False
     rw_config: RWConfig = field(default_factory=RWConfig)
-    prune_codebook: bool = True
+    prune_codebook: bool = False
+    normalize_graph_embedding: bool = False
 
 
 @dataclass
