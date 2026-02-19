@@ -233,7 +233,8 @@ class TestFragmentLibrary:
         fragments = fragment_library.sample_fragments(1)
         combined = fragment_library.combine_fragments(fragments)
 
-        assert combined == fragments[0]
+        assert combined is not None
+        assert Chem.MolToSmiles(combined) == Chem.MolToSmiles(fragments[0])
 
     def test_combine_empty_list(self, fragment_library):
         """Test combining empty list returns None."""

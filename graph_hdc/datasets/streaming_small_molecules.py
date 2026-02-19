@@ -448,7 +448,12 @@ class SmallMoleculeStreamingDataset(torch.utils.data.IterableDataset):
 
             try:
                 serialized_data = self._queue.get(timeout=5.0)
-                self._queue.put(serialized_data)
+                # Put it back — use timeout to avoid deadlocking when workers
+                # fill the freed slot before we can return the sample.
+                try:
+                    self._queue.put(serialized_data, timeout=1.0)
+                except Exception:
+                    pass  # Queue full — workers refilled it, sample lost but OK
                 samples_received += 1
                 if samples_received % 100 == 0:
                     print(

@@ -147,6 +147,30 @@ class RRWPHyperNet(HyperNet):
         if self.prune_codebook and observed_node_features is not None:
             self._limit_full_codebook(observed_node_features)
 
+    def rebuild_unpruned_codebook(self) -> None:
+        """Rebuild both base and full (base + RRWP) unpruned codebooks."""
+        super().rebuild_unpruned_codebook()
+
+        device = self.nodes_codebook_full.device
+        dtype_str = "float64" if self._dtype == torch.float64 else "float32"
+
+        # Use the same derived seed as _build_full_codebook
+        if self.seed is not None:
+            torch.manual_seed(self.seed + 1000)
+
+        full_encoder = CombinatoricIntegerEncoder(
+            num_categories=math.prod(self._full_bins),
+            dim=self.hv_dim,
+            vsa=self.vsa.value,
+            idx_offset=0,
+            device=device,
+            indexer=TupleIndexer(sizes=self._full_bins),
+            dtype=dtype_str,
+        )
+
+        self.nodes_codebook_full = full_encoder.codebook
+        self.nodes_indexer_full = full_encoder.indexer
+
     def _limit_full_codebook(self, node_features: set[tuple]) -> None:
         """Prune the full codebook to only observed feature tuples."""
         sorted_features = sorted(node_features)

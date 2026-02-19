@@ -509,6 +509,7 @@ class MultiHyperNet(pl.LightningModule):
                         "num_bins": hn.rw_config.num_bins,
                     } if hasattr(hn, "rw_config") else None,
                     "prune_codebook": getattr(hn, "prune_codebook", True),
+                    "normalize_graph_embedding": getattr(hn, "normalize_graph_embedding", False),
                 },
                 "encoder_maps": {
                     "node": hn._serialize_encoder_map(hn.node_encoder_map),
@@ -615,6 +616,7 @@ class MultiHyperNet(pl.LightningModule):
             rw_dict = cfg.get("rw_config")
             hn.rw_config = RWConfig(**rw_dict) if rw_dict else RWConfig()
             hn.prune_codebook = cfg.get("prune_codebook", True)
+            hn.normalize_graph_embedding = cfg.get("normalize_graph_embedding", False)
             hn._decoding_edge_limit = 50 if hn.base_dataset == "qm9" else 122
             hn._max_step_delta = None
 

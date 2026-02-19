@@ -283,6 +283,11 @@ NOISE_TYPE: str = "marginal"
 #     Random seed for reproducibility.
 SEED: int = INHERIT
 
+# :param ACCELERATOR:
+#     PyTorch Lightning accelerator. Options: "auto", "gpu", "cpu".
+#     Use "gpu" to force GPU training.
+ACCELERATOR: str = "gpu"
+
 # -----------------------------------------------------------------------------
 # Reconstruction Evaluation
 # -----------------------------------------------------------------------------

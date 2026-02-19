@@ -314,6 +314,11 @@ NUM_WORKERS: int = 0
 #     Training precision. Options: "32", "16", "bf16".
 PRECISION: str = "32"
 
+# :param ACCELERATOR:
+#     PyTorch Lightning accelerator. Options: "auto", "gpu", "cpu".
+#     Use "gpu" to force GPU training, "cpu" to force CPU training.
+ACCELERATOR: str = "auto"
+
 # -----------------------------------------------------------------------------
 # Reconstruction Evaluation
 # -----------------------------------------------------------------------------
@@ -470,8 +475,13 @@ def experiment(e: Experiment) -> None:
     e["config/resuming"] = resuming
 
     # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    e.log(f"Using device: {device}")
+    if e.ACCELERATOR == "gpu":
+        device = torch.device("cuda")
+    elif e.ACCELERATOR == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e.log(f"Using device: {device} (accelerator={e.ACCELERATOR})")
     e["config/device"] = str(device)
 
     # =========================================================================
@@ -738,7 +748,7 @@ def experiment(e: Experiment) -> None:
     # Trainer
     trainer = Trainer(
         max_epochs=e.EPOCHS,
-        accelerator="auto",
+        accelerator=e.ACCELERATOR,
         devices=1,
         precision=e.PRECISION,
         callbacks=callbacks,

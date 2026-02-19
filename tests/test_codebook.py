@@ -2,9 +2,9 @@
 Tests for node and edge codebook initialization and limitation.
 
 This module verifies that:
-1. The node codebook is limited to actual features in the dataset (not full Cartesian product)
-2. The edge codebook has a quadratic relationship with the limited node codebook
-3. Encoding and decoding works correctly with the limited codebooks
+1. The node codebook matches the expected size for the config (full or pruned)
+2. The edge codebook has a quadratic relationship with the node codebook
+3. Encoding and decoding works correctly with the codebooks
 """
 
 import math
@@ -12,9 +12,14 @@ import math
 import pytest
 import torch
 
-from graph_hdc.hypernet.configs import get_config, DecoderSettings
+from graph_hdc.hypernet.configs import get_config, DecoderSettings, Features
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.datasets.utils import get_split, get_dataset_info
+
+
+def _get_node_bins(config):
+    """Extract node feature bins from a DSHDCConfig."""
+    return next(iter(config.node_feature_configs.values())).bins
 
 # force_cpu fixture is now in conftest.py
 
@@ -32,33 +37,35 @@ class TestQM9Codebook:
     def qm9_hypernet(self, qm9_config):
         return HyperNet(qm9_config)
 
-    def test_node_codebook_is_limited(self, qm9_hypernet, qm9_config):
-        """Verify node codebook size is smaller than full Cartesian product."""
-        # QM9 has feature dimensions [4, 5, 3, 5] → 300 theoretical combinations
-        full_size = math.prod([4, 5, 3, 5])
-        assert full_size == 300
+    def test_node_codebook_size_matches_config(self, qm9_hypernet, qm9_config):
+        """Verify node codebook size is consistent with prune_codebook setting."""
+        full_size = math.prod(_get_node_bins(qm9_config))
 
-        # The actual codebook should be limited to observed features
         actual_size = qm9_hypernet.nodes_codebook.shape[0]
-        assert actual_size < full_size, (
-            f"Node codebook should be limited. Full: {full_size}, Actual: {actual_size}"
-        )
+        if qm9_config.prune_codebook:
+            assert actual_size < full_size, (
+                f"Node codebook should be pruned. Full: {full_size}, Actual: {actual_size}"
+            )
+        else:
+            assert actual_size == full_size, (
+                f"Node codebook should be full Cartesian product. "
+                f"Full: {full_size}, Actual: {actual_size}"
+            )
 
-        # Verify shape is [limited_size, hv_dim]
+        # Verify shape is [size, hv_dim]
         assert qm9_hypernet.nodes_codebook.shape[1] == qm9_config.hv_dim
 
-    def test_node_codebook_matches_dataset_info(self, qm9_hypernet):
-        """Verify node codebook size matches DatasetInfo node_features count."""
+    def test_node_codebook_contains_dataset_features(self, qm9_hypernet):
+        """Verify all node features from the dataset are represented in codebook."""
         dataset_info = get_dataset_info("qm9")
-        expected_size = len(dataset_info.node_features)
-        actual_size = qm9_hypernet.nodes_codebook.shape[0]
 
-        assert actual_size == expected_size, (
-            f"Codebook size {actual_size} should match dataset info {expected_size}"
-        )
+        for node_tuple in dataset_info.node_features:
+            assert node_tuple in qm9_hypernet.nodes_indexer.tuple_to_idx, (
+                f"Node feature {node_tuple} from qm9 dataset not in indexer"
+            )
 
     def test_nodes_indexer_consistency(self, qm9_hypernet):
-        """Verify nodes indexer is consistent with limited codebook."""
+        """Verify nodes indexer is consistent with codebook."""
         codebook_size = qm9_hypernet.nodes_codebook.shape[0]
         indexer_size = qm9_hypernet.nodes_indexer.size()
 
@@ -129,15 +136,22 @@ class TestQM9Codebook:
 class TestCodebookLimitationProcess:
     """Tests verifying the codebook limitation process works correctly."""
 
-    def test_qm9_full_vs_limited_size_sanity(self):
-        """Sanity check: limited codebook should be reasonably sized for QM9."""
+    def test_qm9_codebook_size_is_reasonable(self):
+        """Sanity check: codebook size should match config expectations."""
         config = get_config("QM9_SMILES_HRR_256_F64_G1NG3")
         config.device = "cpu"
         hypernet = HyperNet(config)
 
         node_size = hypernet.nodes_codebook.shape[0]
-        # QM9 typically has ~50-60 unique node types
-        assert 30 < node_size < 150, f"QM9 node codebook size {node_size} seems unusual"
+        full_size = math.prod(_get_node_bins(config))
+
+        if config.prune_codebook:
+            # Pruned: QM9 typically has ~50-60 unique node types
+            assert 30 < node_size < 150, f"QM9 node codebook size {node_size} seems unusual"
+        else:
+            assert node_size == full_size, (
+                f"Unpruned codebook should be full Cartesian product ({full_size}), got {node_size}"
+            )
 
     def test_all_dataset_node_features_in_codebook(self):
         """Verify all node features from dataset are represented in codebook."""

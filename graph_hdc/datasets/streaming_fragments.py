@@ -1174,8 +1174,13 @@ class StreamingFragmentDataset(torch.utils.data.IterableDataset):
             try:
                 # Try to get a sample with timeout
                 serialized_data = self._queue.get(timeout=5.0)
-                # Put it back - we're just checking the queue is filling
-                self._queue.put(serialized_data)
+                # Put it back - we're just checking the queue is filling.
+                # Use a timeout to avoid deadlocking when workers fill the
+                # freed slot before we can put the sample back.
+                try:
+                    self._queue.put(serialized_data, timeout=1.0)
+                except Exception:
+                    pass  # Queue full — workers refilled it, sample is lost but OK
                 samples_received += 1
 
                 if samples_received % 100 == 0:
