@@ -29,10 +29,62 @@ from __future__ import annotations
 import random
 from typing import Optional, Tuple
 
+from rdkit import Chem
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 
 from graph_hdc.datasets.utils import get_split
+
+
+def _sanitize_smiles(smiles: str) -> Optional[str]:
+    """
+    Sanitize a molecule: remove charges, explicit H, and all stereochemistry.
+
+    Converts stereo bonds to basic types, strips chiral center annotations,
+    zeroes all formal charges, removes explicit hydrogens, and returns a
+    new canonical SMILES.  Returns ``None`` if the resulting molecule is
+    chemically invalid.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    # Remove explicit hydrogens
+    mol = Chem.RemoveHs(mol)
+
+    # Remove all stereochemistry (chiral centers + bond E/Z)
+    Chem.RemoveStereochemistry(mol)
+
+    # Zero all formal charges
+    for atom in mol.GetAtoms():
+        atom.SetFormalCharge(0)
+
+    # First sanitize pass – may fail if charge removal broke valence rules
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        return None
+
+    # Fix radicals AFTER sanitize (SanitizeMol can recompute radical
+    # electrons from valence).  Zero them out and force implicit-H
+    # recalculation via UpdatePropertyCache.
+    for atom in mol.GetAtoms():
+        if atom.GetNumRadicalElectrons() > 0:
+            atom.SetNumRadicalElectrons(0)
+            atom.SetNoImplicit(False)
+            atom.UpdatePropertyCache(strict=False)
+
+    # Re-perceive aromaticity: charge removal can leave rings with stale
+    # aromatic flags.  Kekulize first (assigns explicit single/double bonds),
+    # then re-apply aromaticity detection from scratch.
+    try:
+        Chem.Kekulize(mol, clearAromaticFlags=True)
+        Chem.SetAromaticity(mol)
+    except Exception:
+        pass  # keep whatever SanitizeMol produced
+
+    new_smiles = Chem.MolToSmiles(mol)
+    return new_smiles if new_smiles else None
 
 
 # =============================================================================
@@ -69,12 +121,18 @@ DATASET: str = "zinc"
 # :param NUM_DATASET_SAMPLES:
 #     Number of molecules to randomly sample from the complete dataset
 #     (train + valid + test splits combined).
-NUM_DATASET_SAMPLES: int = 100
+NUM_DATASET_SAMPLES: int = 1000
 
 # :param DATASET_SEED:
 #     Random seed for reproducible dataset sampling. Separate from the
 #     model SEED to allow re-drawing different subsets independently.
 DATASET_SEED: int = 0
+
+# :param MAX_MOLECULE_SIZE:
+#     Maximum number of atoms (nodes) a molecule may have to be included
+#     in the sample pool. Molecules with more atoms are filtered out
+#     before sampling. Set to None to disable the filter.
+MAX_MOLECULE_SIZE: Optional[int] = 40
 
 # -----------------------------------------------------------------------------
 # Input SMILES (inherited but ignored — overridden by load_smiles hook)
@@ -128,7 +186,7 @@ DETERMINISTIC: bool = False
 #     Number of independent edge generation attempts per molecule.
 #     When > 1, each attempt is scored by HDC cosine distance to the
 #     original order_N embedding, and the best result is kept.
-NUM_REPETITIONS: int = 64
+NUM_REPETITIONS: int = 128
 
 # :param INIT_MODE:
 #     Initialization mode for the edge matrix at the start of sampling.
@@ -208,7 +266,7 @@ experiment = Experiment.extend(
 # =============================================================================
 
 
-@experiment.hook("load_smiles", replace=True)
+@experiment.hook("load_smiles", replace=True, default=False)
 def load_smiles_from_dataset(e: Experiment) -> list[str]:
     """
     Load SMILES by randomly sampling from the complete dataset.
@@ -226,31 +284,51 @@ def load_smiles_from_dataset(e: Experiment) -> list[str]:
     dataset_name = e.DATASET
     num_samples = e.NUM_DATASET_SAMPLES
     seed = e.DATASET_SEED
+    max_size = e.MAX_MOLECULE_SIZE
 
     e.log(f"Loading complete {dataset_name.upper()} dataset (all splits)...")
 
     all_smiles: list[str] = []
     for split in ["train", "valid", "test"]:
         ds = get_split(split=split, dataset=dataset_name)
-        split_smiles = [data.smiles for data in ds]
-        e.log(f"  {split}: {len(split_smiles)} molecules")
+        split_smiles = [data.smiles for data in ds if max_size is None or data.num_nodes <= max_size]
+        e.log(f"  {split}: {len(split_smiles)} molecules (after size filter)")
         all_smiles.extend(split_smiles)
 
-    e.log(f"Total molecules in dataset: {len(all_smiles)}")
+    e.log(f"Total molecules after filtering (max_size={max_size}): {len(all_smiles)}")
 
-    # Clamp to available molecules
-    num_samples = min(num_samples, len(all_smiles))
-
-    # Random sampling with fixed seed
+    # Shuffle the full pool with fixed seed, then iterate and sanitize
+    # until we have enough valid molecules (drop-and-resample strategy).
     rng = random.Random(seed)
-    sampled = rng.sample(all_smiles, num_samples)
+    rng.shuffle(all_smiles)
 
-    e.log(f"Sampled {num_samples} molecules (seed={seed})")
+    sampled: list[str] = []
+    num_dropped = 0
+    for smi in all_smiles:
+        if len(sampled) >= num_samples:
+            break
+
+        clean = _sanitize_smiles(smi)
+        if clean is not None:
+            sampled.append(clean)
+        else:
+            num_dropped += 1
+
+    if num_dropped > 0:
+        e.log(f"Dropped {num_dropped} molecules that became invalid after sanitization")
+
+    if len(sampled) < num_samples:
+        e.log(f"WARNING: Only {len(sampled)} valid molecules available "
+               f"(requested {num_samples})")
+
+    e.log(f"Sampled {len(sampled)} sanitized molecules (seed={seed})")
     e["config/smiles_source"] = "dataset"
     e["config/dataset_name"] = dataset_name
-    e["config/num_dataset_samples"] = num_samples
+    e["config/num_dataset_samples"] = len(sampled)
     e["config/dataset_seed"] = seed
+    e["config/max_molecule_size"] = max_size
     e["config/total_dataset_size"] = len(all_smiles)
+    e["config/num_dropped_sanitization"] = num_dropped
 
     return sampled
 

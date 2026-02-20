@@ -48,8 +48,10 @@ Usage:
 
 from __future__ import annotations
 
+import gc
 import io
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -889,6 +891,23 @@ def experiment(e: Experiment) -> None:
             save_path=plot_path,
         )
 
+        # Per-sample timing / ETA
+        elapsed_total = time.time() - start_time
+        processed_so_far = idx + 1 - skipped_count
+        if processed_so_far > 0:
+            avg_per_sample = elapsed_total / processed_so_far
+            remaining = len(smiles_list) - (idx + 1)
+            eta_seconds = avg_per_sample * remaining
+            eta_time = datetime.now() + timedelta(seconds=eta_seconds)
+            valid_pct = 100 * valid_count / processed_so_far
+            match_pct = 100 * match_count / processed_so_far
+            e.log(f"  Time: {elapsed_total:.1f}s elapsed | "
+                  f"avg {avg_per_sample:.2f}s/sample | "
+                  f"~{eta_seconds:.0f}s remaining | "
+                  f"ETA {eta_time:%Y-%m-%d %H:%M:%S}")
+            e.log(f"  Accuracy: {match_count}/{processed_so_far} match ({match_pct:.1f}%) | "
+                  f"{valid_count}/{processed_so_far} valid ({valid_pct:.1f}%)")
+
         results.append({
             "idx": idx,
             "original_smiles": smiles,
@@ -899,6 +918,11 @@ def experiment(e: Experiment) -> None:
             "is_match": is_match,
             "num_atoms": num_atoms,
         })
+
+        # Free GPU memory: drop per-iteration tensors and flush CUDA cache
+        del data, hdc_vector, node_features, node_mask, hdc_vectors
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # =========================================================================
     # Summary

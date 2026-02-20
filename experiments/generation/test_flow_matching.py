@@ -173,6 +173,11 @@ DEVICE: str = "cuda"
 #     "cpu", "cuda".
 HDC_DEVICE: str = "cpu"
 
+# :param PRUNE_DECODING_CODEBOOK:
+#     Prune the RRWP codebook to only dataset-observed feature tuples before
+#     node decoding. Reduces false positives from the overcomplete codebook.
+PRUNE_DECODING_CODEBOOK: bool = True
+
 # :param RUN_DIAGNOSTIC:
 #     Whether to run the norm-decay diagnostic on real encoded molecules
 #     before generation. Useful for debugging but adds startup time.
@@ -611,6 +616,34 @@ def experiment(e: Experiment) -> None:
     hypernet.to(hdc_device)
     hypernet.eval()
     e.log(str(hypernet))
+
+    # Prune RRWP codebook to observed features for better node decoding
+    if e.PRUNE_DECODING_CODEBOOK and hasattr(hypernet, '_limit_full_codebook'):
+        from graph_hdc.datasets.utils import scan_node_features_with_rw
+
+        rw_cfg = hypernet.rw_config
+
+        @e.cache.cached(
+            name="observed_rw_features",
+            scope=lambda _e: (
+                "rw_scan",
+                _e.DATASET,
+                str(rw_cfg.k_values),
+                str(rw_cfg.num_bins),
+            ),
+        )
+        def scan_observed_features():
+            return scan_node_features_with_rw(
+                dataset_name=e.DATASET,
+                rw_config=rw_cfg,
+            )
+
+        observed = scan_observed_features()
+        size_before = hypernet.nodes_codebook_full.shape[0]
+        hypernet._limit_full_codebook(observed)
+        size_after = hypernet.nodes_codebook_full.shape[0]
+        e.log(f"Pruned RRWP codebook: {size_before:,} -> {size_after:,} entries")
+
     decoder.to(device)
     decoder.eval()
     flow_model.to(device)

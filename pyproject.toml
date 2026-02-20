@@ -26,6 +26,8 @@ dependencies = [
     "pycomex @ git+https://github.com/the16thpythonist/pycomex",
     "flow-matching",
     "torchdiffeq",
+    "psutil>=5.9.0",
+    "nvidia-ml-py>=12.0.0",
 ]
 
 [project.optional-dependencies]

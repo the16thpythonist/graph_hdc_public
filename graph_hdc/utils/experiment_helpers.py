@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import math
 import signal
+import threading
+import time
+import warnings
 from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -1015,13 +1018,17 @@ MODULE_GROUPS = {
 
 class TrainingMetricsCallback(Callback):
     """
-    Track and visualize comprehensive training metrics in a 4x4 grid.
+    Track and visualize comprehensive training metrics in a 5x4 grid.
 
     Generates plots for:
     - Row 1: Loss curves, per-class loss, learning rate, timestep-binned loss
     - Row 2: Edge distribution, per-class accuracy, confusion matrix, loss ratio
     - Row 3: Gradient norms (global, by module, HDC, variance)
     - Row 4: Parameter changes, weight norms, convergence metrics
+    - Row 5: Hardware utilization (GPU util, GPU memory, CPU util, CPU RAM)
+
+    Row 5 uses a daemon background thread that samples hardware metrics every
+    ~1 second during training and reports epoch-level averages.
 
     The callback reads batch metrics from the model's `batch_metrics` attribute,
     which should be populated by the model's training_step.
@@ -1077,6 +1084,20 @@ class TrainingMetricsCallback(Callback):
         self.weight_norms: List[Dict[str, float]] = []
         self.module_param_deltas: List[Dict[str, float]] = []
         self.tanimoto_similarities: List[float] = []
+
+        # Row 5: Hardware metrics (epoch-level averages from background thread)
+        self.gpu_utilization: List[float] = []      # Mean GPU util % per epoch
+        self.gpu_memory_used: List[float] = []      # Mean GPU memory MB per epoch
+        self.cpu_utilization: List[float] = []       # Mean CPU util % per epoch
+        self.cpu_ram_used: List[float] = []          # Mean RAM MB per epoch
+
+        # Hardware monitoring background thread state
+        self._hw_stop_event: Optional[threading.Event] = None
+        self._hw_thread: Optional[threading.Thread] = None
+        self._hw_samples: List[Dict[str, float]] = []
+        self._hw_lock = threading.Lock()
+        self._nvml_available = False
+        self._nvml_handle = None
 
         # Within-epoch accumulators (reset each epoch)
         self._reset_epoch_accumulators()
@@ -1158,6 +1179,119 @@ class TrainingMetricsCallback(Callback):
         return min(int(t * self.num_timestep_bins), self.num_timestep_bins - 1)
 
     # =========================================================================
+    # Hardware Monitoring (Background Thread)
+    # =========================================================================
+
+    def _init_nvml(self) -> None:
+        """Try to initialise NVML for GPU monitoring."""
+        try:
+            # nvidia-ml-py installs as "pynvml"; suppress the deprecation
+            # warning that fires when the legacy pynvml wrapper is also present.
+            warnings.filterwarnings("ignore", message=".*pynvml.*deprecated.*")
+            import pynvml
+
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self._nvml_available = True
+        except Exception:
+            self._nvml_available = False
+
+    def _shutdown_nvml(self) -> None:
+        """Shutdown NVML if it was initialised."""
+        if self._nvml_available:
+            try:
+                import pynvml
+
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_available = False
+            self._nvml_handle = None
+
+    def _hw_sample_loop(self) -> None:
+        """Background loop that samples hardware metrics every ~1 second."""
+        import psutil
+
+        while not self._hw_stop_event.is_set():
+            sample: Dict[str, float] = {}
+
+            # GPU metrics via NVML
+            if self._nvml_available:
+                try:
+                    import pynvml
+
+                    util = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                    sample["gpu_util"] = float(util.gpu)
+                    sample["gpu_mem_mb"] = mem_info.used / (1024 ** 2)
+                except Exception:
+                    pass
+
+            # CPU metrics via psutil
+            try:
+                sample["cpu_util"] = psutil.cpu_percent(interval=None)
+                sample["ram_mb"] = psutil.virtual_memory().used / (1024 ** 2)
+            except Exception:
+                pass
+
+            if sample:
+                with self._hw_lock:
+                    self._hw_samples.append(sample)
+
+            self._hw_stop_event.wait(timeout=1.0)
+
+    def _start_hw_monitor(self) -> None:
+        """Start the hardware monitoring background thread."""
+        if self._hw_thread is not None and self._hw_thread.is_alive():
+            return
+
+        if not self._nvml_available:
+            self._init_nvml()
+
+        # Prime psutil's cpu_percent (first call always returns 0)
+        try:
+            import psutil
+
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+        with self._hw_lock:
+            self._hw_samples.clear()
+
+        self._hw_stop_event = threading.Event()
+        self._hw_thread = threading.Thread(
+            target=self._hw_sample_loop, daemon=True
+        )
+        self._hw_thread.start()
+
+    def _stop_hw_monitor(self) -> Dict[str, float]:
+        """Stop the background thread and return aggregated averages."""
+        if self._hw_stop_event is not None:
+            self._hw_stop_event.set()
+
+        if self._hw_thread is not None and self._hw_thread.is_alive():
+            self._hw_thread.join(timeout=3.0)
+
+        self._hw_thread = None
+        self._hw_stop_event = None
+
+        with self._hw_lock:
+            samples = list(self._hw_samples)
+            self._hw_samples.clear()
+
+        if not samples:
+            return {}
+
+        result: Dict[str, float] = {}
+        for key in ("gpu_util", "gpu_mem_mb", "cpu_util", "ram_mb"):
+            values = [s[key] for s in samples if key in s]
+            if values:
+                result[key] = sum(values) / len(values)
+
+        return result
+
+    # =========================================================================
     # PyTorch Lightning Hooks
     # =========================================================================
 
@@ -1167,6 +1301,7 @@ class TrainingMetricsCallback(Callback):
         """Take parameter snapshot and reset accumulators."""
         self._param_snapshot = self._take_param_snapshot(pl_module)
         self._reset_epoch_accumulators()
+        self._start_hw_monitor()
 
     def on_before_optimizer_step(
         self,
@@ -1313,6 +1448,20 @@ class TrainingMetricsCallback(Callback):
             weight_norms[name] = self._compute_weight_norm(pl_module, prefix)
         self.weight_norms.append(weight_norms)
 
+        # Aggregate hardware metrics from background thread
+        hw = self._stop_hw_monitor()
+        self.gpu_utilization.append(hw.get("gpu_util", 0.0))
+        self.gpu_memory_used.append(hw.get("gpu_mem_mb", 0.0))
+        self.cpu_utilization.append(hw.get("cpu_util", 0.0))
+        self.cpu_ram_used.append(hw.get("ram_mb", 0.0))
+
+    def teardown(
+        self, trainer: Trainer, pl_module: pl.LightningModule, stage: str
+    ) -> None:
+        """Clean up hardware monitoring resources."""
+        self._stop_hw_monitor()
+        self._shutdown_nvml()
+
     def on_validation_epoch_end(
         self, trainer: Trainer, pl_module: pl.LightningModule
     ) -> None:
@@ -1348,8 +1497,8 @@ class TrainingMetricsCallback(Callback):
     # =========================================================================
 
     def _create_metrics_plot(self, epoch: int) -> plt.Figure:
-        """Create 4x4 grid of training metrics."""
-        fig, axes = plt.subplots(4, 4, figsize=(16, 14))
+        """Create 5x4 grid of training metrics."""
+        fig, axes = plt.subplots(5, 4, figsize=(16, 17.5))
 
         epochs = list(range(1, len(self.train_losses) + 1))
 
@@ -1376,6 +1525,12 @@ class TrainingMetricsCallback(Callback):
         self._plot_weight_norms(axes[3, 1], epochs)
         self._plot_module_param_deltas(axes[3, 2], epochs)
         self._plot_tanimoto_similarity(axes[3, 3], epochs)
+
+        # Row 5: Hardware utilization
+        self._plot_gpu_utilization(axes[4, 0], epochs)
+        self._plot_gpu_memory(axes[4, 1], epochs)
+        self._plot_cpu_utilization(axes[4, 2], epochs)
+        self._plot_cpu_ram(axes[4, 3], epochs)
 
         fig.suptitle(f"Training Metrics - Epoch {epoch}", fontsize=14, fontweight="bold")
         plt.tight_layout()
@@ -1789,6 +1944,114 @@ class TrainingMetricsCallback(Callback):
         ax.set_title("Tanimoto Similarity")
         ax.set_ylim(-0.05, 1.05)
         ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # =========================================================================
+    # Row 5: Hardware Utilization Plots
+    # =========================================================================
+
+    def _plot_gpu_utilization(self, ax, epochs):
+        """Plot average GPU utilization per epoch."""
+        if not self.gpu_utilization:
+            ax.set_title("GPU Utilization")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.gpu_utilization))
+        ax.plot(
+            epochs[:n_data],
+            self.gpu_utilization[:n_data],
+            color="#e74c3c",
+            linewidth=2,
+        )
+        ax.fill_between(
+            epochs[:n_data],
+            self.gpu_utilization[:n_data],
+            alpha=0.15,
+            color="#e74c3c",
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Utilization (%)")
+        ax.set_title("GPU Utilization (epoch avg)")
+        ax.set_ylim(0, 105)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_gpu_memory(self, ax, epochs):
+        """Plot average GPU memory usage per epoch."""
+        if not self.gpu_memory_used:
+            ax.set_title("GPU Memory")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.gpu_memory_used))
+        values_gb = [v / 1024 for v in self.gpu_memory_used[:n_data]]
+        ax.plot(
+            epochs[:n_data],
+            values_gb,
+            color="#e67e22",
+            linewidth=2,
+        )
+        ax.fill_between(
+            epochs[:n_data],
+            values_gb,
+            alpha=0.15,
+            color="#e67e22",
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Memory (GB)")
+        ax.set_title("GPU Memory Used (epoch avg)")
+        ax.grid(True, alpha=0.3)
+
+    def _plot_cpu_utilization(self, ax, epochs):
+        """Plot average CPU utilization per epoch."""
+        if not self.cpu_utilization:
+            ax.set_title("CPU Utilization")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.cpu_utilization))
+        ax.plot(
+            epochs[:n_data],
+            self.cpu_utilization[:n_data],
+            color="#3498db",
+            linewidth=2,
+        )
+        ax.fill_between(
+            epochs[:n_data],
+            self.cpu_utilization[:n_data],
+            alpha=0.15,
+            color="#3498db",
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Utilization (%)")
+        ax.set_title("CPU Utilization (epoch avg)")
+        ax.set_ylim(0, 105)
+        ax.grid(True, alpha=0.3)
+
+    def _plot_cpu_ram(self, ax, epochs):
+        """Plot average CPU RAM usage per epoch."""
+        if not self.cpu_ram_used:
+            ax.set_title("CPU RAM")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+
+        n_data = min(len(epochs), len(self.cpu_ram_used))
+        values_gb = [v / 1024 for v in self.cpu_ram_used[:n_data]]
+        ax.plot(
+            epochs[:n_data],
+            values_gb,
+            color="#2ecc71",
+            linewidth=2,
+        )
+        ax.fill_between(
+            epochs[:n_data],
+            values_gb,
+            alpha=0.15,
+            color="#2ecc71",
+        )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("RAM (GB)")
+        ax.set_title("CPU RAM Used (epoch avg)")
         ax.grid(True, alpha=0.3)
 
 
