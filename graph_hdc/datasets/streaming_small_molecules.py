@@ -118,38 +118,80 @@ def _small_mol_worker_process(
     import sys
     import time as time_module
 
-    from rdkit import Chem, RDLogger as _RDLogger
-    _RDLogger.DisableLog('rdApp.*')
-
     def log_msg(msg: str) -> None:
         print(f"[SmallMolWorker {worker_id}] {msg}", file=sys.stderr, flush=True)
 
     log_msg("Starting worker process...")
 
+    # -- Stage 1: core imports -----------------------------------------------
     try:
-        from graph_hdc.hypernet import load_hypernet
+        log_msg("[init 1/5] Importing rdkit...")
+        from rdkit import Chem, RDLogger as _RDLogger
+        _RDLogger.DisableLog('rdApp.*')
+        log_msg("[init 1/5] rdkit OK")
+    except Exception as e:
+        log_msg(f"FATAL [init 1/5] rdkit import failed: {e}")
+        import traceback; traceback.print_exc()
+        return
 
-        log_msg(f"Loading HyperNet from {hypernet_checkpoint_path}")
+    # -- Stage 2: graph_hdc imports ------------------------------------------
+    try:
+        log_msg("[init 2/5] Importing graph_hdc.hypernet...")
+        from graph_hdc.hypernet import load_hypernet
+        log_msg("[init 2/5] graph_hdc imports OK")
+    except Exception as e:
+        log_msg(f"FATAL [init 2/5] graph_hdc import failed: {e}")
+        import traceback; traceback.print_exc()
+        return
+
+    # -- Stage 3: checkpoint validation --------------------------------------
+    try:
+        import os
+        log_msg(f"[init 3/5] Checking checkpoint: {hypernet_checkpoint_path}")
+        if not os.path.exists(hypernet_checkpoint_path):
+            log_msg(f"FATAL [init 3/5] Checkpoint not found: {hypernet_checkpoint_path}")
+            return
+        ckpt_size_mb = os.path.getsize(hypernet_checkpoint_path) / (1024 ** 2)
+        log_msg(f"[init 3/5] Checkpoint exists ({ckpt_size_mb:.1f} MB)")
+    except Exception as e:
+        log_msg(f"FATAL [init 3/5] Checkpoint check failed: {e}")
+        import traceback; traceback.print_exc()
+        return
+
+    # -- Stage 4: load HyperNet ----------------------------------------------
+    try:
+        log_msg("[init 4/5] Loading HyperNet...")
         hypernet = load_hypernet(hypernet_checkpoint_path, device="cpu")
         hypernet.eval()
+        log_msg("[init 4/5] HyperNet loaded OK")
+    except Exception as e:
+        log_msg(f"FATAL [init 4/5] HyperNet loading failed: {e}")
+        import traceback; traceback.print_exc()
+        return
 
-        # Check if RW augmentation is needed
+    # -- Stage 5: optional RW augmentation -----------------------------------
+    try:
         _use_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
         if _use_rw:
+            log_msg("[init 5/5] Setting up RW augmentation...")
             from graph_hdc.utils.rw_features import augment_data_with_rw
             _rw_k = hypernet.rw_config.k_values
             _rw_bins = hypernet.rw_config.num_bins
             _rw_boundaries = hypernet.rw_config.bin_boundaries
             _rw_clip_range = hypernet.rw_config.clip_range
             bin_mode = "quantile" if _rw_boundaries else ("clipped" if _rw_clip_range else "uniform")
-            log_msg(f"RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, mode={bin_mode}")
-
-        log_msg(f"HyperNet loaded (batch_size={encoding_batch_size})")
+            log_msg(f"[init 5/5] RW augmentation enabled: k={_rw_k}, bins={_rw_bins}, mode={bin_mode}")
+        else:
+            log_msg("[init 5/5] No RW augmentation")
     except Exception as e:
-        log_msg(f"FATAL: Failed to load HyperNet: {e}")
-        import traceback
-        traceback.print_exc()
+        log_msg(f"FATAL [init 5/5] RW augmentation setup failed: {e}")
+        import traceback; traceback.print_exc()
         return
+
+    log_msg(
+        f"Worker ready: pool={len(smiles_list)}, "
+        f"batch_size={encoding_batch_size}, max_nodes={max_nodes}"
+    )
 
     iteration = 0
     retry_count = 0
@@ -359,6 +401,32 @@ class SmallMoleculeStreamingDataset(torch.utils.data.IterableDataset):
         self._workers: list = []
         self._started = False
 
+    # -- diagnostics ---------------------------------------------------------
+
+    def _format_worker_diagnostics(self) -> str:
+        """Collect exit codes from dead workers."""
+        lines = []
+        for i, w in enumerate(self._workers):
+            code = w.exitcode
+            if code is None:
+                status = "still running"
+            elif code == 0:
+                status = "exited normally (init error caught — check stderr)"
+            elif code < 0:
+                import signal as sig_mod
+
+                try:
+                    sig_name = sig_mod.Signals(-code).name
+                except (ValueError, AttributeError):
+                    sig_name = f"signal {-code}"
+                status = f"killed by {sig_name}"
+                if code == -9:
+                    status += " (likely OOM)"
+            else:
+                status = f"exited with code {code}"
+            lines.append(f"  Worker {i}: {status}")
+        return "\n".join(lines)
+
     # -- public interface expected by MixedStreamingDataLoader ---------------
 
     @property
@@ -438,7 +506,10 @@ class SmallMoleculeStreamingDataset(torch.utils.data.IterableDataset):
             if elapsed > prefill_timeout:
                 alive_workers = [w for w in self._workers if w.is_alive()]
                 if not alive_workers:
-                    raise RuntimeError("All small-molecule workers died during prefill.")
+                    raise RuntimeError(
+                        "All small-molecule workers died during prefill.\n"
+                        + self._format_worker_diagnostics()
+                    )
                 print(
                     f"[SmallMolDataset] Warning: Prefill timeout after {elapsed:.1f}s, "
                     f"but {len(alive_workers)} workers still alive. Continuing...",
@@ -464,8 +535,10 @@ class SmallMoleculeStreamingDataset(torch.utils.data.IterableDataset):
             except Exception:
                 alive = sum(1 for w in self._workers if w.is_alive())
                 if alive == 0:
-                    raise RuntimeError("All small-molecule workers died during prefill")
-                time.sleep(0.5)
+                    raise RuntimeError(
+                        "All small-molecule workers died during prefill.\n"
+                        + self._format_worker_diagnostics()
+                    )
 
         print(
             f"[SmallMolDataset] Buffer prefilled with ~{samples_received} samples",
