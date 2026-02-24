@@ -27,6 +27,62 @@ from torch import Tensor
 
 
 # =============================================================================
+# Loss Functions
+# =============================================================================
+
+
+class PseudoHuberLoss(nn.Module):
+    """Pseudo-Huber loss for flow matching velocity prediction.
+
+    Smooth approximation transitioning from L2 (small residuals) to L1 (large
+    residuals).  More robust to outlier velocity targets than MSE.
+
+    Reference: Lee et al., "Improving the Training of Rectified Flows"
+    (NeurIPS 2024), https://arxiv.org/abs/2405.20320
+
+    Args:
+        data_dim: Dimension of the velocity vectors, used to compute the
+            default scale ``c = 0.00054 * sqrt(data_dim)``.
+        c: Override for the transition scale. When None, uses the paper default.
+    """
+
+    def __init__(self, data_dim: int, c: float | None = None):
+        super().__init__()
+        self.c = c if c is not None else 0.00054 * math.sqrt(data_dim)
+
+    def forward(self, v_pred: Tensor, v_target: Tensor) -> Tensor:
+        delta_sq = (v_pred - v_target).pow(2).sum(dim=-1)
+        return (torch.sqrt(delta_sq + self.c ** 2) - self.c).mean()
+
+
+def sample_logit_normal(
+    n: int,
+    m: float = 0.0,
+    s: float = 1.0,
+    device: torch.device | None = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    """Sample timesteps from a logit-normal distribution.
+
+    Concentrates samples on mid-range timesteps where signal and noise
+    compete, improving training efficiency for flow matching.
+
+    Reference: Esser et al., "Scaling Rectified Flow Transformers for
+    High-Resolution Image Synthesis" (SD3, 2024), https://arxiv.org/abs/2403.03206
+
+    Args:
+        n: Number of samples.
+        m: Mean of the underlying normal distribution.
+        s: Std of the underlying normal distribution.
+        device: Device for the output tensor.
+        eps: Clamping epsilon to avoid singularities at t=0 and t=1.
+    """
+    z = torch.randn(n, device=device)
+    t = torch.sigmoid(m + s * z)
+    return t.clamp(eps, 1.0 - eps)
+
+
+# =============================================================================
 # Time Embedding
 # =============================================================================
 
@@ -104,6 +160,96 @@ class FiLMResidualBlock(nn.Module):
         h = self.dropout(h)
 
         return x + h
+
+
+# =============================================================================
+# adaLN-Zero Transformer Block
+# =============================================================================
+
+
+class AdaLNZeroBlock(nn.Module):
+    """Transformer block with adaptive LayerNorm Zero conditioning.
+
+    Implements the DiT block from Peebles & Xie (2023):
+    pre-norm adaLN → multi-head self-attention → gated residual,
+    pre-norm adaLN → pointwise FFN → gated residual.
+
+    The conditioning signal produces 6 modulation parameters per block:
+    ``(gamma1, beta1, alpha1, gamma2, beta2, alpha2)`` where gamma/beta
+    modulate the LayerNorm output and alpha gates the residual branch.
+    All modulations are zero-initialized so the block starts as identity.
+
+    Reference: Peebles & Xie, "Scalable Diffusion Models with Transformers"
+    (ICCV 2023), https://arxiv.org/abs/2212.09748
+
+    Args:
+        hidden_dim: Token embedding dimension.
+        num_heads: Number of attention heads.
+        mlp_ratio: FFN hidden dimension as multiple of hidden_dim.
+        dropout: Dropout rate.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, bias=False)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, bias=False)
+
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        # adaLN modulation: conditioning -> 6 * hidden_dim
+        # (gamma1, beta1, alpha1, gamma2, beta2, alpha2)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6 * hidden_dim),
+        )
+        # Zero-init so gates start at 0 (identity residual)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x: Tensor, c: Tensor) -> Tensor:
+        """
+        Args:
+            x: (batch_size, num_tokens, hidden_dim) token sequence.
+            c: (batch_size, hidden_dim) conditioning embedding.
+
+        Returns:
+            (batch_size, num_tokens, hidden_dim) updated tokens.
+        """
+        mod = self.adaLN_modulation(c)  # (bs, 6 * hidden_dim)
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = mod.chunk(6, dim=-1)
+
+        # Attention block
+        h = self.norm1(x)
+        h = h * (1 + gamma1.unsqueeze(1)) + beta1.unsqueeze(1)
+        h, _ = self.attn(h, h, h, need_weights=False)
+        x = x + alpha1.unsqueeze(1) * h
+
+        # FFN block
+        h = self.norm2(x)
+        h = h * (1 + gamma2.unsqueeze(1)) + beta2.unsqueeze(1)
+        h = self.mlp(h)
+        x = x + alpha2.unsqueeze(1) * h
+
+        return x
 
 
 # =============================================================================
@@ -200,19 +346,197 @@ class VelocityMLP(nn.Module):
 
 
 # =============================================================================
+# Velocity DiT (Diffusion Transformer)
+# =============================================================================
+
+
+class VelocityDiT(nn.Module):
+    """
+    DiT-style Transformer velocity field v_theta(x_t, t, condition) for flow matching.
+
+    Chunks the flat data vector into a sequence of tokens, processes them
+    with self-attention transformer blocks using adaLN-Zero conditioning,
+    then unpatches back to the original dimension.
+
+    This captures cross-dimensional correlations that the MLP architecture
+    misses, since HDC binding operations create complex inter-dimensional
+    dependencies that require explicit pairwise modeling.
+
+    Reference: Peebles & Xie, "Scalable Diffusion Models with Transformers"
+    (ICCV 2023), https://arxiv.org/abs/2212.09748
+
+    Args:
+        data_dim: Dimension of input/output data vectors.
+        hidden_dim: Transformer hidden dimension per token.
+        num_blocks: Number of DiT transformer blocks.
+        num_heads: Number of attention heads. Must divide hidden_dim.
+        num_tokens: Number of tokens to chunk the input into.
+        mlp_ratio: FFN hidden dim as multiple of hidden_dim.
+        time_embed_dim: Dimension of sinusoidal time embedding.
+        condition_dim: Dimension of optional condition input (0 = unconditional).
+        dropout: Dropout rate.
+    """
+
+    def __init__(
+        self,
+        data_dim: int,
+        hidden_dim: int = 768,
+        num_blocks: int = 6,
+        num_heads: int = 8,
+        num_tokens: int = 32,
+        mlp_ratio: float = 4.0,
+        time_embed_dim: int = 128,
+        condition_dim: int = 0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, (
+            f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
+        )
+
+        self.data_dim = data_dim
+        self.hidden_dim = hidden_dim
+        self.num_tokens = num_tokens
+        self.condition_dim = condition_dim
+
+        # Compute chunk size (pad if not evenly divisible)
+        self.chunk_size = math.ceil(data_dim / num_tokens)
+        self.padded_dim = self.chunk_size * num_tokens
+
+        # Patchify: project each chunk to hidden_dim
+        self.input_proj = nn.Linear(self.chunk_size, hidden_dim)
+
+        # Learned positional embedding for tokens
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, hidden_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Time embedding: sinusoidal -> MLP -> hidden_dim
+        self.time_embed = nn.Sequential(
+            SinusoidalTimeEmbedding(time_embed_dim),
+            nn.Linear(time_embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Condition embedding (optional)
+        if condition_dim > 0:
+            self.cond_embed = nn.Sequential(
+                nn.Linear(condition_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.cond_embed = None
+
+        # Transformer blocks with adaLN-Zero
+        self.blocks = nn.ModuleList([
+            AdaLNZeroBlock(hidden_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_blocks)
+        ])
+
+        # Final layer: adaLN (scale + shift only) + linear unpatchify
+        self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, bias=False)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+        )
+        nn.init.zeros_(self.final_modulation[-1].weight)
+        nn.init.zeros_(self.final_modulation[-1].bias)
+
+        # Unpatchify: hidden_dim -> chunk_size per token (zero-initialized)
+        self.output_proj = nn.Linear(hidden_dim, self.chunk_size)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        condition: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Predict velocity field at (x_t, t).
+
+        Args:
+            x_t: (batch_size, data_dim) noisy data at time t.
+            t: (batch_size,) time in [0, 1].
+            condition: (batch_size, condition_dim) optional condition.
+
+        Returns:
+            (batch_size, data_dim) predicted velocity.
+        """
+        if t.dim() == 2:
+            t = t.squeeze(-1)
+
+        bs = x_t.shape[0]
+
+        # Pad input if needed
+        if self.padded_dim > self.data_dim:
+            x_t = F.pad(x_t, (0, self.padded_dim - self.data_dim))
+
+        # Patchify: (bs, padded_dim) -> (bs, num_tokens, chunk_size)
+        tokens = x_t.view(bs, self.num_tokens, self.chunk_size)
+
+        # Project to hidden_dim and add positional embedding
+        h = self.input_proj(tokens) + self.pos_embed
+
+        # Build conditioning signal
+        c = self.time_embed(t)  # (bs, hidden_dim)
+        if self.cond_embed is not None and condition is not None:
+            c = c + self.cond_embed(condition)
+
+        # Transformer blocks
+        for block in self.blocks:
+            h = block(h, c)
+
+        # Final adaLN + projection
+        mod = self.final_modulation(c)
+        gamma, beta = mod.chunk(2, dim=-1)
+        h = self.final_norm(h)
+        h = h * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+        # Unpatchify: (bs, num_tokens, hidden_dim) -> (bs, num_tokens, chunk_size)
+        out = self.output_proj(h)
+
+        # Flatten and truncate padding
+        out = out.reshape(bs, self.padded_dim)
+        return out[:, :self.data_dim]
+
+
+# =============================================================================
 # Model Wrapper for flow_matching library
 # =============================================================================
 
 
 class VelocityModelWrapper(ModelWrapper):
-    """Wraps VelocityMLP for use with flow_matching ODESolver."""
+    """Wraps a velocity network (VelocityMLP or VelocityDiT) for use with
+    flow_matching ODESolver.
 
-    def __init__(self, velocity_net: VelocityMLP):
+    For x-prediction, converts the network's x_1 prediction to velocity
+    using ``path.target_to_velocity()`` so the ODE solver receives a
+    proper velocity field.
+    """
+
+    def __init__(
+        self,
+        velocity_net: nn.Module,
+        path: Optional["AffineProbPath"] = None,
+        prediction_type: str = "velocity",
+    ):
         super().__init__(velocity_net)
+        self.path = path
+        self.prediction_type = prediction_type
 
     def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:
         condition = extras.get("condition", None)
-        return self.model(x_t=x, t=t, condition=condition)
+        output = self.model(x_t=x, t=t, condition=condition)
+        if self.prediction_type == "x_prediction":
+            # Clamp t away from 1 to avoid division by sigma_t = 1-t = 0
+            # in target_to_velocity. This only affects the reverse ODE
+            # (encode / NLL) where the solver evaluates at t=1.
+            t_safe = t.clamp(max=1.0 - 1e-5)
+            return self.path.target_to_velocity(output, x, t_safe)
+        return output
 
 
 # =============================================================================
@@ -545,8 +869,8 @@ class FlowMatchingModel(pl.LightningModule):
 
     Args:
         data_dim: Dimension of data vectors.
-        hidden_dim: Hidden dimension for the velocity MLP.
-        num_blocks: Number of residual FiLM blocks.
+        hidden_dim: Hidden dimension for the velocity network.
+        num_blocks: Number of blocks (FiLM residual for MLP, Transformer for DiT).
         time_embed_dim: Dimension of sinusoidal time embedding.
         condition_dim: Raw condition input dimension (0 = unconditional).
         condition_embed_dim: Dimension to project raw conditions into via MLP.
@@ -558,6 +882,11 @@ class FlowMatchingModel(pl.LightningModule):
         lr: Learning rate.
         weight_decay: Weight decay for AdamW.
         warmup_epochs: Number of linear warmup epochs.
+        velocity_arch: Velocity network architecture. ``"mlp"`` for FiLM residual
+            MLP, ``"dit"`` for DiT-style Transformer with adaLN-Zero.
+        num_heads: Number of attention heads (DiT only). Must divide hidden_dim.
+        num_tokens: Number of tokens to chunk the data vector into (DiT only).
+        mlp_ratio: FFN hidden dimension as multiple of hidden_dim (DiT only).
     """
 
     def __init__(
@@ -570,11 +899,22 @@ class FlowMatchingModel(pl.LightningModule):
         condition_embed_dim: int = 64,
         dropout: float = 0.0,
         use_ot_coupling: bool = True,
+        loss_type: str = "mse",
+        time_sampling: str = "uniform",
+        prediction_type: str = "velocity",
         solver_method: str = "midpoint",
         default_sample_steps: int = 100,
         lr: float = 2e-4,
         weight_decay: float = 1e-5,
         warmup_epochs: int = 5,
+        velocity_arch: str = "mlp",
+        num_heads: int = 8,
+        num_tokens: int = 32,
+        mlp_ratio: float = 4.0,
+        vector_part: str = "both",
+        cosine_loss_weight: float = 0.0,
+        dequant_sigma: float = 0.0,
+        cond_dropout_prob: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -582,8 +922,15 @@ class FlowMatchingModel(pl.LightningModule):
         self.data_dim = data_dim
         self.condition_dim = condition_dim
         self.use_ot_coupling = use_ot_coupling
+        self.loss_type = loss_type
+        self.time_sampling = time_sampling
+        self.prediction_type = prediction_type
         self.solver_method = solver_method
         self.default_sample_steps = default_sample_steps
+        self.vector_part = vector_part
+        self.cosine_loss_weight = cosine_loss_weight
+        self.dequant_sigma = dequant_sigma
+        self.cond_dropout_prob = cond_dropout_prob
         self.lr = lr
         self.weight_decay = weight_decay
         self.warmup_epochs = warmup_epochs
@@ -600,24 +947,50 @@ class FlowMatchingModel(pl.LightningModule):
             self.condition_proj = None
             velocity_condition_dim = 0
 
-        # Velocity network
-        self.velocity_net = VelocityMLP(
-            data_dim=data_dim,
-            hidden_dim=hidden_dim,
-            num_blocks=num_blocks,
-            time_embed_dim=time_embed_dim,
-            condition_dim=velocity_condition_dim,
-            dropout=dropout,
-        )
-
-        # Wrapper for the flow_matching library's ODESolver
-        self.wrapper = VelocityModelWrapper(self.velocity_net)
+        # Velocity network (architecture selection)
+        if velocity_arch == "dit":
+            self.velocity_net = VelocityDiT(
+                data_dim=data_dim,
+                hidden_dim=hidden_dim,
+                num_blocks=num_blocks,
+                num_heads=num_heads,
+                num_tokens=num_tokens,
+                mlp_ratio=mlp_ratio,
+                time_embed_dim=time_embed_dim,
+                condition_dim=velocity_condition_dim,
+                dropout=dropout,
+            )
+        elif velocity_arch == "mlp":
+            self.velocity_net = VelocityMLP(
+                data_dim=data_dim,
+                hidden_dim=hidden_dim,
+                num_blocks=num_blocks,
+                time_embed_dim=time_embed_dim,
+                condition_dim=velocity_condition_dim,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(
+                f"Unknown velocity_arch '{velocity_arch}'. "
+                f"Choose from: 'mlp', 'dit'."
+            )
 
         # Probability path (CondOT: x_t = t*x_1 + (1-t)*x_0)
         self.path = CondOTProbPath()
 
+        # Wrapper for the flow_matching library's ODESolver
+        self.wrapper = VelocityModelWrapper(
+            self.velocity_net, path=self.path, prediction_type=prediction_type,
+        )
+
         # OT coupler
         self.ot_coupler = MinibatchOTCoupler()
+
+        # Loss criterion
+        if loss_type == "pseudo_huber":
+            self.criterion = PseudoHuberLoss(data_dim)
+        else:
+            self.criterion = nn.MSELoss()
 
         # Standardization buffers.
         # Initialized to identity transform (mean=0, std=1) so standardize /
@@ -627,6 +1000,53 @@ class FlowMatchingModel(pl.LightningModule):
         self.register_buffer("data_mean", torch.zeros(data_dim))
         self.register_buffer("data_std", torch.ones(data_dim))
 
+        # PCA dimensionality reduction buffers.
+        # When set via set_pca(), _extract_vectors projects to PCA space and
+        # sample() inverse-projects back to the original space.  Registered as
+        # None so Lightning's state_dict skips them when PCA is unused.
+        self.register_buffer("pca_components", None)  # (pca_dim, original_dim)
+        self.register_buffer("pca_mean", None)         # (original_dim,)
+
+    # -------------------------------------------------------------------------
+    # PCA dimensionality reduction
+    # -------------------------------------------------------------------------
+
+    @property
+    def _use_pca(self) -> bool:
+        return self.pca_components is not None
+
+    def set_pca(self, components: Tensor, mean: Tensor) -> None:
+        """Store PCA projection matrices as persistent buffers.
+
+        Args:
+            components: (pca_dim, original_dim) principal component rows.
+            mean: (original_dim,) data mean used for centering.
+        """
+        self.pca_components = components
+        self.pca_mean = mean
+
+    def pca_project(self, x: Tensor) -> Tensor:
+        """Project from original space to PCA space. (*, D) -> (*, K)."""
+        return (x - self.pca_mean) @ self.pca_components.T
+
+    def pca_inverse(self, z: Tensor) -> Tensor:
+        """Reconstruct from PCA space to original space. (*, K) -> (*, D)."""
+        return z @ self.pca_components + self.pca_mean
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        """Handle optional PCA buffers that were None at init."""
+        for buf_name in ("pca_components", "pca_mean"):
+            key = prefix + buf_name
+            if key in state_dict and getattr(self, buf_name) is None:
+                # Materialize the buffer so the parent's strict check passes.
+                self.register_buffer(buf_name, state_dict[key].clone())
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     # -------------------------------------------------------------------------
     # Standardization
@@ -668,6 +1088,21 @@ class FlowMatchingModel(pl.LightningModule):
             Scalar MSE loss.
         """
         x1 = self.standardize(x1)
+
+        # Dequantization: smooth the discrete lattice during training
+        if self.training and self.dequant_sigma > 0:
+            x1 = x1 + torch.randn_like(x1) * self.dequant_sigma
+
+        # Condition dropout: randomly zero out the entire condition vector
+        # for a fraction of samples during training. Prevents memorization
+        # of condition->target pairs and enables classifier-free guidance.
+        if self.training and self.cond_dropout_prob > 0 and condition is not None:
+            keep_mask = (
+                torch.rand(condition.shape[0], 1, device=condition.device)
+                >= self.cond_dropout_prob
+            ).float()
+            condition = condition * keep_mask
+
         condition = self._project_condition(condition)
         bs = x1.shape[0]
 
@@ -689,7 +1124,10 @@ class FlowMatchingModel(pl.LightningModule):
             x0 = x0_coupled
 
         # Sample time
-        t = torch.rand(bs, device=x1.device)
+        if self.time_sampling == "logit_normal":
+            t = sample_logit_normal(bs, device=x1.device)
+        else:
+            t = torch.rand(bs, device=x1.device)
 
         # Get path sample (x_t and target velocity dx_t)
         path_sample = self.path.sample(x_0=x0, x_1=x1, t=t)
@@ -697,8 +1135,26 @@ class FlowMatchingModel(pl.LightningModule):
         # Predict velocity
         v_pred = self.velocity_net(path_sample.x_t, t, condition)
 
-        # MSE loss against target velocity
-        return F.mse_loss(v_pred, path_sample.dx_t)
+        # Main loss
+        if self.prediction_type == "x_prediction":
+            main_loss = self.criterion(v_pred, path_sample.x_1)
+        else:
+            main_loss = self.criterion(v_pred, path_sample.dx_t)
+
+        # Auxiliary cosine similarity loss
+        if self.cosine_loss_weight > 0.0:
+            if self.prediction_type == "x_prediction":
+                x1_hat = v_pred  # network directly predicts x_1
+            else:
+                # Exact reconstruction for CondOT: x_1 = x_t + (1-t) * v
+                x1_hat = path_sample.x_t + (1.0 - t.unsqueeze(-1)) * v_pred
+            cos_sim = F.cosine_similarity(x1_hat, path_sample.x_1, dim=-1)
+            cosine_loss = (1.0 - cos_sim).mean()
+            if self.training:
+                self._cosine_loss = cosine_loss.detach().item()
+            main_loss = main_loss + self.cosine_loss_weight * cosine_loss
+
+        return main_loss
 
     def training_step(self, batch, batch_idx) -> Tensor:
         x1 = self._extract_vectors(batch)
@@ -708,6 +1164,11 @@ class FlowMatchingModel(pl.LightningModule):
             "train/loss", loss.detach(), prog_bar=True,
             batch_size=x1.shape[0], on_step=True, on_epoch=True,
         )
+        if self.cosine_loss_weight > 0.0 and hasattr(self, "_cosine_loss"):
+            self.log(
+                "train/cosine_loss", self._cosine_loss, prog_bar=False,
+                batch_size=x1.shape[0], on_step=True, on_epoch=True,
+            )
         return loss
 
     def validation_step(self, batch, batch_idx) -> Tensor:
@@ -764,7 +1225,10 @@ class FlowMatchingModel(pl.LightningModule):
             condition=condition,
         )
 
-        return self.destandardize(x1)
+        x1 = self.destandardize(x1)
+        if self._use_pca:
+            x1 = self.pca_inverse(x1)
+        return x1
 
     def encode(
         self,
@@ -789,6 +1253,8 @@ class FlowMatchingModel(pl.LightningModule):
         step_size = 1.0 / num_steps
         device = x1.device
 
+        if self._use_pca:
+            x1 = self.pca_project(x1)
         x1_std = self.standardize(x1)
 
         if condition is None and self.condition_dim > 0:
@@ -866,28 +1332,47 @@ class FlowMatchingModel(pl.LightningModule):
     def _extract_vectors(self, batch) -> Tensor:
         """Extract flat HDC vectors from a PyG batch.
 
-        Uses ``[node_terms | graph_terms]`` so the first half contains
-        the bundled raw node hypervectors (order-0), which can be
-        iteratively decoded back into node identities.
+        Respects ``self.vector_part``:
+        - ``"both"``: returns ``[node_terms | graph_terms]`` (default).
+        - ``"node_terms"``: returns only the bundled order-0 node HVs.
+        - ``"graph_terms"``: returns only the graph-level HVs.
         """
         bs = batch.num_graphs
         node_terms = batch.node_terms.view(bs, -1)
         graph_terms = batch.graph_terms.view(bs, -1)
+
+        if self.vector_part == "node_terms":
+            vectors = node_terms
+        elif self.vector_part == "graph_terms":
+            vectors = graph_terms
+        else:  # "both"
+            vectors = torch.cat([node_terms, graph_terms], dim=-1)
+
         # .as_subclass(Tensor) strips HRRTensor (or other subclasses) back to
         # plain Tensor so downstream ops and Lightning deepcopy work correctly.
-        return (
-            torch.cat([node_terms, graph_terms], dim=-1)
-            .float()
-            .as_subclass(torch.Tensor)
-        )
+        vectors = vectors.float().as_subclass(torch.Tensor)
+
+        if self._use_pca:
+            vectors = self.pca_project(vectors)
+
+        return vectors
 
     def _extract_condition(self, batch) -> Optional[Tensor]:
-        """Extract condition from batch. Auto-detects batch.condition attribute.
+        """Extract condition from batch.
 
-        Returns None if condition_dim is 0 or no condition attribute is present.
+        When ``vector_part="graph_terms"``, uses ``node_terms`` as the
+        condition (for two-stage hierarchical generation).  Otherwise,
+        auto-detects ``batch.condition``.
+
+        Returns None if condition_dim is 0 or no condition is available.
         """
         if self.condition_dim <= 0:
             return None
+
+        # Two-stage: graph_terms flow is conditioned on node_terms
+        if self.vector_part == "graph_terms":
+            bs = batch.num_graphs
+            return batch.node_terms.view(bs, -1).float().as_subclass(torch.Tensor)
 
         if hasattr(batch, "condition") and batch.condition is not None:
             bs = batch.num_graphs

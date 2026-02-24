@@ -106,11 +106,11 @@ FLOW_MATCHING_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/
 
 # :param NUM_SAMPLES:
 #     Number of HDC vectors to sample from the flow model.
-NUM_SAMPLES: int = 100
+NUM_SAMPLES: int = 10
 
 # :param NUM_REPETITIONS:
 #     Best-of-N for FlowEdgeDecoder edge generation (batched).
-NUM_REPETITIONS: int = 64
+NUM_REPETITIONS: int = 256
 
 # :param SAMPLE_STEPS:
 #     Number of ODE steps for FlowEdgeDecoder discrete flow sampling.
@@ -130,7 +130,12 @@ SAMPLE_TIME_DISTORTION: str = "polydec"
 
 # :param FM_SAMPLE_STEPS:
 #     Number of ODE steps for FlowMatchingModel sampling.
-FM_SAMPLE_STEPS: int = 2_500
+FM_SAMPLE_STEPS: int = 1_000
+
+# :param FM_SOLVER_METHOD:
+#     ODE solver method for FlowMatchingModel sampling. Options: "euler",
+#     "midpoint", "dopri5". None = use whatever was saved in the checkpoint.
+FM_SOLVER_METHOD: Optional[str] = "dopri5"
 
 # -----------------------------------------------------------------------------
 # Conditioning (optional)
@@ -158,7 +163,7 @@ COMPARE_DATASET: bool = True
 
 # :param DATASET_SUBSAMPLE:
 #     Number of reference molecules to subsample for comparison.
-DATASET_SUBSAMPLE: int = 1000
+DATASET_SUBSAMPLE: int = 5_000
 
 # -----------------------------------------------------------------------------
 # System Configuration
@@ -189,7 +194,7 @@ PLOT_NORM_DECAY: bool = True
 
 # :param SEED:
 #     Random seed for reproducibility.
-SEED: int = 42
+SEED: int = 43
 
 # :param __DEBUG__:
 #     Debug mode — reuses same output folder during development.
@@ -649,6 +654,11 @@ def experiment(e: Experiment) -> None:
     flow_model.to(device)
     flow_model.eval()
 
+    # Override solver method if specified
+    if e.FM_SOLVER_METHOD is not None:
+        e.log(f"Overriding solver method: {flow_model.solver_method} -> {e.FM_SOLVER_METHOD}")
+        flow_model.solver_method = e.FM_SOLVER_METHOD
+
     e["model/base_hdc_dim"] = base_hdc_dim
     e["model/concat_hdc_dim"] = 2 * base_hdc_dim
 
@@ -790,12 +800,20 @@ def experiment(e: Experiment) -> None:
             device=device,
         )
 
+        # Use decoded node tuples as raw features for HDC distance computation.
+        # We cannot rely on onehot_to_raw_features(generated_data.x) because
+        # dense_to_pyg treats the concatenated multi-feature one-hot as a
+        # single-class one-hot (argmax→one_hot), destroying all features
+        # except atom type.
+        raw_x = torch.tensor(node_tuples, dtype=torch.float)
+
         with torch.no_grad():
             if num_reps > 1:
                 def score_fn(s):
                     return compute_hdc_distance(
                         s, hdc_vec_device, base_hdc_dim,
                         hypernet, device, dataset=e.DATASET,
+                        original_x=raw_x,
                     )
 
                 best_sample, best_distance, _avg_distance = decoder.sample_best_of_n(
@@ -825,20 +843,23 @@ def experiment(e: Experiment) -> None:
         hdc_dist = compute_hdc_distance(
             generated_data, hdc_vec_device, base_hdc_dim,
             hypernet, device, dataset=e.DATASET,
+            original_x=raw_x,
         )
 
         # 3f. Save molecule PNG with SMILES title and HDC distance
         mol_img = draw_mol_or_error(mol, size=(300, 300))
-        title = f"{smiles or 'N/A'}  |  HDC dist: {hdc_dist:.4f}"
+        line1 = f"HDC dist: {hdc_dist:.4f}"
+        line2 = smiles or "N/A"
         # Create composite image with title bar
         try:
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
         except OSError:
             font = ImageFont.load_default()
-        title_h = 30
+        title_h = 45
         composite = Image.new("RGB", (mol_img.width, mol_img.height + title_h), "white")
         draw_ctx = ImageDraw.Draw(composite)
-        draw_ctx.text((5, 5), title, fill="black", font=font)
+        draw_ctx.text((5, 3), line1, fill="black", font=font)
+        draw_ctx.text((5, 20), line2, fill="black", font=font)
         composite.paste(mol_img, (0, title_h))
         composite.save(molecules_dir / f"molecule_{idx:04d}.png")
 

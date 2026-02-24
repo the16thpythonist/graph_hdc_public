@@ -33,28 +33,72 @@ from graph_hdc.utils.helpers import TupleIndexer, cartesian_bind_tensor, scatter
 
 
 class RRWPHyperNet(HyperNet):
-    """
-    HyperNet variant that uses RRWP-augmented node features for order-0
-    terms but base-only features for message passing.
+    """HyperNet variant with Random Walk Return Probability (RRWP) features.
 
-    Maintains two node codebooks:
+    RRWP features capture global structural information — ring membership,
+    node centrality, bridge positions — that local message passing may miss.
+    Each node is annotated with the probability that a random walk of length
+    *k* returns to its starting position, computed for one or more values of
+    *k*.  These continuous probabilities are discretised into bin indices and
+    appended to the base node feature vector before codebook lookup.  See
+    :mod:`graph_hdc.utils.rw_features` for the computation and binning
+    details.
 
-    - ``nodes_codebook`` (inherited): base features only, used for message
-      passing, edge_terms, and graph_embedding.
-    - ``nodes_codebook_full``: base + RRWP features, used exclusively for
-      node_terms (order-0 readout) and order-0 decoding.
+    Split-codebook architecture
+    ---------------------------
+    To prevent positional/structural RRWP information from leaking into the
+    message-passing binding operations, this class maintains **two separate
+    node codebooks**:
+
+    ``nodes_codebook`` (inherited from :class:`HyperNet`)
+        Maps **base features only** (atom type, degree, charge, …) to
+        hypervectors.  Used for all message-passing rounds, producing
+        ``edge_terms`` and ``graph_embedding``.
+
+    ``nodes_codebook_full``
+        Maps the **full feature vector** (base + RRWP bin indices) to
+        hypervectors.  Used exclusively for the order-0 ``node_terms``
+        readout and for order-0 decoding.
+
+    During :meth:`forward`, message passing runs entirely on the base
+    codebook.  Afterwards, ``node_terms`` is recomputed by bundling the
+    full-codebook hypervectors (``node_hv_full``), giving the order-0
+    embedding access to RRWP-enriched representations without affecting
+    edge-level structural binding.
+
+    Data flow
+    ---------
+    1. RRWP columns are appended to ``data.x`` *before* encoding (typically
+       by :func:`~graph_hdc.datasets.utils.encode_dataset` or
+       :func:`~graph_hdc.utils.rw_features.augment_data_with_rw`).
+    2. :meth:`encode_properties` performs two codebook lookups on the
+       augmented ``data.x``:
+
+       - base features (first *F* columns) → ``data.node_hv``
+       - full features (first *F + R* columns) → ``data.node_hv_full``
+
+    3. :meth:`forward` delegates message passing to the parent (using
+       ``node_hv``), then replaces ``node_terms`` with a bundle of
+       ``node_hv_full``.
+
+    Limitations
+    -----------
+    Edge-level and full-graph decoding are **not supported** because the
+    RRWP-enriched codebook is only meaningful at the node level.  Use the
+    base :class:`HyperNet` for those tasks.
 
     Parameters
     ----------
     config : DSHDCConfig
-        Configuration with ``rw_config.enabled=True``. The node feature
+        Configuration with ``rw_config.enabled=True``.  The node feature
         bins must include the RRWP dimensions (as produced by
         ``create_config_with_rw``).
     depth : int, optional
-        Override message passing depth from config.
+        Override message-passing depth from config.
     observed_node_features : set[tuple], optional
         Full feature tuples (base + RRWP) observed in the dataset.
-        Used for codebook pruning. Base tuples are derived automatically.
+        Used for codebook pruning.  Base-only tuples are derived
+        automatically by stripping the trailing RRWP dimensions.
     """
 
     def __init__(
@@ -101,7 +145,25 @@ class RRWPHyperNet(HyperNet):
 
     @staticmethod
     def _derive_base_config(config: DSHDCConfig, base_bins: list[int]) -> DSHDCConfig:
-        """Create a config with only base features (no RRWP)."""
+        """Create a copy of *config* with RRWP features stripped out.
+
+        Replaces the node feature config with one that uses only *base_bins*
+        and sets ``rw_config.enabled=False``.  All other config fields
+        (hv_dim, vsa, edge features, …) are preserved.
+
+        Parameters
+        ----------
+        config : DSHDCConfig
+            Original config whose node bins include RRWP dimensions.
+        base_bins : list[int]
+            Bin sizes for the base (non-RRWP) node features only.
+
+        Returns
+        -------
+        DSHDCConfig
+            A shallow copy of *config* suitable for initialising the parent
+            :class:`HyperNet` without any RRWP awareness.
+        """
         base_node_fc = FeatureConfig(
             count=math.prod(base_bins),
             encoder_cls=CombinatoricIntegerEncoder,
@@ -122,7 +184,33 @@ class RRWPHyperNet(HyperNet):
         full_bins: list[int],
         observed_node_features: set[tuple] | None,
     ) -> None:
-        """Build the full (base + RRWP) codebook and indexer."""
+        """Build the full (base + RRWP) node codebook and its indexer.
+
+        Creates a :class:`CombinatoricIntegerEncoder` whose cartesian
+        product space spans all *full_bins* dimensions (base features
+        followed by RRWP bin indices).  The resulting codebook and
+        :class:`TupleIndexer` are stored as ``nodes_codebook_full`` and
+        ``nodes_indexer_full``.
+
+        A deterministic but independent random seed (``self.seed + 1000``)
+        is used so that the full codebook does not share hypervectors with
+        the base codebook.
+
+        If codebook pruning is enabled and *observed_node_features* is
+        provided, the codebook is immediately pruned to contain only
+        hypervectors for observed feature combinations.
+
+        Parameters
+        ----------
+        config : DSHDCConfig
+            Original (RRWP-enabled) config, used for device selection.
+        full_bins : list[int]
+            Bin sizes for all feature dimensions (base + RRWP).
+        observed_node_features : set[tuple] or None
+            Full feature tuples seen in the dataset.  When provided
+            together with ``self.prune_codebook=True``, the codebook is
+            pruned to these entries only.
+        """
         device = torch.device(config.device)
 
         # Use a derived seed for the full codebook to keep it independent
@@ -148,7 +236,18 @@ class RRWPHyperNet(HyperNet):
             self._limit_full_codebook(observed_node_features)
 
     def rebuild_unpruned_codebook(self) -> None:
-        """Rebuild both base and full (base + RRWP) unpruned codebooks."""
+        """Rebuild both base and full (base + RRWP) codebooks without pruning.
+
+        Re-generates the complete cartesian-product codebooks from scratch
+        using the original seeds, discarding any prior pruning.  This is
+        useful when the encoder needs to handle feature tuples that were
+        not in the original ``observed_node_features`` set (e.g. after
+        dataset expansion or during inference on unseen molecules).
+
+        The base codebook is rebuilt by the parent; the full codebook is
+        rebuilt here using the same derived seed (``self.seed + 1000``) as
+        :meth:`_build_full_codebook` for reproducibility.
+        """
         super().rebuild_unpruned_codebook()
 
         device = self.nodes_codebook_full.device
@@ -172,7 +271,20 @@ class RRWPHyperNet(HyperNet):
         self.nodes_indexer_full = full_encoder.indexer
 
     def _limit_full_codebook(self, node_features: set[tuple]) -> None:
-        """Prune the full codebook to only observed feature tuples."""
+        """Prune the full codebook to only observed feature tuples.
+
+        Replaces ``nodes_codebook_full`` with a compact version containing
+        only entries that correspond to *node_features*, and rebuilds the
+        ``nodes_indexer_full`` mapping so that indices 0..N-1 map to the
+        sorted observed tuples.  This reduces memory usage and speeds up
+        dot-product decoding when the actual feature space is much smaller
+        than the full cartesian product.
+
+        Parameters
+        ----------
+        node_features : set[tuple]
+            Full (base + RRWP) feature tuples observed in the dataset.
+        """
         sorted_features = sorted(node_features)
         idxs = self.nodes_indexer_full.get_idxs(sorted_features)
         self.nodes_indexer_full.idx_to_tuple = sorted_features
@@ -188,8 +300,32 @@ class RRWPHyperNet(HyperNet):
     def encode_properties(self, data: Data) -> Data:
         """Encode node properties into both base and full hypervectors.
 
-        Sets ``data.node_hv`` (base features only, for message passing)
-        and ``data.node_hv_full`` (base + RRWP, for order-0 readout).
+        Delegates to the parent to produce ``data.node_hv`` from base
+        features, then performs a second codebook lookup on the full
+        feature vector (base + RRWP columns of ``data.x``) to produce
+        ``data.node_hv_full``.
+
+        The full lookup converts each node's feature row to an integer
+        tuple, maps it through ``nodes_indexer_full`` to a codebook index,
+        and retrieves the corresponding hypervector from
+        ``nodes_codebook_full``.
+
+        Parameters
+        ----------
+        data : Data
+            PyG data object whose ``data.x`` has shape ``[N, F+R]`` where
+            *F* is the number of base feature columns and *R* is the
+            number of RRWP columns (``len(rw_config.k_values)``).
+
+        Returns
+        -------
+        Data
+            The same *data* object, mutated in-place with two new
+            attributes:
+
+            - ``node_hv`` — shape ``[N, D]``, base-only hypervectors.
+            - ``node_hv_full`` — shape ``[N, D]``, full (base + RRWP)
+              hypervectors.
         """
         # Parent encodes base features → data.node_hv
         data = super().encode_properties(data)
@@ -214,14 +350,42 @@ class RRWPHyperNet(HyperNet):
         bidirectional: bool = False,
         normalize: bool | None = None,
     ) -> dict[str, Tensor]:
-        """
-        Encode graphs with RRWP-enriched order-0 terms.
+        """Encode graphs, using RRWP-enriched hypervectors for order-0 terms.
 
-        Message passing (edge_terms, graph_embedding) uses base features
-        only. The node_terms output uses the full (base + RRWP) codebook.
+        Execution proceeds in two stages:
 
-        Parameters and return format are identical to
-        :meth:`HyperNet.forward`.
+        1. **Parent forward pass** — calls :meth:`HyperNet.forward`, which
+           internally invokes :meth:`encode_properties` (setting both
+           ``node_hv`` and ``node_hv_full``), runs VSA message passing on
+           the *base* hypervectors, and produces ``edge_terms``,
+           ``node_terms``, and ``graph_embedding``.
+        2. **Order-0 replacement** — the ``node_terms`` entry from step 1
+           is discarded and recomputed by bundling ``node_hv_full``
+           (RRWP-enriched) per graph via :func:`scatter_hd`.
+
+        This ensures that structural binding (edges, graph embedding) is
+        free of positional RRWP information, while the order-0 readout
+        benefits from it.
+
+        Parameters
+        ----------
+        data : Data | Batch
+            Single graph or batched graphs.  Must already have RRWP
+            columns appended to ``data.x`` (see
+            :func:`~graph_hdc.utils.rw_features.augment_data_with_rw`).
+        bidirectional : bool, optional
+            If ``True``, encode edges in both directions.
+        normalize : bool or None, optional
+            Override the instance-level normalisation setting.
+
+        Returns
+        -------
+        dict[str, Tensor]
+            Same keys as :meth:`HyperNet.forward`:
+
+            - ``"node_terms"`` — RRWP-enriched order-0 embedding ``[B, D]``
+            - ``"edge_terms"`` — structural edge embedding ``[B, D]``
+            - ``"graph_embedding"`` — full graph embedding ``[B, D]``
         """
         # Parent forward: message passing with base HVs
         # (calls our encode_properties, which sets both node_hv and node_hv_full)
@@ -276,7 +440,28 @@ class RRWPHyperNet(HyperNet):
     # ─────────────────────────── Decoding ───────────────────────────
 
     def decode_order_zero(self, embedding: torch.Tensor) -> torch.Tensor:
-        """Decode node types and counts from embedding using the full codebook."""
+        """Decode node type counts from an order-0 embedding via dot product.
+
+        Computes the dot product of *embedding* against every entry in
+        ``nodes_codebook_full``, rounds to the nearest integer, and clamps
+        to non-negative values.  Each resulting value approximates how
+        many times the corresponding (base + RRWP) feature tuple appears
+        in the graph that produced the embedding.
+
+        For FHRR and MAP VSA models the raw dot products are normalised
+        by ``hv_dim`` before rounding.
+
+        Parameters
+        ----------
+        embedding : Tensor
+            Order-0 (node_terms) hypervector, shape ``[D]`` or ``[B, D]``.
+
+        Returns
+        -------
+        Tensor
+            Integer counts, shape ``[C]`` or ``[B, C]`` where *C* is the
+            size of ``nodes_codebook_full``.
+        """
         d = torchhd.dot(embedding, self.nodes_codebook_full)
         if self.vsa in {VSAModel.FHRR, VSAModel.MAP}:
             d = d / self.hv_dim
@@ -285,7 +470,44 @@ class RRWPHyperNet(HyperNet):
     def decode_order_zero_iterative(
         self, embedding: torch.Tensor, debug: bool = False
     ) -> list[tuple[int, ...]] | tuple[list[tuple[int, ...]], list[float], list[float]]:
-        """Decode node types via iterative unbinding using the full codebook."""
+        """Decode node types by iteratively subtracting codebook entries.
+
+        Starting from the full order-0 embedding, this method repeatedly:
+
+        1. Finds the ``nodes_codebook_full`` entry with highest cosine
+           similarity to the current residual.
+        2. Subtracts that entry from the residual.
+        3. Records the decoded feature tuple.
+
+        Iteration stops when any of these conditions is met:
+
+        - The residual norm drops below a small threshold (``eps``).
+        - Subtracting an entry *increases* the residual norm (the
+          contribution is no longer constructive).
+        - The dataset-specific maximum node count is reached.
+
+        This is more robust than the dot-product method
+        (:meth:`decode_order_zero`) for noisy or generated embeddings,
+        since it does not rely on integer-rounded counts.
+
+        Parameters
+        ----------
+        embedding : Tensor
+            A single order-0 hypervector, shape ``[D]``.
+        debug : bool, optional
+            If ``True``, return additional diagnostics.
+
+        Returns
+        -------
+        list[tuple[int, ...]]
+            Decoded node feature tuples (base + RRWP), one per decoded
+            node.  Returned when ``debug=False``.
+        tuple[list[tuple], list[float], list[float]]
+            ``(decoded_nodes, norms_history, similarities)`` when
+            ``debug=True``.  *norms_history* tracks the residual norm
+            before each iteration; *similarities* records the peak cosine
+            similarity at each step.
+        """
         if not hasattr(self, "_min_node_delta_full"):
             norms = [hv.norm().item() for hv in self.nodes_codebook_full]
             self._min_node_delta_full = min(norms) if norms else 1.0
@@ -339,7 +561,24 @@ class RRWPHyperNet(HyperNet):
     def decode_order_zero_counter(
         self, embedding: torch.Tensor
     ) -> dict[int, Counter]:
-        """Decode node counts as Counter dict using the full codebook."""
+        """Decode node feature counts as a Counter via dot-product decoding.
+
+        Wraps :meth:`decode_order_zero` and converts the integer count
+        vector into a ``{batch_idx: Counter}`` mapping, where each
+        :class:`~collections.Counter` maps feature tuples to their
+        predicted multiplicity.
+
+        Parameters
+        ----------
+        embedding : Tensor
+            Order-0 hypervector(s), shape ``[D]`` or ``[B, D]``.
+
+        Returns
+        -------
+        dict[int, Counter]
+            Mapping from batch index to a Counter of ``(base + RRWP)``
+            feature tuples.
+        """
         dot_products_rounded = self.decode_order_zero(embedding)
         return self._convert_to_counter(
             similarities=dot_products_rounded, indexer=self.nodes_indexer_full
@@ -348,7 +587,24 @@ class RRWPHyperNet(HyperNet):
     def decode_order_zero_counter_iterative(
         self, embedding: torch.Tensor
     ) -> dict[int, Counter]:
-        """Decode node counts via iterative unbinding using the full codebook."""
+        """Decode node feature counts via iterative subtraction.
+
+        Wraps :meth:`decode_order_zero_iterative` for one or more
+        embeddings and aggregates the per-node results into Counter
+        objects, giving the same output format as
+        :meth:`decode_order_zero_counter`.
+
+        Parameters
+        ----------
+        embedding : Tensor
+            Order-0 hypervector(s), shape ``[D]`` or ``[B, D]``.
+
+        Returns
+        -------
+        dict[int, Counter]
+            Mapping from batch index to a Counter of ``(base + RRWP)``
+            feature tuples.
+        """
         if embedding.dim() == 1:
             embedding = embedding.unsqueeze(0)
 
@@ -398,7 +654,18 @@ class RRWPHyperNet(HyperNet):
     # ─────────────────────────── Save/Load ──────────────────────────
 
     def save(self, path: str | Path) -> None:
-        """Save RRWPHyperNet to file (base + full codebook)."""
+        """Save the full RRWPHyperNet state to a checkpoint file.
+
+        First delegates to :meth:`HyperNet.save` to write the base state,
+        then re-opens the checkpoint and augments it with RRWP-specific
+        data: the full codebook, full indexer, RW config, and dimensional
+        metadata.  The resulting file can be loaded with :meth:`load`.
+
+        Parameters
+        ----------
+        path : str | Path
+            Destination file path.
+        """
         # Let parent save the base state
         super().save(path)
 
@@ -429,18 +696,29 @@ class RRWPHyperNet(HyperNet):
     def load(
         cls, path: str | Path, device: str | torch.device = "cpu"
     ) -> "RRWPHyperNet":
-        """Load RRWPHyperNet from file.
+        """Load an RRWPHyperNet from a checkpoint saved with :meth:`save`.
+
+        Loads the base :class:`HyperNet` state first, then upgrades the
+        instance to :class:`RRWPHyperNet` by restoring the full codebook,
+        full indexer, RW config, and dimensional metadata from the
+        ``"rrwp"`` key in the checkpoint.
 
         Parameters
         ----------
         path : str | Path
-            Path to saved RRWPHyperNet checkpoint.
-        device : str | torch.device
-            Device to load to.
+            Path to a checkpoint file produced by :meth:`save`.
+        device : str | torch.device, optional
+            Target device for all tensors.
 
         Returns
         -------
         RRWPHyperNet
+
+        Raises
+        ------
+        ValueError
+            If the checkpoint does not contain RRWP data (i.e. was saved
+            by the base :class:`HyperNet`).
         """
         state = torch.load(path, map_location="cpu", weights_only=False)
         device = torch.device(device)
