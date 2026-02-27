@@ -93,19 +93,26 @@ from experiments.generation.test_flow_matching import (
 
 # :param HDC_ENCODER_PATH:
 #     Path to saved HyperNet/MultiHyperNet encoder checkpoint (.ckpt).
-HDC_ENCODER_PATH: str = ""
+HDC_ENCODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/hypernet_encoder.ckpt"
 
 # :param FLOW_DECODER_PATH:
 #     Path to saved FlowEdgeDecoder checkpoint (.ckpt).
-FLOW_DECODER_PATH: str = ""
+FLOW_DECODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/last.ckpt"
 
 # :param NODE_FLOW_PATH:
 #     Path to saved Stage 1 FlowMatchingModel checkpoint (node_terms flow).
-NODE_FLOW_PATH: str = ""
+NODE_FLOW_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/generation/results/train_flow_matching__node/debug/last.ckpt"
 
 # :param GRAPH_FLOW_PATH:
 #     Path to saved Stage 2 FlowMatchingModel checkpoint (graph_terms flow).
-GRAPH_FLOW_PATH: str = ""
+GRAPH_FLOW_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/generation/results/train_flow_matching__graph/first/last.ckpt"
+
+# :param DENSITY_NVP_PATH:
+#     Optional path to a trained DensityNVP checkpoint (.pt).
+#     When set, graph_terms candidates are ranked by log-likelihood under the
+#     density model instead of HDC cosine distance.  When empty, falls back to
+#     HDC distance ranking.
+DENSITY_NVP_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/generation/results/train_density_nvp/debug/last.ckpt"
 
 # -----------------------------------------------------------------------------
 # Sampling Configuration
@@ -117,7 +124,7 @@ NUM_SAMPLES: int = 10
 
 # :param NUM_REPETITIONS:
 #     Best-of-N for FlowEdgeDecoder edge generation (batched).
-NUM_REPETITIONS: int = 256
+NUM_REPETITIONS: int = 128
 
 # :param SAMPLE_STEPS:
 #     Number of ODE steps for FlowEdgeDecoder discrete flow sampling.
@@ -137,12 +144,18 @@ SAMPLE_TIME_DISTORTION: str = "polydec"
 
 # :param FM_SAMPLE_STEPS:
 #     Number of ODE steps for FlowMatchingModel sampling (both stages).
-FM_SAMPLE_STEPS: int = 1_000
+FM_SAMPLE_STEPS: int = 250
 
 # :param FM_SOLVER_METHOD:
 #     ODE solver method for FlowMatchingModel sampling. Options: "euler",
 #     "midpoint", "dopri5". None = use whatever was saved in the checkpoint.
 FM_SOLVER_METHOD: Optional[str] = "dopri5"
+
+# :param NUM_GRAPH_SAMPLES:
+#     Number of graph_terms candidates to sample per node_terms.
+#     The best candidate is selected by DensityNVP log-likelihood (if
+#     DENSITY_NVP_PATH is set) or by HDC cosine distance (fallback).
+NUM_GRAPH_SAMPLES: int = 10
 
 # -----------------------------------------------------------------------------
 # Reference Dataset Comparison
@@ -158,7 +171,7 @@ COMPARE_DATASET: bool = True
 
 # :param DATASET_SUBSAMPLE:
 #     Number of reference molecules to subsample for comparison.
-DATASET_SUBSAMPLE: int = 5_000
+DATASET_SUBSAMPLE: int = 10_000
 
 # -----------------------------------------------------------------------------
 # System Configuration
@@ -182,7 +195,7 @@ PLOT_NORM_DECAY: bool = True
 
 # :param SEED:
 #     Random seed for reproducibility.
-SEED: int = 43
+SEED: int = 44
 
 # :param __DEBUG__:
 #     Debug mode — reuses same output folder during development.
@@ -278,11 +291,28 @@ def experiment(e: Experiment) -> None:
                 e.log(f"Overriding {name} solver: {flow.solver_method} -> {e.FM_SOLVER_METHOD}")
                 flow.solver_method = e.FM_SOLVER_METHOD
 
+    # Check if HyperNet needs RRWP augmentation for re-encoding
+    _use_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
+    if _use_rw:
+        from graph_hdc.utils.rw_features import augment_data_with_rw
+
     e["model/base_hdc_dim"] = base_hdc_dim
     e["model/concat_hdc_dim"] = 2 * base_hdc_dim
 
+    # Optional: load DensityNVP for likelihood-based candidate ranking
+    density_nvp = None
+    if e.DENSITY_NVP_PATH and Path(e.DENSITY_NVP_PATH).exists():
+        from graph_hdc.models.flows.density_nvp import DensityNVP
+
+        density_nvp = DensityNVP.load(e.DENSITY_NVP_PATH, device=device)
+        density_nvp.eval()
+        e.log(f"Loaded DensityNVP from: {e.DENSITY_NVP_PATH}")
+        e.log(f"  Candidate ranking: log-likelihood")
+    else:
+        e.log("No DensityNVP loaded — candidate ranking: HDC cosine distance")
+
     # =========================================================================
-    # Step 2: Two-Stage Sampling
+    # Step 2: Sample node_terms (bulk)
     # =========================================================================
 
     e.log("\n" + "=" * 60)
@@ -291,37 +321,20 @@ def experiment(e: Experiment) -> None:
 
     sample_start = time.time()
     with torch.no_grad():
-        node_terms = node_flow.sample(
+        node_terms_raw = node_flow.sample(
             num_samples=e.NUM_SAMPLES,
             num_steps=e.FM_SAMPLE_STEPS,
             device=device,
         )
     node_time = time.time() - sample_start
-    e.log(f"  Sampled node_terms: {node_terms.shape} in {node_time:.2f}s")
-
-    e.log(f"\nStage 2: Sampling {e.NUM_SAMPLES} graph_terms conditioned on node_terms...")
-    graph_start = time.time()
-    with torch.no_grad():
-        graph_terms = graph_flow.sample(
-            num_samples=e.NUM_SAMPLES,
-            condition=node_terms,
-            num_steps=e.FM_SAMPLE_STEPS,
-            device=device,
-        )
-    graph_time = time.time() - graph_start
-    e.log(f"  Sampled graph_terms: {graph_terms.shape} in {graph_time:.2f}s")
-
-    # Concatenate into full HDC vectors
-    hdc_vectors = torch.cat([node_terms, graph_terms], dim=-1)
-    sample_time = node_time + graph_time
-    e.log(f"\nCombined HDC vectors: {hdc_vectors.shape} (total {sample_time:.2f}s)")
+    e.log(f"  Sampled node_terms: {node_terms_raw.shape} in {node_time:.2f}s")
 
     # =========================================================================
-    # Step 3: Decode Each HDC Vector → Molecular Graph
+    # Step 3: Per-sample — decode, re-encode, sample graph_terms, reconstruct
     # =========================================================================
 
     e.log("\n" + "=" * 60)
-    e.log("Decoding HDC vectors to molecules...")
+    e.log(f"Stage 2+3: Decode → re-encode → sample {e.NUM_GRAPH_SAMPLES} graph_terms → reconstruct...")
     e.log("=" * 60)
 
     molecules_dir = Path(e.path) / "molecules"
@@ -331,14 +344,26 @@ def experiment(e: Experiment) -> None:
     valid_mols = []
     all_smiles = []
     all_norm_histories: List[List[float]] = []
+    graph_time = 0.0
     decode_start = time.time()
 
-    for idx in range(hdc_vectors.shape[0]):
-        hdc_vector = hdc_vectors[idx].cpu()
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12,
+        )
+    except OSError:
+        font = ImageFont.load_default()
 
-        # 3a. Decode nodes from order_0 part
+    for idx in range(e.NUM_SAMPLES):
+        raw_node_vec = node_terms_raw[idx].cpu()
+
+        # 3a. Decode nodes from raw sampled node_terms
         node_tuples, num_nodes, norms_history, _ = decode_nodes_from_hdc(
-            hypernet, hdc_vector.unsqueeze(0), base_hdc_dim, debug=True
+            hypernet,
+            # Pad with zeros for the graph_terms half (only order-0 is used)
+            torch.cat([raw_node_vec, torch.zeros_like(raw_node_vec)]).unsqueeze(0),
+            base_hdc_dim,
+            debug=True,
         )
         all_norm_histories.append(norms_history)
 
@@ -352,15 +377,45 @@ def experiment(e: Experiment) -> None:
             })
             continue
 
-        # 3b. Convert node tuples to one-hot features
+        # 3b. Re-encode decoded nodes via HyperNet to get clean node_terms
+        reenc_x = torch.tensor(node_tuples, dtype=torch.float, device=hdc_device)
+        reenc_data = Data(
+            x=reenc_x,
+            edge_index=torch.zeros((2, 0), dtype=torch.long, device=hdc_device),
+        )
+        reenc_data.batch = torch.zeros(num_nodes, dtype=torch.long, device=hdc_device)
+        if _use_rw:
+            reenc_data = augment_data_with_rw(
+                reenc_data,
+                k_values=hypernet.rw_config.k_values,
+                num_bins=hypernet.rw_config.num_bins,
+                bin_boundaries=hypernet.rw_config.bin_boundaries,
+                clip_range=hypernet.rw_config.clip_range,
+            )
+        with torch.no_grad():
+            clean_node_terms = hypernet.forward(reenc_data, normalize=True)["node_terms"]
+        clean_node_terms = clean_node_terms.float().to(device)  # [1, hv_dim]
+
+        # 3c. Sample NUM_GRAPH_SAMPLES graph_terms conditioned on clean node_terms
+        repeated_cond = clean_node_terms.repeat(e.NUM_GRAPH_SAMPLES, 1)
+        graph_start = time.time()
+        with torch.no_grad():
+            graph_terms_candidates = graph_flow.sample(
+                num_samples=e.NUM_GRAPH_SAMPLES,
+                condition=repeated_cond,
+                num_steps=e.FM_SAMPLE_STEPS,
+                device=device,
+            )
+        graph_time += time.time() - graph_start
+
+        # 3d. Prepare shared node features for edge generation
         feature_bins = get_node_feature_bins(hypernet.rw_config)
         node_features = node_tuples_to_onehot(
             node_tuples, device=device, feature_bins=feature_bins,
         ).unsqueeze(0)
         node_mask = torch.ones(1, num_nodes, dtype=torch.bool, device=device)
-        hdc_vec_device = hdc_vector.unsqueeze(0).to(device)
+        raw_x = torch.tensor(node_tuples, dtype=torch.float)
 
-        # 3c. Generate edges
         sample_kwargs = dict(
             sample_steps=e.SAMPLE_STEPS,
             eta=e.ETA,
@@ -370,75 +425,156 @@ def experiment(e: Experiment) -> None:
             device=device,
         )
 
-        raw_x = torch.tensor(node_tuples, dtype=torch.float)
+        # 3e. For each graph_terms candidate, generate edges and score
+        # candidates: list of (mol, smiles, valid, hdc_dist, log_prob) tuples
+        candidates = []
+        # Collect re-encoded HDC vectors of final molecules for density scoring
+        hdc_vectors_for_scoring = []
 
         with torch.no_grad():
-            if e.NUM_REPETITIONS > 1:
-                def score_fn(s):
-                    return compute_hdc_distance(
-                        s, hdc_vec_device, base_hdc_dim,
+            for k in range(e.NUM_GRAPH_SAMPLES):
+                # Concat [clean_node_terms | graph_terms_k]
+                hdc_vector_k = torch.cat([
+                    clean_node_terms[0].cpu(),
+                    graph_terms_candidates[k].cpu(),
+                ], dim=-1)
+                hdc_vec_k_device = hdc_vector_k.unsqueeze(0).to(device)
+
+                # Generate edges (inner best-of-N still uses HDC distance)
+                if e.NUM_REPETITIONS > 1:
+                    def score_fn(s, _hv=hdc_vec_k_device, _rx=raw_x):
+                        return compute_hdc_distance(
+                            s, _hv, base_hdc_dim,
+                            hypernet, device, dataset=e.DATASET,
+                            original_x=_rx,
+                        )
+
+                    candidate_data, candidate_dist, _ = decoder.sample_best_of_n(
+                        hdc_vectors=hdc_vec_k_device,
+                        node_features=node_features,
+                        node_mask=node_mask,
+                        num_repetitions=e.NUM_REPETITIONS,
+                        score_fn=score_fn,
+                        **sample_kwargs,
+                    )
+                else:
+                    generated_samples = decoder.sample(
+                        hdc_vectors=hdc_vec_k_device,
+                        node_features=node_features,
+                        node_mask=node_mask,
+                        **sample_kwargs,
+                    )
+                    candidate_data = generated_samples[0]
+                    candidate_dist = compute_hdc_distance(
+                        candidate_data, hdc_vec_k_device, base_hdc_dim,
                         hypernet, device, dataset=e.DATASET,
                         original_x=raw_x,
                     )
 
-                best_sample, best_distance, _avg_distance = decoder.sample_best_of_n(
-                    hdc_vectors=hdc_vec_device,
-                    node_features=node_features,
-                    node_mask=node_mask,
-                    num_repetitions=e.NUM_REPETITIONS,
-                    score_fn=score_fn,
-                    **sample_kwargs,
-                )
-                generated_data = best_sample
-            else:
-                generated_samples = decoder.sample(
-                    hdc_vectors=hdc_vec_device,
-                    node_features=node_features,
-                    node_mask=node_mask,
-                    **sample_kwargs,
-                )
-                generated_data = generated_samples[0]
+                # Re-encode the final reconstructed graph through the HyperNet
+                # to get its true [node_terms | graph_terms] for density scoring
+                if density_nvp is not None:
+                    try:
+                        hdc_device_ = hypernet.nodes_codebook.device
+                        gen_data_k = Data(
+                            x=raw_x.to(hdc_device_),
+                            edge_index=candidate_data.edge_index.to(hdc_device_),
+                        )
+                        gen_data_k.batch = torch.zeros(
+                            gen_data_k.x.size(0), dtype=torch.long, device=hdc_device_,
+                        )
+                        if _use_rw:
+                            gen_data_k = augment_data_with_rw(
+                                gen_data_k,
+                                k_values=hypernet.rw_config.k_values,
+                                num_bins=hypernet.rw_config.num_bins,
+                                bin_boundaries=hypernet.rw_config.bin_boundaries,
+                                clip_range=hypernet.rw_config.clip_range,
+                            )
+                        gen_out_k = hypernet.forward(gen_data_k, normalize=True)
+                        reenc_hdc_k = torch.cat([
+                            gen_out_k["node_terms"],
+                            gen_out_k["graph_embedding"],
+                        ], dim=-1).squeeze(0).float().cpu()
+                        hdc_vectors_for_scoring.append(reenc_hdc_k)
+                    except Exception:
+                        # Fallback: use the pre-generation HDC vector
+                        hdc_vectors_for_scoring.append(hdc_vector_k)
 
-        # 3d. Convert to RDKit molecule
-        mol = pyg_to_mol(generated_data)
-        smiles = get_canonical_smiles(mol)
-        valid = is_valid_mol(mol)
+                c_mol = pyg_to_mol(candidate_data)
+                c_smiles = get_canonical_smiles(c_mol)
+                c_valid = is_valid_mol(c_mol)
+                candidates.append((c_mol, c_smiles, c_valid, candidate_dist, None))
 
-        # 3e. Compute HDC distance
-        hdc_dist = compute_hdc_distance(
-            generated_data, hdc_vec_device, base_hdc_dim,
-            hypernet, device, dataset=e.DATASET,
-            original_x=raw_x,
-        )
+            # Batch-compute DensityNVP log-probs using re-encoded final molecules
+            if density_nvp is not None:
+                hdc_batch = torch.stack(hdc_vectors_for_scoring).float().to(device)
+                log_probs = density_nvp.log_prob(hdc_batch).cpu().tolist()
+                candidates = [
+                    (mol, smi, val, dist, lp)
+                    for (mol, smi, val, dist, _), lp in zip(candidates, log_probs)
+                ]
 
-        # 3f. Save molecule PNG
-        mol_img = draw_mol_or_error(mol, size=(300, 300))
-        line1 = f"HDC dist: {hdc_dist:.4f}"
-        line2 = smiles or "N/A"
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12,
+        # Pick the best candidate: by log-likelihood (higher=better) or HDC distance (lower=better)
+        if density_nvp is not None:
+            best_k = max(range(len(candidates)), key=lambda i: candidates[i][4])
+        else:
+            best_k = min(range(len(candidates)), key=lambda i: candidates[i][3])
+        mol, smiles, valid, hdc_dist, best_log_prob = candidates[best_k]
+
+        # 3f. Save molecule PNG strip showing all candidates
+        cell_w, cell_h = 300, 300
+        annotation_h = 50
+        n_cells = len(candidates)
+        strip_w = n_cells * cell_w
+        strip_h = cell_h + annotation_h
+        strip = Image.new("RGB", (strip_w, strip_h), "white")
+        draw_ctx = ImageDraw.Draw(strip)
+
+        for k, (c_mol, c_smiles, c_valid, c_dist, c_lp) in enumerate(candidates):
+            x_offset = k * cell_w
+            c_img = draw_mol_or_error(c_mol, size=(cell_w, cell_h))
+            strip.paste(c_img, (x_offset, 0))
+
+            display_s = (c_smiles or "N/A")
+            if len(display_s) > 40:
+                display_s = display_s[:37] + "..."
+            status_str = "valid" if c_valid else "invalid"
+            color = "green" if c_valid else "red"
+            # Highlight the best candidate
+            if k == best_k:
+                status_str += " *BEST*"
+                color = "blue"
+            draw_ctx.text((x_offset + 5, cell_h + 3), display_s, fill="black", font=font)
+            score_parts = [f"dist={c_dist:.4f}"]
+            if c_lp is not None:
+                score_parts.append(f"lp={c_lp:.1f}")
+            draw_ctx.text(
+                (x_offset + 5, cell_h + 18),
+                f"{status_str}  {' '.join(score_parts)}",
+                fill=color,
+                font=font,
             )
-        except OSError:
-            font = ImageFont.load_default()
-        title_h = 45
-        composite = Image.new("RGB", (mol_img.width, mol_img.height + title_h), "white")
-        draw_ctx = ImageDraw.Draw(composite)
-        draw_ctx.text((5, 3), line1, fill="black", font=font)
-        draw_ctx.text((5, 20), line2, fill="black", font=font)
-        composite.paste(mol_img, (0, title_h))
-        composite.save(molecules_dir / f"molecule_{idx:04d}.png")
+
+        strip.save(molecules_dir / f"molecule_{idx:04d}.png")
 
         if e.PLOT_NORM_DECAY and norms_history:
             plot_norm_decay([norms_history], molecules_dir / f"norm_decay_{idx:04d}.png")
 
-        # 3g. Collect results
+        # 3g. Collect results (best candidate used for statistics)
         result = {
             "idx": idx,
             "smiles": smiles,
             "status": "valid" if valid else "invalid",
             "num_nodes": num_nodes,
             "hdc_distance": hdc_dist,
+            "log_prob": best_log_prob,
+            "selection_method": "log_prob" if density_nvp is not None else "hdc_distance",
+            "best_candidate_idx": best_k,
+            "all_candidates": [
+                {"smiles": c_s, "valid": c_v, "hdc_distance": c_d, "log_prob": c_lp}
+                for _, c_s, c_v, c_d, c_lp in candidates
+            ],
         }
 
         if valid and mol is not None:
@@ -452,10 +588,16 @@ def experiment(e: Experiment) -> None:
         results.append(result)
 
         if (idx + 1) % 10 == 0 or idx == 0:
-            e.log(f"  Sample {idx + 1}/{e.NUM_SAMPLES}: {smiles or 'N/A'} [{result['status']}]")
+            score_info = f"dist={hdc_dist:.4f}"
+            if best_log_prob is not None:
+                score_info += f" lp={best_log_prob:.1f}"
+            e.log(f"  Sample {idx + 1}/{e.NUM_SAMPLES}: {num_nodes} nodes, "
+                   f"{smiles or 'N/A'} [{result['status']}] {score_info}")
 
+    sample_time = node_time + graph_time
     decode_time = time.time() - decode_start
-    e.log(f"\nDecoding completed in {decode_time:.2f}s")
+    e.log(f"\nCompleted in {decode_time:.2f}s "
+          f"(node sampling: {node_time:.2f}s, graph sampling: {graph_time:.2f}s)")
 
     # =========================================================================
     # Step 4: Compute Statistics
@@ -584,9 +726,12 @@ def experiment(e: Experiment) -> None:
             "flow_decoder_path": e.FLOW_DECODER_PATH,
             "node_flow_path": e.NODE_FLOW_PATH,
             "graph_flow_path": e.GRAPH_FLOW_PATH,
+            "density_nvp_path": e.DENSITY_NVP_PATH,
+            "selection_method": "log_prob" if density_nvp is not None else "hdc_distance",
             "dataset": e.DATASET,
             "num_samples": e.NUM_SAMPLES,
             "num_repetitions": e.NUM_REPETITIONS,
+            "num_graph_samples": e.NUM_GRAPH_SAMPLES,
             "sample_steps": e.SAMPLE_STEPS,
             "eta": e.ETA,
             "omega": e.OMEGA,
@@ -730,6 +875,7 @@ def testing(e: Experiment) -> None:
     """Quick test mode with reduced parameters."""
     e.NUM_SAMPLES = 5
     e.NUM_REPETITIONS = 1
+    e.NUM_GRAPH_SAMPLES = 2
     e.SAMPLE_STEPS = 10
     e.FM_SAMPLE_STEPS = 10
     e.COMPARE_DATASET = False
