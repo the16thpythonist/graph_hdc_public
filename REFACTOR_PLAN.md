@@ -599,29 +599,84 @@ All items completed. Old tests still pass via DSHDCConfig path.
 - `graph_hdc/hypernet/configs.py`: `BaseDataset` type now allows `None` for domain-agnostic configs.
 - `tests/test_hypernet_explicit.py` (319 lines): Creation tests (8), encoding equivalence tests against config-based HyperNet for QM9/ZINC (exact match at atol=1e-10), synthetic graph tests (color+shape domains), domain integration tests (`from_domain()`), save/load roundtrip tests, pruning error tests.
 
-### Phase 3: Decouple FlowEdgeDecoder
-- Make `feature_bins` and `num_edge_classes` required constructor args
-- Remove hardcoded `NODE_FEATURE_DIM`, `NUM_EDGE_CLASSES`, `NODE_FEATURE_BINS`, `ZINC_ATOM_TYPES`
-- Move `BOND_TYPE_TO_IDX` and RDKit imports to molecular domain
-- Update test files to derive constants from fixtures
+### Phase 3: Decouple FlowEdgeDecoder — ~95% DONE
 
-### Phase 4: Remove legacy code
-- Delete legacy graph decoders from `encoder.py` (decode_order_one, decode_graph, greedy decoder methods)
-- **Keep** `decode_order_zero_iterative` and `decode_order_zero_counter_iterative` (used by FlowEdgeDecoder pipeline)
-- Delete `decoder.py`, `correction_utils.py`
-- Delete `Feat` dataclass from `types.py`
-- Delete degree-dependent functions from `nx_utils.py`
-- Delete `DecoderSettings`, `FallbackDecoderSettings`
-- Delete `DSHDCConfig`, `get_config()`, `SupportedDataset`
+The primary objective — decoupling FlowEdgeDecoder from hardcoded molecular constants — is achieved. The model accepts `feature_bins` and `num_edge_classes` as required arguments and works with any graph domain.
 
-### Phase 5: Relocate molecular code
-- Move `utils/chem.py` → `domains/molecular/chem.py`
-- Move evaluator molecular logic → `domains/molecular/metrics.py`
-- Move datasets → `domains/molecular/datasets.py`
-- Move ZINC quantile bins → `domains/molecular/`
-- Move experiment helpers → `domains/molecular/`
-- Update all imports
-- Ensure `import graph_hdc` works without RDKit
+**What was implemented:**
+- ✅ `flow_edge_decoder.py`: `feature_bins` and `num_edge_classes` are mandatory positional args. Zero hardcoded constants, zero RDKit imports, zero preprocessing imports. All node/edge dimensions computed from constructor arguments.
+- ✅ `BOND_TYPE_TO_IDX` and all ZINC/molecular constants moved to `domains/molecular/preprocessing.py` with clear docstring. RDKit imports localized there.
+- ✅ Migration tests (`tests/migration/test_flow_decoder.py`) derive all dimensions from fixture config dicts, not hardcoded values.
+- ✅ Main test files (`tests/test_flow_edge_decoder.py`, `tests/test_transformer_edge_decoder.py`) import constants from preprocessing (appropriate since they are molecular-domain tests).
+- ✅ Core library (`graph_hdc/__init__.py`, `graph_hdc/models/__init__.py`) does not export molecular-specific constants.
+
+**Remaining (minor, non-blocking):**
+- ⚠️ `transformer_edge_decoder.py` still imports `NODE_FEATURE_DIM` and `NUM_EDGE_CLASSES` from preprocessing as **default argument values** (lines 150-151). The model itself accepts explicit overrides. This is intentional backward compatibility for a secondary model — not a blocker.
+- ⚠️ `preprocessing.py` keeps legacy aliases (`NODE_FEATURE_DIM`, `NODE_FEATURE_BINS`, `NUM_EDGE_CLASSES`) for backward compatibility. Could be deprecated in Phase 4 cleanup.
+
+### Phase 4: Remove legacy code — NOT STARTED
+
+None of the Phase 4 deletion tasks have been performed. All legacy code is still fully present and actively used throughout the codebase.
+
+**Detailed status of each item:**
+
+- ❌ **Legacy graph decoders in `encoder.py`** — ALL STILL PRESENT:
+  - `decode_order_one()` (line ~803)
+  - `decode_order_one_no_node_terms()` (line ~875)
+  - `decode_graph()` (line ~1120)
+  - `decode_graph_greedy()` (line ~1286)
+  - Supporting helpers: `_is_feasible_set()`, `_apply_edge_corrections()`, `_find_top_k_isomorphic_graphs()`
+  - These methods actively import from `correction_utils` and `decoder` modules.
+  - **Keep as required**: `decode_order_zero_iterative` (line ~633) and `decode_order_zero_counter_iterative` (line ~715) — correctly present and used by FlowEdgeDecoder pipeline.
+
+- ❌ **`decoder.py`** — STILL EXISTS at `graph_hdc/hypernet/decoder.py`. Contains `compute_sampling_structure()`, `try_find_isomorphic_graph()`, `has_valid_ring_structure()`, etc. Actively imported by legacy decoder methods in `encoder.py`.
+
+- ❌ **`correction_utils.py`** — STILL EXISTS at `graph_hdc/hypernet/correction_utils.py`. Contains `CorrectionResult`, `get_corrected_sets()`, `get_node_counter()`, `target_reached()`. Actively imported by legacy decoder methods in `encoder.py`.
+
+- ❌ **`Feat` dataclass in `types.py`** — STILL EXISTS at `graph_hdc/hypernet/types.py` (lines ~39-90). Actively used by `decode_graph()` and `decode_graph_greedy()` via `Feat.from_tuple()`.
+
+- ❌ **Degree-dependent functions in `nx_utils.py`** — ALL STILL PRESENT at `graph_hdc/utils/nx_utils.py`:
+  - `current_degree()`, `residual_degree()`, `residuals()`, `anchors()`
+  - `add_node_with_feat()`, `add_node_and_connect()`, `connect_all_if_possible()`
+  - `order_leftovers_by_degree_distinct()`
+  - All depend on the `Feat` dataclass and `target_degree` convention. Actively used by legacy decoders.
+
+- ❌ **`DecoderSettings` / `FallbackDecoderSettings`** — STILL EXIST in `graph_hdc/hypernet/configs.py` (lines ~87-177). Exported from `__init__.py`. Used in experiment scripts (`evaluate_generation.py`, `run_optimization.py`, `run_retrieval_experiment.py`).
+
+- ❌ **`DSHDCConfig` / `get_config()` / `SupportedDataset`** — ALL STILL EXIST in `graph_hdc/hypernet/configs.py`:
+  - `DSHDCConfig` (lines ~64-84)
+  - `_get_qm9_config()`, `_get_zinc_config()` helper functions
+  - `SupportedDataset` enum (lines ~234-249)
+  - `get_config()` function (lines ~252-257)
+  - Widely used: `encoder.py`, `rrwp_hypernet.py`, `experiment_helpers.py`, multiple experiment scripts.
+
+**Note:** All legacy code forms a tightly coupled cluster. The deletion order matters: legacy decoder methods → `decoder.py`/`correction_utils.py` → `Feat` → degree functions → `DecoderSettings`. `DSHDCConfig`/`get_config()` can be removed independently once all experiment scripts are updated to use explicit args or `from_domain()`.
+
+### Phase 5: Relocate molecular code — ~85% DONE
+
+The core goal — relocating molecular code to `domains/molecular/` and establishing backward-compatible shims — is largely achieved.
+
+**What was implemented:**
+
+- ✅ **`utils/chem.py` → `domains/molecular/chem.py`**: FULL MOVE (391 lines in new location). All functions moved: `draw_mol()`, `is_valid_molecule()`, `canonical_key()`, `compute_qed()`, `nx_to_mol()`, `_infer_bond_orders()`, `reconstruct_for_eval()`, `mol_to_data()`, `ReconstructionResult`, atom symbol mappings, charge mappings. Old `utils/chem.py` is now an 18-line backward-compatible re-export wrapper.
+
+- ✅ **Evaluator → `domains/molecular/metrics.py`**: FULL MOVE (389 lines in new location). Contains `rdkit_logp()`, `rdkit_qed()`, `rdkit_sa_score()`, `rdkit_max_ring_size()`, `calculate_internal_diversity()`, and the full `GenerationEvaluator` class (210 lines). Old `utils/evaluator.py` is now a 10-line re-export wrapper.
+
+- ✅ **Experiment helpers → `domains/molecular/helpers.py`**: EXTRACTED (408 lines in new location). Molecular-specific functions moved: `pyg_to_mol()`, `scrub_smiles()`, `is_valid_mol()`, `get_canonical_smiles()`, `draw_mol_or_error()`, `create_reconstruction_plot()`, `compute_tanimoto_similarity()`, `load_smiles_from_csv()`, `smiles_to_pyg_data()`. Old `utils/experiment_helpers.py` is now a hybrid: domain-agnostic core logic (HDC config, encoding, callbacks) plus re-exports from `domains.molecular.helpers`.
+
+- ✅ **Datasets → `domains/molecular/datasets.py`**: NEW generic `SmilesDataset(GraphDataset)` class (68 lines). Loads SMILES from text files, converts via `domain.process()`. Legacy PyG dataset classes (`QM9Smiles`, `ZincSmiles`) remain in `graph_hdc/datasets/` for backward compatibility — appropriate since the refactored pipeline prefers `SmilesDataset`.
+
+- ✅ **Import updates**: Backward-compatible re-export shims in all old locations. `domains/molecular/__init__.py` uses `__getattr__` lazy import pattern to avoid circular dependencies and defer RDKit loading.
+
+- ✅ **New domain infrastructure**: `domains/molecular/preprocessing.py` centralizes all molecular constants (`NODE_FEATURE_BINS`, `NUM_EDGE_CLASSES`, `BOND_TYPE_TO_IDX`, `ZINC_ATOM_TYPES`, etc.). `domains/molecular/encoders.py` has `DegreeEncoder` and `FormalChargeEncoder`.
+
+**Remaining:**
+
+- ❌ **ZINC quantile bins not moved**: Still in `graph_hdc/utils/rw_features.py` (lines 26-115: `_ZINC_RW_QUANTILE_BOUNDARIES`, `ZINC_RW_QUANTILE_BOUNDARIES`, `get_zinc_rw_boundaries()`). Referenced by `streaming_fragments.py` and `experiment_helpers.py`. Should move to `domains/molecular/` — RRWP computation itself is domain-agnostic, but ZINC-specific quantile presets belong in the molecular domain.
+
+- ⚠️ **Top-level RDKit dependency not fully lazy**: `graph_hdc/__init__.py` (lines 36-42) unconditionally imports from `utils.evaluator`, which triggers RDKit import. `from graph_hdc import HyperNet` works fine, but `from graph_hdc import GenerationEvaluator` requires RDKit. To make the top-level package fully RDKit-optional, evaluator imports in `__init__.py` should use the same `__getattr__` lazy pattern already used in `domains/molecular/__init__.py`.
+
+- ⚠️ **Legacy dataset classes still present**: `graph_hdc/datasets/{qm9_smiles.py, zinc_smiles.py}` still exist alongside the new `SmilesDataset`. This is intentional — backward compatibility for existing training scripts.
 
 ### Phase 6: Implement colored graph domain
 - Create `domains/colored_graphs/domain.py`
