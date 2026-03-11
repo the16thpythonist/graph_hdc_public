@@ -7,7 +7,8 @@ Vector Symbolic Architectures (VSA) with message passing.
 
 import enum
 import itertools
-from collections import Counter, defaultdict
+import math
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Final
@@ -29,6 +30,7 @@ from graph_hdc.hypernet.configs import (
     DecoderSettings,
     DSHDCConfig,
     FallbackDecoderSettings,
+    FeatureConfig,
     Features,
     IndexRange,
     RWConfig,
@@ -120,19 +122,39 @@ class HyperNet(pl.LightningModule):
 
     def __init__(
         self,
-        config: DSHDCConfig,
+        config: DSHDCConfig | None = None,
         depth: int | None = None,
         observed_node_features: set[tuple] | None = None,
+        *,
+        # Explicit args (alternative to config, keyword-only):
+        feature_bins: list[int] | None = None,
+        hv_dim: int = 256,
+        vsa: str | VSAModel = "HRR",
+        hypernet_depth: int = 3,
+        seed: int | None = None,
+        normalize: bool = False,
+        normalize_graph_embedding: bool = False,
+        prune_codebook: bool = False,
+        dtype: str = "float64",
+        device: str = "cpu",
     ):
         """
-        Initialize HyperNet from configuration.
+        Initialize HyperNet from configuration or explicit feature bins.
+
+        There are two construction paths:
+
+        1. **Config path** (existing): ``HyperNet(config)``
+        2. **Explicit path** (new): ``HyperNet(feature_bins=[4, 5, 3, 5])``
+
+        Both paths are mutually exclusive — passing both ``config`` and
+        ``feature_bins`` raises :class:`ValueError`.
 
         Parameters
         ----------
-        config : DSHDCConfig
-            Dataset and encoding configuration
+        config : DSHDCConfig, optional
+            Dataset and encoding configuration (path 1).
         depth : int, optional
-            Override message passing depth from config
+            Override message passing depth from config.
         observed_node_features : set[tuple], optional
             Explicit set of observed node feature tuples for codebook
             pruning. When provided, used instead of
@@ -140,7 +162,47 @@ class HyperNet(pl.LightningModule):
             needed when extra features (e.g. RW bins) have been appended
             to the base node features, since the cached dataset info
             only knows about the base features.
+        feature_bins : list[int], optional
+            Per-dimension cardinalities (path 2). E.g. ``[4, 5, 3, 5]``
+            means 4 possible values for feature 0, 5 for feature 1, etc.
+        hv_dim : int
+            Hypervector dimensionality (path 2 only, default 256).
+        vsa : str | VSAModel
+            VSA model name or enum (path 2 only, default ``"HRR"``).
+        hypernet_depth : int
+            Message passing depth (path 2 only, default 3).
+        seed : int, optional
+            Random seed for codebook generation (path 2 only).
+        normalize : bool
+            Normalize hypervectors (path 2 only, default False).
+        normalize_graph_embedding : bool
+            Normalize graph embedding (path 2 only, default False).
+        prune_codebook : bool
+            Prune codebook to observed features (path 2 only, default False).
+        dtype : str
+            Data type ``"float64"`` or ``"float32"`` (path 2 only).
+        device : str
+            Torch device string (path 2 only, default ``"cpu"``).
         """
+        if config is not None and feature_bins is not None:
+            raise ValueError("Cannot specify both 'config' and 'feature_bins'")
+        if config is None and feature_bins is None:
+            raise ValueError("Either 'config' or 'feature_bins' must be provided")
+
+        if config is None:
+            config = self._config_from_bins(
+                feature_bins,
+                hv_dim=hv_dim,
+                vsa=vsa,
+                hypernet_depth=depth or hypernet_depth,
+                seed=seed,
+                normalize=normalize,
+                normalize_graph_embedding=normalize_graph_embedding,
+                prune_codebook=prune_codebook,
+                dtype=dtype,
+                device=device,
+            )
+
         super().__init__()
 
         # Core attributes
@@ -160,19 +222,19 @@ class HyperNet(pl.LightningModule):
             torch.manual_seed(self.seed)
 
         # Build encoder maps from config
-        device = torch.device(config.device)
+        _device = torch.device(config.device)
         self.node_encoder_map: EncoderMap = self._build_encoder_map(
-            config.node_feature_configs, config, device
+            config.node_feature_configs, config, _device
         )
         self.edge_encoder_map: EncoderMap = self._build_encoder_map(
-            config.edge_feature_configs or {}, config, device
+            config.edge_feature_configs or {}, config, _device
         )
         self.graph_encoder_map: EncoderMap = self._build_encoder_map(
-            config.graph_feature_configs or {}, config, device
+            config.graph_feature_configs or {}, config, _device
         )
 
         # Build derived codebooks eagerly
-        self._build_codebooks(device, observed_node_features=observed_node_features)
+        self._build_codebooks(_device, observed_node_features=observed_node_features)
 
         # Decoding parameters (dataset-dependent)
         self._decoding_edge_limit = MAX_ALLOWED_DECODING_EDGES_QM9 if self.base_dataset == "qm9" else MAX_ALLOWED_DECODING_EDGES_ZINC
@@ -201,6 +263,63 @@ class HyperNet(pl.LightningModule):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+    # ──────────────── Alternative constructor helpers ────────────────
+
+    @staticmethod
+    def _config_from_bins(
+        feature_bins: list[int],
+        hv_dim: int = 256,
+        vsa: str | VSAModel = "HRR",
+        hypernet_depth: int = 3,
+        seed: int | None = None,
+        normalize: bool = False,
+        normalize_graph_embedding: bool = False,
+        prune_codebook: bool = False,
+        dtype: str = "float64",
+        device: str = "cpu",
+    ) -> DSHDCConfig:
+        """Build a DSHDCConfig from explicit feature bins."""
+        vsa_model = VSAModel(vsa) if isinstance(vsa, str) else vsa
+        node_fc = FeatureConfig(
+            count=math.prod(feature_bins),
+            encoder_cls=CombinatoricIntegerEncoder,
+            index_range=(0, len(feature_bins)),
+            bins=list(feature_bins),
+        )
+        return DSHDCConfig(
+            name="explicit",
+            hv_dim=hv_dim,
+            vsa=vsa_model,
+            node_feature_configs=OrderedDict([(Features.NODE_FEATURES, node_fc)]),
+            device=device,
+            seed=seed,
+            dtype=dtype,
+            base_dataset=None,
+            hypernet_depth=hypernet_depth,
+            normalize=normalize,
+            prune_codebook=prune_codebook,
+            normalize_graph_embedding=normalize_graph_embedding,
+        )
+
+    @property
+    def feature_bins(self) -> list[int]:
+        """List of feature cardinalities (bin counts per dimension)."""
+        return list(self.nodes_indexer.sizes)
+
+    @classmethod
+    def from_domain(cls, domain, **kwargs) -> "HyperNet":
+        """Create a HyperNet from a GraphDomain's feature schema.
+
+        Parameters
+        ----------
+        domain : GraphDomain
+            Domain providing ``feature_bins``.
+        **kwargs
+            Additional keyword arguments passed to the constructor
+            (hv_dim, seed, normalize, etc.).
+        """
+        return cls(feature_bins=domain.feature_bins, **kwargs)
 
     def _validate_vsa(self, vsa: VSAModel) -> VSAModel:
         """Validate VSA model is supported."""
@@ -315,8 +434,13 @@ class HyperNet(pl.LightningModule):
         if self.prune_codebook:
             if observed_node_features is not None:
                 self.limit_nodes_codebook(node_features=observed_node_features)
-            else:
+            elif self.base_dataset is not None:
                 self.limit_nodes_codebook(node_features=get_dataset_info(self.base_dataset).node_features)
+            else:
+                raise ValueError(
+                    "prune_codebook=True requires either observed_node_features "
+                    "or a known base_dataset for the implicit fallback"
+                )
 
 
         # Edge feature codebook (if edge features exist)
@@ -1696,6 +1820,7 @@ class HyperNet(pl.LightningModule):
                 "seed": self.seed,
                 "normalize": self.normalize,
                 "base_dataset": self.base_dataset,
+                "feature_bins": list(self.nodes_indexer.sizes),
                 "dtype": "float64" if self._dtype == torch.float64 else "float32",
                 "rw_config": {
                     "enabled": self.rw_config.enabled,

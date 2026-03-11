@@ -1,10 +1,10 @@
 """
 FlowEdgeDecoder - Edge-only DeFoG decoder conditioned on HDC vectors.
 
-This module implements a discrete flow matching model that generates molecular
+This module implements a discrete flow matching model that generates graph
 edges conditioned on:
 1. Pre-computed HDC vectors (512-dim default)
-2. Fixed node features (24-dim one-hot: atom type, degree, charge, Hs, ring)
+2. Fixed node features (one-hot encoded from domain-provided feature_bins)
 
 The model inherits from DeFoG's DeFoGModel and overrides the training and
 sampling methods to:
@@ -12,13 +12,9 @@ sampling methods to:
 - Only denoise edges through the flow matching process
 - Use HDC vectors as global conditioning
 
-Node features (ZINC format):
-- atom_type: 9 classes (Br, C, Cl, F, I, N, O, P, S)
-- degree: 6 classes (0-5)
-- formal_charge: 3 classes (0=neutral, 1=+1, 2=-1)
-- total_Hs: 4 classes (0-3)
-- is_in_ring: 2 classes (0, 1)
-Total: 24-dimensional one-hot concatenation
+The model is domain-agnostic: node feature layout is determined by the
+``feature_bins`` constructor argument. Molecular-specific constants and
+preprocessing live in ``graph_hdc.domains.molecular.preprocessing``.
 """
 
 from __future__ import annotations
@@ -32,7 +28,6 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from rdkit import Chem
 from torch import Tensor
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
@@ -97,47 +92,6 @@ class SinusoidalTimeEmbedding(nn.Module):
         return embedding
 
 
-# =============================================================================
-# Constants
-# =============================================================================
-
-# ZINC atom types (9 classes)
-ZINC_ATOM_TYPES = ["Br", "C", "Cl", "F", "I", "N", "O", "P", "S"]
-ZINC_ATOM_TO_IDX = {atom: idx for idx, atom in enumerate(ZINC_ATOM_TYPES)}
-ZINC_IDX_TO_ATOM = {idx: atom for atom, idx in ZINC_ATOM_TO_IDX.items()}
-
-# Node feature dimensions (ZINC)
-NUM_ATOM_CLASSES = 9
-NUM_DEGREE_CLASSES = 6
-NUM_CHARGE_CLASSES = 3
-NUM_HS_CLASSES = 4
-NUM_RING_CLASSES = 2
-
-# Total one-hot dimension for all node features
-NODE_FEATURE_DIM = (
-    NUM_ATOM_CLASSES + NUM_DEGREE_CLASSES + NUM_CHARGE_CLASSES +
-    NUM_HS_CLASSES + NUM_RING_CLASSES
-)  # 24
-
-# Feature bin sizes (for indexing)
-NODE_FEATURE_BINS = [
-    NUM_ATOM_CLASSES,
-    NUM_DEGREE_CLASSES,
-    NUM_CHARGE_CLASSES,
-    NUM_HS_CLASSES,
-    NUM_RING_CLASSES,
-]
-
-# 5-class edge type mapping
-BOND_TYPES = ["no_edge", "single", "double", "triple", "aromatic"]
-BOND_TYPE_TO_IDX = {
-    None: 0,  # No edge
-    Chem.BondType.SINGLE: 1,
-    Chem.BondType.DOUBLE: 2,
-    Chem.BondType.TRIPLE: 3,
-    Chem.BondType.AROMATIC: 4,
-}
-NUM_EDGE_CLASSES = 5
 
 
 # =============================================================================
@@ -145,20 +99,21 @@ NUM_EDGE_CLASSES = 5
 # =============================================================================
 
 
-def get_node_feature_bins(rw_config=None) -> List[int]:
+def extend_feature_bins(base_bins: List[int], rw_config=None) -> List[int]:
     """
-    Get the full list of feature bin sizes, optionally including RW bins.
+    Extend base feature bins with RW positional encoding bins.
 
     Args:
+        base_bins: Base feature bin sizes from the domain (e.g. [9, 6, 3, 4, 2]).
         rw_config: Optional RWConfig. When provided and enabled, appends
-                   ``[num_bins] * len(k_values)`` to the base ZINC bins.
+                   ``[num_bins] * len(k_values)`` to the base bins.
 
     Returns:
         List of class counts per feature position.
         Base: [9, 6, 3, 4, 2] (24-dim).
         With RW(k=(3,6), bins=10): [9, 6, 3, 4, 2, 10, 10] (44-dim).
     """
-    bins = list(NODE_FEATURE_BINS)
+    bins = list(base_bins)
     if rw_config is not None and getattr(rw_config, "enabled", False):
         bins.extend([rw_config.num_bins] * len(rw_config.k_values))
     return bins
@@ -173,24 +128,17 @@ def node_tuple_to_onehot(
     Convert a single node tuple to concatenated one-hot encoding.
 
     Encodes every position in the tuple according to ``feature_bins``.
-    When ``feature_bins`` is ``None``, falls back to the base 5-feature
-    ``NODE_FEATURE_BINS`` for backward compatibility.
 
     Args:
-        node_tuple: Tuple of integer feature indices, e.g.
-                    (atom_idx, degree, charge, num_hs, is_ring) for base, or
-                    (atom_idx, degree, charge, num_hs, is_ring, rw_k3, rw_k6)
-                    when RW features are present.
+        node_tuple: Tuple of integer feature indices.
         device: Target device for the tensor.
-        feature_bins: List of class counts per position. Length must match the
-                      tuple length. Use ``get_node_feature_bins(rw_config)``
-                      to obtain this from a HyperNet's RW configuration.
+        feature_bins: List of class counts per position. Required.
 
     Returns:
         One-hot tensor of shape (sum(feature_bins),)
     """
     if feature_bins is None:
-        feature_bins = NODE_FEATURE_BINS
+        raise ValueError("feature_bins is required")
 
     parts = []
     for i, num_classes in enumerate(feature_bins):
@@ -214,15 +162,13 @@ def node_tuples_to_onehot(
     Args:
         node_tuples: List of integer-index tuples (one per node).
         device: Target device for the tensor.
-        feature_bins: List of class counts per position (see
-                      ``node_tuple_to_onehot``). Defaults to
-                      ``NODE_FEATURE_BINS``.
+        feature_bins: List of class counts per position. Required.
 
     Returns:
         One-hot tensor of shape (n, sum(feature_bins))
     """
     if feature_bins is None:
-        feature_bins = NODE_FEATURE_BINS
+        raise ValueError("feature_bins is required")
 
     total_dim = sum(feature_bins)
     if not node_tuples:
@@ -245,14 +191,13 @@ def raw_features_to_onehot(
         raw_features: Tensor of shape (n, num_features) with integer indices.
                       Columns correspond to ``feature_bins`` positions.
         device: Target device for the tensor.
-        feature_bins: List of class counts per column. Defaults to
-                      ``NODE_FEATURE_BINS``.
+        feature_bins: List of class counts per column. Required.
 
     Returns:
         One-hot tensor of shape (n, sum(feature_bins))
     """
     if feature_bins is None:
-        feature_bins = NODE_FEATURE_BINS
+        raise ValueError("feature_bins is required")
 
     total_dim = sum(feature_bins)
     n_atoms = raw_features.size(0)
@@ -279,14 +224,13 @@ def onehot_to_raw_features(
 
     Args:
         x_onehot: One-hot tensor of shape (n, sum(feature_bins))
-        feature_bins: List of class counts per position. Defaults to
-                      ``NODE_FEATURE_BINS`` ([9, 6, 3, 4, 2] = 24-dim).
+        feature_bins: List of class counts per position. Required.
 
     Returns:
         Tensor of shape (n, len(feature_bins)) with integer indices.
     """
     if feature_bins is None:
-        feature_bins = NODE_FEATURE_BINS
+        raise ValueError("feature_bins is required")
 
     parts = []
     offset = 0
@@ -306,9 +250,9 @@ def onehot_to_raw_features(
 class FlowEdgeDecoderConfig:
     """Configuration for FlowEdgeDecoder model."""
 
-    # Data dimensions
-    num_node_classes: int = NODE_FEATURE_DIM
-    num_edge_classes: int = NUM_EDGE_CLASSES
+    # Data dimensions — feature_bins and num_edge_classes must be set
+    feature_bins: Optional[List[int]] = None
+    num_edge_classes: Optional[int] = None
     hdc_dim: int = 512
     condition_dim: int = 128  # Reduced dimension after MLP
     time_embed_dim: int = 64  # Dimension for time embedding
@@ -348,15 +292,6 @@ class FlowEdgeDecoderConfig:
 
     # Per-node HDC codebook embedding
     node_hdc_embed_dim: int = 0  # 0=disabled, >0=project codebook HVs to this dim
-
-
-# Default config for ZINC dataset (24-dim node features)
-ZINC_EDGE_DECODER_CONFIG = FlowEdgeDecoderConfig(
-    hdc_dim=512,
-    n_layers=8,
-    hidden_dim=384,
-    max_nodes=50,
-)
 
 
 # =============================================================================
@@ -549,7 +484,7 @@ class FlowEdgeDecoder(pl.LightningModule):
     """
     Edge-only DeFoG decoder conditioned on HDC vectors.
 
-    This model generates molecular edges given:
+    This model generates graph edges given:
     - Pre-computed HDC vectors as global conditioning
     - Fixed node types (not modified during generation)
 
@@ -558,10 +493,11 @@ class FlowEdgeDecoder(pl.LightningModule):
 
     Parameters
     ----------
-    num_node_classes : int
-        Number of node classes (default: 7 for C, N, O, F, S, Cl, Br)
+    feature_bins : list[int]
+        List of class counts per node feature dimension (e.g. [9, 6, 3, 4, 2]).
+        ``num_node_classes`` is computed as ``sum(feature_bins)``.
     num_edge_classes : int
-        Number of edge classes (default: 5 for no-edge, single, double, triple, aromatic)
+        Number of edge classes (e.g. 2 for simple graphs, 5 for molecular bond types).
     hdc_dim : int
         Dimension of HDC conditioning vectors (default: 512)
     n_layers : int
@@ -600,12 +536,16 @@ class FlowEdgeDecoder(pl.LightningModule):
         Target guidance strength for sampling
     sample_time_distortion : str
         Time distortion for sampling
+    codebook_feature_bins : list[int], optional
+        Feature bins for the HDC codebook. Only needed when ``node_hdc_embed_dim > 0``
+        and the codebook uses different (base) bins than ``feature_bins`` (e.g. when
+        RW features extend the bins). Defaults to ``feature_bins``.
     """
 
     def __init__(
         self,
-        num_node_classes: int = NODE_FEATURE_DIM,
-        num_edge_classes: int = NUM_EDGE_CLASSES,
+        feature_bins: List[int],
+        num_edge_classes: int,
         hdc_dim: int = 512,
         condition_dim: int = 128,
         time_embed_dim: int = 64,
@@ -633,11 +573,14 @@ class FlowEdgeDecoder(pl.LightningModule):
         node_hdc_embed_dim: int = 0,
         nodes_codebook: Optional[Tensor] = None,
         size_edge_marginals: Optional[Tensor] = None,
+        codebook_feature_bins: Optional[List[int]] = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["nodes_codebook", "size_edge_marginals"])
 
         # Store dimensions
+        self.feature_bins = list(feature_bins)
+        num_node_classes = sum(feature_bins)
         self.num_node_classes = num_node_classes
         self.num_edge_classes = num_edge_classes
         self.hdc_dim = hdc_dim
@@ -669,10 +612,12 @@ class FlowEdgeDecoder(pl.LightningModule):
             self.register_buffer("_nodes_codebook", cb)
             codebook_hv_dim = nodes_codebook.shape[1]
             self.node_hdc_proj = nn.Linear(codebook_hv_dim, node_hdc_embed_dim)
-            # Strides for flat index computation from NODE_FEATURE_BINS
+            # Strides for flat index computation from codebook feature bins
+            cb_bins = codebook_feature_bins if codebook_feature_bins is not None else self.feature_bins
+            self._codebook_feature_bins = list(cb_bins)
             strides = []
             s = 1
-            for b in reversed(NODE_FEATURE_BINS):
+            for b in reversed(cb_bins):
                 strides.append(s)
                 s *= b
             strides.reverse()
@@ -859,19 +804,21 @@ class FlowEdgeDecoder(pl.LightningModule):
 
         Args:
             X_t: One-hot node features (bs, n, num_node_classes). Only the
-                 first NODE_FEATURE_DIM dimensions are used for the lookup.
+                 first ``sum(codebook_feature_bins)`` dimensions are used.
 
         Returns:
             Projected embeddings of shape (bs, n, node_hdc_embed_dim).
         """
-        x_base = X_t[..., :NODE_FEATURE_DIM]  # (bs, n, 24)
+        cb_bins = self._codebook_feature_bins
+        base_dim = sum(cb_bins)
+        x_base = X_t[..., :base_dim]
         # Argmax per feature group to recover raw integer indices
         offset = 0
         raw_parts = []
-        for num_classes in NODE_FEATURE_BINS:
+        for num_classes in cb_bins:
             raw_parts.append(x_base[..., offset:offset + num_classes].argmax(dim=-1))
             offset += num_classes
-        raw = torch.stack(raw_parts, dim=-1)  # (bs, n, 5)
+        raw = torch.stack(raw_parts, dim=-1)  # (bs, n, num_features)
         # Flat index via precomputed strides
         flat_idx = (raw * self._codebook_strides).sum(dim=-1).long()  # (bs, n)
         flat_idx = flat_idx.clamp(0, self._nodes_codebook.shape[0] - 1)
@@ -2413,6 +2360,11 @@ class FlowEdgeDecoder(pl.LightningModule):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         hparams = checkpoint["hyper_parameters"]
 
+        # Legacy checkpoint migration: old checkpoints have num_node_classes
+        # instead of feature_bins. Wrap as single-element list so the model loads.
+        if "feature_bins" not in hparams and "num_node_classes" in hparams:
+            hparams["feature_bins"] = [hparams.pop("num_node_classes")]
+
         # Restore nodes_codebook from state_dict — it is excluded from
         # save_hyperparameters to avoid duplication, but the constructor
         # asserts its presence when node_hdc_embed_dim > 0.
@@ -2434,182 +2386,19 @@ class FlowEdgeDecoder(pl.LightningModule):
         return model
 
 
-# =============================================================================
-# Preprocessing Functions
-# =============================================================================
 
-def get_bond_type_idx(bond) -> int:
-    """Convert RDKit bond to 5-class index."""
-    if bond is None:
-        return 0  # No edge
-    return BOND_TYPE_TO_IDX.get(bond.GetBondType(), 0)
-
-
-def preprocess_for_flow_edge_decoder(
-    data: Data,
-    hypernet,
-    device: torch.device = None,
-) -> Optional[Data]:
-    """
-    Preprocess a PyG Data object for FlowEdgeDecoder training (ZINC only).
-
-    Adds/replaces:
-    - x: One-hot encoding (24-dim base, or extended with RW bins when enabled)
-    - edge_attr: 5-class bond type one-hot encoding
-    - hdc_vector: Pre-computed HDC embedding
-    - original_x: Raw feature indices for HDC-guided sampling
-
-    Args:
-        data: Original PyG Data object with ZINC features
-              data.x should have shape (n, 5) with columns:
-              [atom_type, degree, charge, num_hs, is_in_ring]
-        hypernet: HyperNet encoder for computing HDC embeddings
-        device: Device for HDC computation
-
-    Returns:
-        Preprocessed Data object, or None if molecule has no edges
-    """
-    device = device or torch.device("cpu")
-
-    # Skip molecules with no edges (single atoms)
-    if data.edge_index.numel() == 0:
-        return None
-
-    # 1. Build node features — base 5-dim ZINC features, optionally extended
-    #    with binned RW return probabilities when the encoder uses them.
-    rw_config = getattr(hypernet, "rw_config", None)
-    feature_bins = get_node_feature_bins(rw_config)
-
-    raw_feats = data.x.clone()  # (n, 5) base ZINC features
-    if rw_config is not None and rw_config.enabled:
-        from graph_hdc.utils.rw_features import (
-            bin_rw_probabilities,
-            compute_rw_return_probabilities,
-        )
-        rw_probs = compute_rw_return_probabilities(
-            data.edge_index, data.x.size(0), rw_config.k_values,
-        )
-        rw_binned = bin_rw_probabilities(rw_probs, rw_config.num_bins, bin_boundaries=rw_config.bin_boundaries, k_values=rw_config.k_values, clip_range=rw_config.clip_range)
-        raw_feats = torch.cat([raw_feats, rw_binned], dim=-1)
-
-    x_onehot = raw_features_to_onehot(raw_feats, feature_bins=feature_bins)
-
-    # 2. Create 5-class edge attributes from SMILES
-    mol = Chem.MolFromSmiles(data.smiles)
-    if mol is None:
-        return None
-
-    edge_index = data.edge_index
-
-    # Build adjacency with bond types
-    edge_attr_list = []
-    for i in range(edge_index.size(1)):
-        src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-        bond = mol.GetBondBetweenAtoms(src, dst)
-        bond_type = get_bond_type_idx(bond)
-        edge_attr_list.append(bond_type)
-
-    edge_attr = torch.tensor(edge_attr_list, dtype=torch.long)
-    edge_attr_onehot = F.one_hot(edge_attr, num_classes=NUM_EDGE_CLASSES).float()
-
-    # 3. Compute HDC embedding: concatenate order-0 and order-N
-    data_for_hdc = data.clone().to(device)
-    # Add batch attribute for single graph (required by HyperNet)
-    if data_for_hdc.batch is None:
-        data_for_hdc.batch = torch.zeros(data_for_hdc.x.size(0), dtype=torch.long, device=device)
-
-    # Augment with RW features if the encoder was built with them
-    if hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled:
-        from graph_hdc.utils.rw_features import augment_data_with_rw
-
-        data_for_hdc = augment_data_with_rw(
-            data_for_hdc,
-            k_values=hypernet.rw_config.k_values,
-            num_bins=hypernet.rw_config.num_bins,
-            bin_boundaries=hypernet.rw_config.bin_boundaries,
-        )
-
-    with torch.no_grad():
-        # forward() handles encode_properties internally and returns:
-        # - node_terms: order-0 (bundled node HVs, RRWP-enriched for RRWPHyperNet)
-        # - graph_embedding: order-N (message passing result)
-        hdc_out = hypernet.forward(data_for_hdc)
-        order_zero = hdc_out["node_terms"]
-        order_n = hdc_out["graph_embedding"]
-
-        # Concatenate [order_0 | order_N]
-        hdc_concat = torch.cat([order_zero, order_n], dim=-1).cpu().float()
-        # Convert from HRRTensor subclass to regular tensor
-        hdc_vector = torch.Tensor(hdc_concat.tolist())
-        if hdc_vector.dim() == 1:
-            hdc_vector = hdc_vector.unsqueeze(0)  # Ensure (1, 2*hdc_dim) for proper batching
-
-    # 4. Create new Data object
-    new_data = Data(
-        x=x_onehot,  # one-hot: base 24-dim, or extended when RW enabled
-        edge_index=edge_index.clone(),
-        edge_attr=edge_attr_onehot,
-        hdc_vector=hdc_vector,
-        smiles=data.smiles,
-        # Keep original raw features for HDC-guided sampling
-        original_x=data.x.clone(),
-    )
-
-    # Copy other attributes
-    if hasattr(data, "logp"):
-        new_data.logp = data.logp.clone()
-    if hasattr(data, "qed"):
-        new_data.qed = data.qed.clone()
-
-    return new_data
-
-
-def preprocess_dataset(
-    dataset,
-    hypernet,
-    device: torch.device = None,
-    show_progress: bool = True,
-) -> List[Data]:
-    """
-    Preprocess entire dataset for FlowEdgeDecoder (ZINC only).
-
-    Args:
-        dataset: PyG dataset or list of Data objects (ZINC format)
-        hypernet: HyperNet encoder
-        device: Device for HDC computation
-        show_progress: Whether to show progress bar
-
-    Returns:
-        List of preprocessed Data objects with 24-dim node features
-    """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    hypernet = hypernet.to(device)
-    hypernet.eval()
-
-    processed = []
-    iterator = dataset
-    if show_progress:
-        iterator = tqdm(iterator, desc="Preprocessing ZINC")
-
-    for data in iterator:
-        new_data = preprocess_for_flow_edge_decoder(data, hypernet, device)
-        if new_data is not None:
-            processed.append(new_data)
-
-    return processed
-
-
-def compute_edge_marginals(data_list: List[Data]) -> Tensor:
+def compute_edge_marginals(data_list: List[Data], num_edge_classes: int) -> Tensor:
     """
     Compute empirical edge marginals from preprocessed data.
 
     Args:
         data_list: List of preprocessed Data objects
+        num_edge_classes: Number of edge classes
 
     Returns:
-        Tensor of shape (5,) with probabilities for each edge class
+        Tensor of shape (num_edge_classes,) with probabilities for each edge class
     """
-    edge_counts = torch.zeros(NUM_EDGE_CLASSES)
+    edge_counts = torch.zeros(num_edge_classes)
 
     for data in data_list:
         n = data.x.size(0)
@@ -2636,27 +2425,29 @@ def compute_edge_marginals(data_list: List[Data]) -> Tensor:
 def compute_size_edge_marginals(
     data_list: List[Data],
     max_size: int,
-    min_molecules_per_size: int = 50,
+    num_edge_classes: int,
+    min_graphs_per_size: int = 50,
 ) -> Tensor:
     """
     Compute per-size edge marginals from preprocessed data.
 
-    Groups molecules by atom count and computes separate marginals for each
-    size.  Sizes with fewer than ``min_molecules_per_size`` molecules fall
+    Groups graphs by node count and computes separate marginals for each
+    size.  Sizes with fewer than ``min_graphs_per_size`` graphs fall
     back to the global marginal to avoid noisy estimates.
 
     Args:
         data_list: List of preprocessed Data objects
-        max_size: Maximum molecule size (table rows = max_size + 1)
-        min_molecules_per_size: Minimum molecule count to trust per-size
+        max_size: Maximum graph size (table rows = max_size + 1)
+        num_edge_classes: Number of edge classes
+        min_graphs_per_size: Minimum graph count to trust per-size
             marginals.  Sizes below this threshold use the global marginal.
 
     Returns:
-        Tensor of shape (max_size + 1, 5) with per-size edge class
-        probabilities.
+        Tensor of shape (max_size + 1, num_edge_classes) with per-size edge
+        class probabilities.
     """
     # Accumulate per-size edge counts
-    size_edge_counts = torch.zeros(max_size + 1, NUM_EDGE_CLASSES)
+    size_edge_counts = torch.zeros(max_size + 1, num_edge_classes)
     size_mol_counts = torch.zeros(max_size + 1, dtype=torch.long)
 
     for data in data_list:
@@ -2681,9 +2472,9 @@ def compute_size_edge_marginals(
     global_marginals = global_counts / global_counts.sum().clamp(min=1)
 
     # Build per-size marginals with fallback
-    size_marginals = torch.zeros(max_size + 1, NUM_EDGE_CLASSES)
+    size_marginals = torch.zeros(max_size + 1, num_edge_classes)
     for s in range(max_size + 1):
-        if size_mol_counts[s] >= min_molecules_per_size:
+        if size_mol_counts[s] >= min_graphs_per_size:
             row_sum = size_edge_counts[s].sum()
             size_marginals[s] = size_edge_counts[s] / row_sum.clamp(min=1)
         else:

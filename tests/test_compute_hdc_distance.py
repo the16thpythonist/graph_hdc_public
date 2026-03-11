@@ -16,10 +16,10 @@ from rdkit import Chem
 from torch_geometric.data import Data
 
 from graph_hdc.models.flow_edge_decoder import (
-    NODE_FEATURE_BINS,
     node_tuples_to_onehot,
     onehot_to_raw_features,
 )
+from graph_hdc.domains.molecular.preprocessing import NODE_FEATURE_BINS
 from graph_hdc.utils.experiment_helpers import (
     compute_hdc_distance,
     decode_nodes_from_hdc,
@@ -141,8 +141,9 @@ class TestOnehotRawRoundTrip:
         onehot = node_tuples_to_onehot(
             [tuple(int(v) for v in row) for row in raw.tolist()],
             device="cpu",
+            feature_bins=NODE_FEATURE_BINS,
         )
-        raw_back = onehot_to_raw_features(onehot)
+        raw_back = onehot_to_raw_features(onehot, feature_bins=NODE_FEATURE_BINS)
 
         assert torch.allclose(raw, raw_back), (
             f"Round-trip mismatch!\n  original: {raw}\n  recovered: {raw_back}"
@@ -154,9 +155,10 @@ class TestOnehotRawRoundTrip:
         for atom_idx in range(bins[0]):
             raw = torch.tensor([[atom_idx, 1, 0, 0, 0]], dtype=torch.float)
             onehot = node_tuples_to_onehot(
-                [(atom_idx, 1, 0, 0, 0)], device="cpu"
+                [(atom_idx, 1, 0, 0, 0)], device="cpu",
+                feature_bins=NODE_FEATURE_BINS,
             )
-            raw_back = onehot_to_raw_features(onehot)
+            raw_back = onehot_to_raw_features(onehot, feature_bins=NODE_FEATURE_BINS)
             assert raw_back[0, 0].item() == atom_idx, (
                 f"Atom type {atom_idx}: expected {atom_idx}, got {raw_back[0, 0].item()}"
             )
@@ -202,7 +204,7 @@ class TestOnehotRawRoundTrip:
         assert x_onehot.shape == (2, 24)
 
         # Reverse to raw (what compute_hdc_distance does)
-        raw_back = onehot_to_raw_features(x_onehot)
+        raw_back = onehot_to_raw_features(x_onehot, feature_bins=NODE_FEATURE_BINS)
         assert raw_back.shape == (2, 5)
 
         # Encode with HyperNet
@@ -272,12 +274,12 @@ class TestComputeHDCDistanceFlow:
         )
 
         # This is what the test experiment does
-        onehot = node_tuples_to_onehot(node_tuples, device="cpu")
+        onehot = node_tuples_to_onehot(node_tuples, device="cpu", feature_bins=NODE_FEATURE_BINS)
         print(f"One-hot shape: {onehot.shape}")
         assert onehot.shape == (num_nodes, 24)
 
         # This is what compute_hdc_distance does
-        raw_back = onehot_to_raw_features(onehot)
+        raw_back = onehot_to_raw_features(onehot, feature_bins=NODE_FEATURE_BINS)
         print(f"Raw features shape: {raw_back.shape}")
         print(f"Raw features:\n{raw_back}")
 
@@ -302,7 +304,8 @@ class TestComputeHDCDistanceFlow:
 
         # Prepare inputs for decoder (same as test experiment)
         node_features = node_tuples_to_onehot(
-            node_tuples, device="cpu"
+            node_tuples, device="cpu",
+            feature_bins=NODE_FEATURE_BINS,
         ).unsqueeze(0)
         node_mask = torch.ones(1, num_nodes, dtype=torch.bool)
         hdc_vectors = hdc_vector.unsqueeze(0)
@@ -327,7 +330,7 @@ class TestComputeHDCDistanceFlow:
         print(f"Generated data.x[:3]:\n{generated_data.x[:3]}")
 
         # Now test the raw features conversion
-        raw_features = onehot_to_raw_features(generated_data.x)
+        raw_features = onehot_to_raw_features(generated_data.x, feature_bins=NODE_FEATURE_BINS)
         print(f"Raw features shape: {raw_features.shape}")
         print(f"Raw features dtype: {raw_features.dtype}")
         print(f"Raw features:\n{raw_features}")
@@ -366,7 +369,8 @@ class TestComputeHDCDistanceFlow:
         )
 
         node_features = node_tuples_to_onehot(
-            node_tuples, device="cpu"
+            node_tuples, device="cpu",
+            feature_bins=NODE_FEATURE_BINS,
         ).unsqueeze(0)
         node_mask = torch.ones(1, num_nodes, dtype=torch.bool)
         hdc_vectors = hdc_vector.unsqueeze(0)
@@ -532,7 +536,8 @@ class TestDebugComputeHDCDistance:
         )
 
         node_features = node_tuples_to_onehot(
-            node_tuples, device="cpu"
+            node_tuples, device="cpu",
+            feature_bins=NODE_FEATURE_BINS,
         ).unsqueeze(0)
         node_mask = torch.ones(1, num_nodes, dtype=torch.bool)
         hdc_vectors = hdc_vector.unsqueeze(0)
@@ -557,7 +562,7 @@ class TestDebugComputeHDCDistance:
 
         # Step 2: What does onehot_to_raw_features produce?
         print(f"\n--- Step 2: onehot_to_raw_features ---")
-        raw_x = onehot_to_raw_features(generated_data.x)
+        raw_x = onehot_to_raw_features(generated_data.x, feature_bins=NODE_FEATURE_BINS)
         print(f"Shape: {raw_x.shape}")
         print(f"Dtype: {raw_x.dtype}")
         print(f"Values:\n{raw_x}")

@@ -1,0 +1,290 @@
+[
+  {
+    "smiles": "C",
+    "decoded_node_tuples": [
+      [
+        0,
+        0,
+        0,
+        4
+      ]
+    ],
+    "decoded_num_nodes": 1
+  },
+  {
+    "smiles": "CC",
+    "decoded_node_tuples": [
+      [
+        0,
+        0,
+        0,
+        3
+      ],
+      [
+        0,
+        0,
+        0,
+        3
+      ]
+    ],
+    "decoded_num_nodes": 2
+  },
+  {
+    "smiles": "CCO",
+    "decoded_node_tuples": [
+      [
+        0,
+        1,
+        0,
+        2
+      ],
+      [
+        0,
+        0,
+        0,
+        3
+      ],
+      [
+        2,
+        0,
+        0,
+        1
+      ]
+    ],
+    "decoded_num_nodes": 3
+  },
+  {
+    "smiles": "C=O",
+    "decoded_node_tuples": [
+      [
+        0,
+        0,
+        0,
+        2
+      ],
+      [
+        2,
+        0,
+        0,
+        0
+      ]
+    ],
+    "decoded_num_nodes": 2
+  },
+  {
+    "smiles": "C#N",
+    "decoded_node_tuples": [
+      [
+        0,
+        0,
+        0,
+        1
+      ],
+      [
+        1,
+        0,
+        0,
+        0
+      ]
+    ],
+    "decoded_num_nodes": 2
+  },
+  {
+    "smiles": "c1ccccc1",
+    "decoded_node_tuples": [
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ]
+    ],
+    "decoded_num_nodes": 6
+  },
+  {
+    "smiles": "CC(=O)O",
+    "decoded_node_tuples": [
+      [
+        0,
+        2,
+        0,
+        0
+      ],
+      [
+        2,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        3
+      ],
+      [
+        2,
+        0,
+        0,
+        1
+      ]
+    ],
+    "decoded_num_nodes": 4
+  },
+  {
+    "smiles": "c1ccncc1",
+    "decoded_node_tuples": [
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        1,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ]
+    ],
+    "decoded_num_nodes": 6
+  },
+  {
+    "smiles": "C1CC1",
+    "decoded_node_tuples": [
+      [
+        0,
+        1,
+        0,
+        2
+      ],
+      [
+        0,
+        1,
+        0,
+        2
+      ],
+      [
+        0,
+        1,
+        0,
+        2
+      ]
+    ],
+    "decoded_num_nodes": 3
+  },
+  {
+    "smiles": "OC(=O)c1ccccc1",
+    "decoded_node_tuples": [
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        0,
+        2,
+        0,
+        0
+      ],
+      [
+        2,
+        0,
+        0,
+        1
+      ],
+      [
+        0,
+        1,
+        0,
+        1
+      ],
+      [
+        2,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        2,
+        0,
+        0
+      ]
+    ],
+    "decoded_num_nodes": 9
+  }
+]

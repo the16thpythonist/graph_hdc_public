@@ -1,5 +1,5 @@
 """
-Models for molecular generation.
+Models for graph generation.
 """
 
 from graph_hdc.models.flows import (
@@ -20,22 +20,14 @@ from graph_hdc.models.regressors import (
 from graph_hdc.models.flow_edge_decoder import (
     FlowEdgeDecoder,
     FlowEdgeDecoderConfig,
-    ZINC_EDGE_DECODER_CONFIG,
-    preprocess_for_flow_edge_decoder,
-    preprocess_dataset,
-    compute_edge_marginals,
-    compute_node_counts,
-    ZINC_ATOM_TYPES,
-    ZINC_ATOM_TO_IDX,
-    ZINC_IDX_TO_ATOM,
-    NODE_FEATURE_DIM,
-    NODE_FEATURE_BINS,
-    NUM_EDGE_CLASSES,
-    get_node_feature_bins,
+    extend_feature_bins,
     node_tuple_to_onehot,
     node_tuples_to_onehot,
     raw_features_to_onehot,
     onehot_to_raw_features,
+    compute_edge_marginals,
+    compute_size_edge_marginals,
+    compute_node_counts,
 )
 
 __all__ = [
@@ -55,20 +47,12 @@ __all__ = [
     # Flow Edge Decoder
     "FlowEdgeDecoder",
     "FlowEdgeDecoderConfig",
-    "ZINC_EDGE_DECODER_CONFIG",
-    "preprocess_for_flow_edge_decoder",
-    "preprocess_dataset",
-    "compute_edge_marginals",
-    "compute_node_counts",
-    "ZINC_ATOM_TYPES",
-    "ZINC_ATOM_TO_IDX",
-    "ZINC_IDX_TO_ATOM",
-    "NODE_FEATURE_DIM",
-    "NODE_FEATURE_BINS",
-    "NUM_EDGE_CLASSES",
-    "get_node_feature_bins",
+    "extend_feature_bins",
     "node_tuple_to_onehot",
     "node_tuples_to_onehot",
     "raw_features_to_onehot",
     "onehot_to_raw_features",
+    "compute_edge_marginals",
+    "compute_size_edge_marginals",
+    "compute_node_counts",
 ]

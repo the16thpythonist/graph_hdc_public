@@ -16,7 +16,7 @@ from graph_hdc.hypernet.types import VSAModel
 from graph_hdc.utils.helpers import pick_device_str
 
 IndexRange = tuple[int, int]
-BaseDataset = Literal["qm9", "zinc"]
+BaseDataset = Literal["qm9", "zinc"] | None
 
 
 class Features(enum.Enum):

@@ -34,15 +34,17 @@ from defog.core import (
     to_dense,
 )
 
-# Reuse constants and EdgeOnlyLoss from flow_edge_decoder
-from graph_hdc.models.flow_edge_decoder import (
+# Reuse EdgeOnlyLoss from flow_edge_decoder
+from graph_hdc.models.flow_edge_decoder import EdgeOnlyLoss
+
+# Molecular-specific constants
+from graph_hdc.domains.molecular.preprocessing import (
     ZINC_ATOM_TYPES,
     ZINC_ATOM_TO_IDX,
     ZINC_IDX_TO_ATOM,
-    NODE_FEATURE_DIM,
+    ZINC_FEATURE_DIM as NODE_FEATURE_DIM,
     BOND_TYPES,
-    NUM_EDGE_CLASSES,
-    EdgeOnlyLoss,
+    NUM_BOND_CLASSES as NUM_EDGE_CLASSES,
 )
 
 

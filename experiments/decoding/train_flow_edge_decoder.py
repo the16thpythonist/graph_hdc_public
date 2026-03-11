@@ -51,14 +51,18 @@ from graph_hdc.utils.rw_features import get_zinc_rw_boundaries
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
 from graph_hdc.models.flow_edge_decoder import (
-    NODE_FEATURE_DIM,
     FlowEdgeDecoder,
+    extend_feature_bins,
     compute_edge_marginals,
     compute_size_edge_marginals,
     compute_node_counts,
-    get_node_feature_bins,
-    preprocess_dataset,
     node_tuples_to_onehot,
+)
+from graph_hdc.domains.molecular.preprocessing import (
+    NODE_FEATURE_DIM,
+    ZINC_FEATURE_BINS,
+    NUM_EDGE_CLASSES,
+    preprocess_dataset,
 )
 from graph_hdc.utils.experiment_helpers import (
     GracefulInterruptHandler,
@@ -573,7 +577,7 @@ def experiment(e: Experiment) -> None:
         e["config/actual_hdc_depth"] = hypernet.depth
 
     # Compute node feature bins (includes RW bins when enabled)
-    feature_bins = get_node_feature_bins(hypernet.rw_config)
+    feature_bins = extend_feature_bins(ZINC_FEATURE_BINS, hypernet.rw_config)
     num_node_classes = sum(feature_bins)
     e.log(f"Node feature bins: {feature_bins} ({num_node_classes}-dim)")
     e["config/node_feature_bins"] = feature_bins
@@ -637,8 +641,8 @@ def experiment(e: Experiment) -> None:
     e["config/node_hdc_embed_dim"] = e.NODE_HDC_EMBED_DIM
 
     model = FlowEdgeDecoder(
-        num_node_classes=num_node_classes,  # dynamic: base 24 + optional RW bins
-        num_edge_classes=5,
+        feature_bins=feature_bins,
+        num_edge_classes=NUM_EDGE_CLASSES,
         hdc_dim=concat_hdc_dim,  # Input dim is 2x base (concatenated)
         condition_dim=e.CONDITION_DIM,  # Reduced dim after MLP
         time_embed_dim=e.TIME_EMBED_DIM,  # Dimension for time embedding
@@ -1193,14 +1197,14 @@ def compute_statistics(
         raise ValueError("train_data is required for base experiment statistics computation")
 
     e.log("\nComputing edge marginals...")
-    edge_marginals = compute_edge_marginals(train_data)
+    edge_marginals = compute_edge_marginals(train_data, num_edge_classes=NUM_EDGE_CLASSES)
     e.log(f"Edge marginals: {edge_marginals.tolist()}")
 
     node_counts = compute_node_counts(train_data)
     max_nodes = int(node_counts.nonzero()[-1].item()) if node_counts.sum() > 0 else 50
     e.log(f"Max nodes: {max_nodes}")
 
-    size_edge_marginals = compute_size_edge_marginals(train_data, max_nodes + 10)
+    size_edge_marginals = compute_size_edge_marginals(train_data, max_nodes + 10, num_edge_classes=NUM_EDGE_CLASSES)
     e.log(f"Size-conditional marginals computed for {size_edge_marginals.size(0)} sizes")
 
     return edge_marginals, node_counts, max_nodes, size_edge_marginals

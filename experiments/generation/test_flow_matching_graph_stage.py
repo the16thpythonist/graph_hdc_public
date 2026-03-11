@@ -49,9 +49,12 @@ from graph_hdc.hypernet import load_hypernet
 from graph_hdc.hypernet.encoder import HyperNet
 from graph_hdc.models.flow_edge_decoder import (
     FlowEdgeDecoder,
-    NODE_FEATURE_DIM,
-    get_node_feature_bins,
+    extend_feature_bins,
     node_tuples_to_onehot,
+)
+from graph_hdc.domains.molecular.preprocessing import (
+    NODE_FEATURE_DIM,
+    ZINC_FEATURE_BINS,
 )
 from graph_hdc.models.flow_matching import FlowMatchingModel
 from graph_hdc.datasets.utils import get_split
@@ -406,7 +409,7 @@ def experiment(e: Experiment) -> None:
                 continue
 
             # 5c. Convert node tuples to one-hot features
-            feature_bins = get_node_feature_bins(hypernet.rw_config)
+            feature_bins = extend_feature_bins(ZINC_FEATURE_BINS, hypernet.rw_config)
             node_features = node_tuples_to_onehot(
                 node_tuples, device=device, feature_bins=feature_bins,
             ).unsqueeze(0)

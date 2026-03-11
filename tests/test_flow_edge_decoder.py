@@ -11,14 +11,7 @@ from torch_geometric.data import Data, Batch
 from copy import deepcopy
 
 from graph_hdc.models.flow_edge_decoder import (
-    # Constants
-    NODE_FEATURE_DIM,
-    NODE_FEATURE_BINS,
-    NUM_EDGE_CLASSES,
-    ZINC_ATOM_TYPES,
-    BOND_TYPES,
     # Helper functions
-    get_bond_type_idx,
     node_tuple_to_onehot,
     node_tuples_to_onehot,
     raw_features_to_onehot,
@@ -31,6 +24,14 @@ from graph_hdc.models.flow_edge_decoder import (
     # Preprocessing
     compute_edge_marginals,
     compute_node_counts,
+)
+from graph_hdc.domains.molecular.preprocessing import (
+    NODE_FEATURE_DIM,
+    NODE_FEATURE_BINS,
+    NUM_EDGE_CLASSES,
+    ZINC_ATOM_TYPES,
+    BOND_TYPES,
+    get_bond_type_idx,
 )
 
 
@@ -60,7 +61,7 @@ def mock_node_counts():
 def small_model(mock_edge_marginals, mock_node_counts):
     """Create a small FlowEdgeDecoder for testing."""
     return FlowEdgeDecoder(
-        num_node_classes=NODE_FEATURE_DIM,
+        feature_bins=NODE_FEATURE_BINS,
         num_edge_classes=NUM_EDGE_CLASSES,
         hdc_dim=64,  # Small for fast tests
         n_layers=2,
@@ -88,7 +89,7 @@ def small_model(mock_edge_marginals, mock_node_counts):
 def small_model_cross_attn(mock_edge_marginals, mock_node_counts):
     """Create a small FlowEdgeDecoder with cross-attention conditioning for testing."""
     return FlowEdgeDecoder(
-        num_node_classes=NODE_FEATURE_DIM,
+        feature_bins=NODE_FEATURE_BINS,
         num_edge_classes=NUM_EDGE_CLASSES,
         hdc_dim=64,
         n_layers=2,
@@ -254,7 +255,7 @@ class TestNodeTupleConversion:
         """Test converting a single node tuple to one-hot."""
         # (C atom=1, degree=1, neutral=0, 2 Hs, not in ring=0)
         t = (1, 1, 0, 2, 0)
-        onehot = node_tuple_to_onehot(t)
+        onehot = node_tuple_to_onehot(t, feature_bins=NODE_FEATURE_BINS)
         assert onehot.shape == (NODE_FEATURE_DIM,)
         assert onehot.sum() == 5  # One hot per feature
 
@@ -262,18 +263,18 @@ class TestNodeTupleConversion:
         """Test converting with specified device."""
         t = (1, 1, 0, 2, 0)
         device = torch.device("cpu")
-        onehot = node_tuple_to_onehot(t, device=device)
+        onehot = node_tuple_to_onehot(t, device=device, feature_bins=NODE_FEATURE_BINS)
         assert onehot.device == device
 
     def test_multiple_tuples_to_onehot(self):
         """Test converting multiple tuples."""
         tuples = [(1, 1, 0, 2, 0), (5, 2, 0, 1, 1)]  # C and N
-        onehot = node_tuples_to_onehot(tuples)
+        onehot = node_tuples_to_onehot(tuples, feature_bins=NODE_FEATURE_BINS)
         assert onehot.shape == (2, NODE_FEATURE_DIM)
 
     def test_empty_tuples_list(self):
         """Test empty list returns empty tensor."""
-        onehot = node_tuples_to_onehot([])
+        onehot = node_tuples_to_onehot([], feature_bins=NODE_FEATURE_BINS)
         assert onehot.shape == (0, NODE_FEATURE_DIM)
 
     def test_raw_features_to_onehot(self):
@@ -283,7 +284,7 @@ class TestNodeTupleConversion:
             [1, 1, 0, 2, 0],  # C
             [5, 2, 0, 1, 1],  # N
         ], dtype=torch.float32)
-        onehot = raw_features_to_onehot(raw)
+        onehot = raw_features_to_onehot(raw, feature_bins=NODE_FEATURE_BINS)
         assert onehot.shape == (2, NODE_FEATURE_DIM)
         # Each row should sum to 5 (one per feature category)
         assert torch.allclose(onehot.sum(dim=1), torch.tensor([5.0, 5.0]))
@@ -804,28 +805,28 @@ class TestComputeEdgeMarginals:
     def test_returns_tensor(self, mock_pyg_batch):
         """Test function returns tensor."""
         data_list = mock_pyg_batch.to_data_list()
-        marginals = compute_edge_marginals(data_list)
+        marginals = compute_edge_marginals(data_list, num_edge_classes=NUM_EDGE_CLASSES)
 
         assert isinstance(marginals, torch.Tensor)
 
     def test_correct_shape(self, mock_pyg_batch):
         """Test marginals have correct shape."""
         data_list = mock_pyg_batch.to_data_list()
-        marginals = compute_edge_marginals(data_list)
+        marginals = compute_edge_marginals(data_list, num_edge_classes=NUM_EDGE_CLASSES)
 
         assert marginals.shape == (NUM_EDGE_CLASSES,)
 
     def test_sums_to_one(self, mock_pyg_batch):
         """Test marginals sum to 1."""
         data_list = mock_pyg_batch.to_data_list()
-        marginals = compute_edge_marginals(data_list)
+        marginals = compute_edge_marginals(data_list, num_edge_classes=NUM_EDGE_CLASSES)
 
         assert marginals.sum().isclose(torch.tensor(1.0))
 
     def test_all_non_negative(self, mock_pyg_batch):
         """Test all marginals are non-negative."""
         data_list = mock_pyg_batch.to_data_list()
-        marginals = compute_edge_marginals(data_list)
+        marginals = compute_edge_marginals(data_list, num_edge_classes=NUM_EDGE_CLASSES)
 
         assert (marginals >= 0).all()
 
@@ -915,20 +916,22 @@ class TestConfiguration:
         """Test default configuration values."""
         config = FlowEdgeDecoderConfig()
 
-        assert config.num_node_classes == NODE_FEATURE_DIM
-        assert config.num_edge_classes == NUM_EDGE_CLASSES
+        assert config.feature_bins is None
+        assert config.num_edge_classes is None
         assert config.hdc_dim == 512
 
     def test_config_to_model(self, mock_edge_marginals, mock_node_counts):
         """Test creating model from config."""
         config = FlowEdgeDecoderConfig(
+            feature_bins=NODE_FEATURE_BINS,
+            num_edge_classes=NUM_EDGE_CLASSES,
             hdc_dim=64,
             n_layers=2,
             hidden_dim=32,
         )
 
         model = FlowEdgeDecoder(
-            num_node_classes=config.num_node_classes,
+            feature_bins=config.feature_bins,
             num_edge_classes=config.num_edge_classes,
             hdc_dim=config.hdc_dim,
             n_layers=config.n_layers,
@@ -1157,7 +1160,7 @@ class TestEndToEndDecoding:
         # Create FlowEdgeDecoder
         # Note: hdc_dim = 2 * hv_dim because preprocess concatenates order_0 and order_N
         model = FlowEdgeDecoder(
-            num_node_classes=NODE_FEATURE_DIM,
+            feature_bins=NODE_FEATURE_BINS,
             num_edge_classes=NUM_EDGE_CLASSES,
             hdc_dim=128,  # 2 * hv_dim (64)
             n_layers=2,
@@ -1193,7 +1196,7 @@ class TestEndToEndDecoding:
 
     def test_encode_decode_pipeline(self, hypernet_and_model, sample_molecule_data):
         """Test full encode -> decode pipeline produces valid output."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
         from defog.core import to_dense
 
         hypernet, model = hypernet_and_model
@@ -1248,7 +1251,7 @@ class TestEndToEndDecoding:
 
     def test_decoded_edges_are_symmetric(self, hypernet_and_model, sample_molecule_data):
         """Test that decoded edges form symmetric adjacency (undirected graph)."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
         from defog.core import to_dense
 
         hypernet, model = hypernet_and_model
@@ -1291,7 +1294,7 @@ class TestEndToEndDecoding:
 
     def test_preprocessing_creates_valid_hdc_vectors(self, hypernet_and_model, sample_molecule_data):
         """Test that preprocessing creates valid HDC vectors."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
 
         hypernet, model = hypernet_and_model
 
@@ -1317,7 +1320,7 @@ class TestEndToEndDecoding:
 
     def test_preprocessing_creates_valid_node_features(self, hypernet_and_model, sample_molecule_data):
         """Test that preprocessing creates valid 24-dim node features (concatenated one-hot)."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
 
         hypernet, model = hypernet_and_model
 
@@ -1339,7 +1342,7 @@ class TestEndToEndDecoding:
 
     def test_preprocessing_creates_valid_edge_features(self, hypernet_and_model, sample_molecule_data):
         """Test that preprocessing creates valid 5-class edge features."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
 
         hypernet, model = hypernet_and_model
 
@@ -1363,7 +1366,7 @@ class TestEndToEndDecoding:
 
     def test_training_on_real_data(self, hypernet_and_model, sample_molecule_data):
         """Test that training step works on real preprocessed data."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
 
         hypernet, model = hypernet_and_model
 
@@ -1386,7 +1389,7 @@ class TestEndToEndDecoding:
 
     def test_validation_on_real_data(self, hypernet_and_model, sample_molecule_data):
         """Test that validation step works on real preprocessed data."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
 
         hypernet, model = hypernet_and_model
 
@@ -1599,7 +1602,7 @@ class TestHDCGuidedSamplingWithHyperNet:
     def model_for_hdc(self, mock_edge_marginals, mock_node_counts):
         """Create FlowEdgeDecoder matching HyperNet dimensions."""
         return FlowEdgeDecoder(
-            num_node_classes=NODE_FEATURE_DIM,
+            feature_bins=NODE_FEATURE_BINS,
             num_edge_classes=NUM_EDGE_CLASSES,
             hdc_dim=512,  # 256 * 2 for [order_0 | order_N]
             n_layers=2,
@@ -1683,7 +1686,7 @@ class TestHDCGuidedSamplingWithHyperNet:
             order_n = output["graph_embedding"]
             hdc_vectors = torch.cat([order_zero, order_n], dim=-1)  # (1, 512)
 
-        node_features = raw_features_to_onehot(data.x).unsqueeze(0)  # (1, n, 24)
+        node_features = raw_features_to_onehot(data.x, feature_bins=NODE_FEATURE_BINS).unsqueeze(0)  # (1, n, 24)
         node_mask = torch.ones(bs, n, dtype=torch.bool)
         raw_node_features = data.x.unsqueeze(0)  # (1, n, 5)
 
@@ -1725,7 +1728,7 @@ class TestHDCGuidedSamplingWithHyperNet:
             order_n = output["graph_embedding"]
             hdc_vectors = torch.cat([order_zero, order_n], dim=-1)
 
-        node_features = raw_features_to_onehot(data.x).unsqueeze(0)
+        node_features = raw_features_to_onehot(data.x, feature_bins=NODE_FEATURE_BINS).unsqueeze(0)
         node_mask = torch.ones(bs, n, dtype=torch.bool)
         raw_node_features = data.x.unsqueeze(0)
 
@@ -1765,7 +1768,7 @@ class TestHDCGuidedSamplingWithHyperNet:
             order_n = output["graph_embedding"]
             hdc_vectors = torch.cat([order_zero, order_n], dim=-1)
 
-        node_features = raw_features_to_onehot(data.x).unsqueeze(0)
+        node_features = raw_features_to_onehot(data.x, feature_bins=NODE_FEATURE_BINS).unsqueeze(0)
         node_mask = torch.ones(bs, n, dtype=torch.bool)
         raw_node_features = data.x.unsqueeze(0)
 
@@ -1802,7 +1805,7 @@ class TestHDCGuidedSamplingWithHyperNet:
             order_n = output["graph_embedding"]
             hdc_vectors = torch.cat([order_zero, order_n], dim=-1)
 
-        node_features = raw_features_to_onehot(data.x).unsqueeze(0)
+        node_features = raw_features_to_onehot(data.x, feature_bins=NODE_FEATURE_BINS).unsqueeze(0)
         node_mask = torch.ones(bs, n, dtype=torch.bool)
         raw_node_features = data.x.unsqueeze(0)
 
@@ -1934,7 +1937,7 @@ class TestNodeHDCEmbedding:
     def small_model_node_hdc(self, mock_edge_marginals, mock_node_counts, mock_codebook):
         """Create a small FlowEdgeDecoder with per-node HDC embedding enabled."""
         return FlowEdgeDecoder(
-            num_node_classes=NODE_FEATURE_DIM,
+            feature_bins=NODE_FEATURE_BINS,
             num_edge_classes=NUM_EDGE_CLASSES,
             hdc_dim=64,
             n_layers=2,
@@ -2029,7 +2032,7 @@ class TestNodeHDCEmbedding:
         assert type(vsa_codebook) is not torch.Tensor  # sanity: it's a VSATensor
 
         model = FlowEdgeDecoder(
-            num_node_classes=NODE_FEATURE_DIM,
+            feature_bins=NODE_FEATURE_BINS,
             num_edge_classes=NUM_EDGE_CLASSES,
             hdc_dim=64,
             n_layers=2,

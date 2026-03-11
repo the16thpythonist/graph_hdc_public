@@ -261,29 +261,15 @@ def fast_combine_two_fragments(frag1: Chem.Mol, frag2: Chem.Mol) -> Optional[Che
     except Exception:
         return None
 
-# Import node feature constants from flow_edge_decoder
-from graph_hdc.models.flow_edge_decoder import (
+# Import node feature constants and bond type helpers from molecular domain
+from graph_hdc.domains.molecular.preprocessing import (
     NODE_FEATURE_DIM,
     NODE_FEATURE_BINS,
     ZINC_ATOM_TO_IDX,
+    BOND_TYPE_TO_IDX,
+    NUM_EDGE_CLASSES,
+    get_bond_type_idx,
 )
-
-# 5-class bond type mapping
-BOND_TYPE_TO_IDX = {
-    None: 0,  # No edge
-    Chem.BondType.SINGLE: 1,
-    Chem.BondType.DOUBLE: 2,
-    Chem.BondType.TRIPLE: 3,
-    Chem.BondType.AROMATIC: 4,
-}
-NUM_EDGE_CLASSES = 5
-
-
-def get_bond_type_idx(bond) -> int:
-    """Convert RDKit bond to 5-class index."""
-    if bond is None:
-        return 0
-    return BOND_TYPE_TO_IDX.get(bond.GetBondType(), 0)
 
 
 def mol_to_flow_data(mol: Chem.Mol) -> Optional[Data]:

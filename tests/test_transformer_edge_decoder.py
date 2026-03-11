@@ -13,13 +13,15 @@ from torch_geometric.data import Data, Batch
 from copy import deepcopy
 
 from graph_hdc.models.flow_edge_decoder import (
-    # Constants (reused)
+    EdgeOnlyLoss,
+    raw_features_to_onehot,
+)
+from graph_hdc.domains.molecular.preprocessing import (
     NODE_FEATURE_DIM,
+    NODE_FEATURE_BINS,
     NUM_EDGE_CLASSES,
     ZINC_ATOM_TYPES,
     BOND_TYPES,
-    EdgeOnlyLoss,
-    raw_features_to_onehot,
 )
 from graph_hdc.models.transformer_edge_decoder import (
     TransformerEdgeDecoder,
@@ -573,7 +575,7 @@ class TestEndToEnd:
 
     def test_encode_decode_pipeline(self, hypernet_and_model, sample_molecule_data):
         """Test full encode -> decode pipeline produces valid output."""
-        from graph_hdc.models.flow_edge_decoder import preprocess_dataset
+        from graph_hdc.domains.molecular.preprocessing import preprocess_dataset
         from graph_hdc.utils.helpers import scatter_hd
         from defog.core import to_dense
 
@@ -601,7 +603,7 @@ class TestEndToEnd:
                 hdc_vector = torch.cat([order_zero, order_n], dim=-1).float()
 
             # Convert to 24-dim concatenated one-hot node features
-            x_24dim = raw_features_to_onehot(data.x)
+            x_24dim = raw_features_to_onehot(data.x, feature_bins=NODE_FEATURE_BINS)
 
             # Convert edge attributes
             edge_attr = F.one_hot(
@@ -669,7 +671,7 @@ class TestEndToEnd:
                 hdc_vector = torch.cat([order_zero, order_n], dim=-1).float()
 
             # Convert to 24-dim concatenated one-hot node features
-            x_24dim = raw_features_to_onehot(data.x)
+            x_24dim = raw_features_to_onehot(data.x, feature_bins=NODE_FEATURE_BINS)
 
             edge_attr = torch.zeros(data.edge_index.size(1), NUM_EDGE_CLASSES)
             edge_attr[:, 1] = 1  # Assume single bonds

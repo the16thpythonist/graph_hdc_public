@@ -1,0 +1,49 @@
+{
+  "test_smiles": [
+    "CCO",
+    "c1ccccc1",
+    "INVALID_SMILES",
+    "CCO",
+    "CC(=O)O"
+  ],
+  "per_molecule": [
+    {
+      "smiles": "CCO",
+      "valid": true,
+      "logp": -0.0014000000000000123,
+      "qed": 0.40680796565539457,
+      "sa_score": 1.9802570386349831,
+      "canonical_key": "CCO"
+    },
+    {
+      "smiles": "c1ccccc1",
+      "valid": true,
+      "logp": 1.6866,
+      "qed": 0.4426283718993647,
+      "sa_score": 1.0,
+      "canonical_key": "c1ccccc1"
+    },
+    {
+      "smiles": "INVALID_SMILES",
+      "valid": false
+    },
+    {
+      "smiles": "CCO",
+      "valid": true,
+      "logp": -0.0014000000000000123,
+      "qed": 0.40680796565539457,
+      "sa_score": 1.9802570386349831,
+      "canonical_key": "CCO"
+    },
+    {
+      "smiles": "CC(=O)O",
+      "valid": true,
+      "logp": 0.09089999999999993,
+      "qed": 0.4298828832001217,
+      "sa_score": 1.5149307387756714,
+      "canonical_key": "CC(=O)O"
+    }
+  ],
+  "num_valid": 4,
+  "num_unique": 3
+}
