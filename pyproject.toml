@@ -28,6 +28,8 @@ dependencies = [
     "torchdiffeq",
     "psutil>=5.9.0",
     "nvidia-ml-py>=12.0.0",
+    "scipy>=1.11.0",
+    "cogiles @ git+https://github.com/the16thpythonist/cogiles",
 ]
 
 [project.optional-dependencies]

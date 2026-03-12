@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
 import networkx as nx
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -233,3 +234,63 @@ class GraphDataset(ABC):
     @property
     def is_finite(self) -> bool:
         return True
+
+
+# ---------------------------------------------------------------------------
+# MixedStreamDataset (generic, domain-agnostic)
+# ---------------------------------------------------------------------------
+
+
+class MixedStreamDataset(GraphDataset):
+    """Combines multiple streaming :class:`GraphDataset` instances with
+    weighted sampling.
+
+    On each iteration step, one of the source datasets is chosen at random
+    according to *weights*, and the next graph from that source is yielded.
+
+    All source datasets must share the same domain (i.e. the same
+    ``feature_bins``).  Non-streaming (finite) sources are supported but
+    will raise ``StopIteration`` when exhausted.
+
+    Parameters
+    ----------
+    datasets : list[GraphDataset]
+        Source datasets to mix.
+    weights : list[float] or None
+        Sampling weights (one per source).  Normalized internally.
+        ``None`` means equal weight for every source.
+    seed : int or None
+        Seed for the source-selection RNG.
+    """
+
+    def __init__(
+        self,
+        datasets: list[GraphDataset],
+        weights: list[float] | None = None,
+        seed: int | None = None,
+    ) -> None:
+        if not datasets:
+            raise ValueError("At least one dataset is required")
+        super().__init__(datasets[0].domain)
+        self.datasets = datasets
+        self._weights = weights
+        self.rng = np.random.default_rng(seed)
+
+    @property
+    def _normalized_weights(self) -> "np.ndarray":
+        if self._weights is None:
+            n = len(self.datasets)
+            return np.ones(n) / n
+        w = np.array(self._weights, dtype=float)
+        return w / w.sum()
+
+    def __iter__(self) -> Iterator[nx.Graph]:
+        iterators = [iter(ds) for ds in self.datasets]
+        probs = self._normalized_weights
+        while True:
+            idx = int(self.rng.choice(len(iterators), p=probs))
+            yield next(iterators[idx])
+
+    @property
+    def is_finite(self) -> bool:
+        return False

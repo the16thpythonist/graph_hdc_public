@@ -13,6 +13,7 @@ from graph_hdc.domains.base import (
     GraphDataset,
     GraphDomain,
     IntegerEncoder,
+    MixedStreamDataset,
     OneHotEncoder,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "GraphDataset",
     "GraphDomain",
     "IntegerEncoder",
+    "MixedStreamDataset",
     "OneHotEncoder",
 ]
