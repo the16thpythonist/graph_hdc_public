@@ -145,7 +145,7 @@ EPOCHS: int = 500
 
 # :param BATCH_SIZE:
 #     Batch size for training.
-BATCH_SIZE: int = 512
+BATCH_SIZE: int = 128
 
 # :param LEARNING_RATE:
 #     Learning rate for AdamW optimizer.
@@ -1592,6 +1592,12 @@ def experiment(e: Experiment) -> None:
     e.log(f"Final validation Cos Sim: {final_cos_sim:.4f}")
     e["results/final_val_mse"] = final_mse
     e["results/final_val_cos_sim"] = final_cos_sim
+
+    # Save final model
+    model_path = Path(e.path) / "autoencoder.ckpt"
+    model.save(model_path)
+    e.log(f"Saved autoencoder to: {model_path}")
+    e["results/model_path"] = str(model_path)
 
     e.log("\n" + "=" * 60)
     e.log("Experiment completed!")

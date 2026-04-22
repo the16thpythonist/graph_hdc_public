@@ -12,6 +12,7 @@ Loss:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List, Optional
 
 import pytorch_lightning as pl
@@ -421,3 +422,26 @@ class HDCAutoencoder(pl.LightningModule):
             lr_lambda=lambda epoch: min(1.0, (epoch + 1) / max(1, self.warmup_epochs)),
         )
         return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
+
+    # -----------------------------------------------------------------
+    # Serialization
+    # -----------------------------------------------------------------
+
+    def save(self, path) -> Path:
+        """Save model weights and hyperparameters to a checkpoint file."""
+        path = Path(path)
+        checkpoint = {
+            "state_dict": self.state_dict(),
+            "hyper_parameters": dict(self.hparams),
+        }
+        torch.save(checkpoint, path)
+        return path
+
+    @classmethod
+    def load(cls, path, map_location=None) -> "HDCAutoencoder":
+        """Load a model from a checkpoint saved with :meth:`save`."""
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        model = cls(**checkpoint["hyper_parameters"])
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        return model
