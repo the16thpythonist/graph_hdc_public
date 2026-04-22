@@ -36,12 +36,16 @@ VECTOR_PART: str = "node_terms"
 # Auxiliary cosine loss weight (0 = disabled).
 COSINE_LOSS_WEIGHT: float = 1.0
 
-# :param DEQUANT_SIGMA:
-#     Dequantization noise scale (std) applied to training targets in
-#     standardized space. Smooths the discrete lattice of HDC vectors
-#     into a continuous distribution. 0.0 disables dequantization.
-#     Suggested range: [0.01, 0.2]. Start with 0.05.
-DEQUANT_SIGMA: float = 0.2
+# :param TARGET_NOISE_SIGMA:
+#     Initial noise scale (std) applied to training targets in standardized
+#     space. Cosine-annealed to 0 over the first TARGET_NOISE_ANNEAL_FRAC
+#     of training. 0.0 disables target noise.
+TARGET_NOISE_SIGMA: float = 0.5
+
+# :param TARGET_NOISE_ANNEAL_FRAC:
+#     Fraction of total training steps over which target_noise_sigma is
+#     cosine-annealed from TARGET_NOISE_SIGMA to 0.
+TARGET_NOISE_ANNEAL_FRAC: float = 0.8
 
 # -----------------------------------------------------------------------------
 # System

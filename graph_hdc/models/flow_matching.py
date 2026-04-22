@@ -163,6 +163,57 @@ class FiLMResidualBlock(nn.Module):
 
 
 # =============================================================================
+# SwiGLU + FiLM Block (adaLN-Zero style)
+# =============================================================================
+
+
+class SwiGLUFiLMBlock(nn.Module):
+    """Pre-norm SwiGLU residual block with adaLN-Zero FiLM conditioning.
+
+    Applies a single FiLM modulation (scale, shift) after LayerNorm, followed
+    by a SwiGLU transformation and a gated residual connection::
+
+        h = LayerNorm(x)
+        h = h * (1 + scale) + shift
+        h = SiLU(W_gate(h)) * W_value(h)
+        h = W_out(h)
+        out = x + gate * h
+
+    The FiLM projection is zero-initialized so the block starts as identity.
+
+    Reference: Shazeer, "GLU Variants Improve Transformer" (2020) for SwiGLU;
+    Peebles & Xie, "Scalable Diffusion Models with Transformers" (2023) for
+    adaLN-Zero gated residual.
+    """
+
+    def __init__(self, hidden_dim: int, film_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.w_gate = nn.Linear(hidden_dim, hidden_dim)
+        self.w_value = nn.Linear(hidden_dim, hidden_dim)
+        self.w_out = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # FiLM: condition -> (scale, shift, residual_gate)
+        self.film_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(film_dim, 3 * hidden_dim),
+        )
+        nn.init.zeros_(self.film_proj[-1].weight)
+        nn.init.zeros_(self.film_proj[-1].bias)
+
+    def forward(self, x: Tensor, film_emb: Tensor) -> Tensor:
+        scale, shift, gate = self.film_proj(film_emb).chunk(3, dim=-1)
+
+        h = self.norm(x)
+        h = h * (1 + scale) + shift
+        h = F.silu(self.w_gate(h)) * self.w_value(h)
+        h = self.dropout(self.w_out(h))
+
+        return x + gate * h
+
+
+# =============================================================================
 # adaLN-Zero Transformer Block
 # =============================================================================
 
@@ -263,7 +314,16 @@ class VelocityMLP(nn.Module):
 
     Uses FiLM conditioning from time (+ optional condition) embeddings
     applied at each residual block.
+
+    When ``output_type="gmm"``, the output layer is replaced by a
+    :class:`~graph_hdc.models.gmm_utils.GMMOutputHead` that returns
+    a dict of Gaussian mixture parameters instead of a single velocity.
     """
+
+    BLOCK_TYPES = {
+        "film": FiLMResidualBlock,
+        "swiglu": SwiGLUFiLMBlock,
+    }
 
     def __init__(
         self,
@@ -273,11 +333,22 @@ class VelocityMLP(nn.Module):
         time_embed_dim: int = 128,
         condition_dim: int = 0,
         dropout: float = 0.0,
+        output_type: str = "velocity",
+        num_gaussians: int = 8,
+        block_type: str = "film",
     ):
         super().__init__()
         self.data_dim = data_dim
         self.hidden_dim = hidden_dim
         self.condition_dim = condition_dim
+        self.output_type = output_type
+
+        if block_type not in self.BLOCK_TYPES:
+            raise ValueError(
+                f"Unknown block_type '{block_type}'. "
+                f"Choose from: {list(self.BLOCK_TYPES.keys())}."
+            )
+        block_cls = self.BLOCK_TYPES[block_type]
 
         # Input projection
         self.input_proj = nn.Linear(data_dim, hidden_dim)
@@ -303,21 +374,26 @@ class VelocityMLP(nn.Module):
 
         # Residual FiLM blocks
         self.blocks = nn.ModuleList(
-            [FiLMResidualBlock(hidden_dim, film_dim, dropout) for _ in range(num_blocks)]
+            [block_cls(hidden_dim, film_dim, dropout) for _ in range(num_blocks)]
         )
 
-        # Output projection (zero-initialized)
+        # Output head
         self.output_norm = nn.LayerNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, data_dim)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        if output_type == "gmm":
+            from graph_hdc.models.gmm_utils import GMMOutputHead
+
+            self.gmm_head = GMMOutputHead(hidden_dim, data_dim, num_gaussians)
+        else:
+            self.output_proj = nn.Linear(hidden_dim, data_dim)
+            nn.init.zeros_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
 
     def forward(
         self,
         x_t: Tensor,
         t: Tensor,
         condition: Optional[Tensor] = None,
-    ) -> Tensor:
+    ) -> Union[Tensor, Dict[str, Tensor]]:
         """
         Predict velocity field at (x_t, t).
 
@@ -327,7 +403,8 @@ class VelocityMLP(nn.Module):
             condition: (batch_size, condition_dim) optional condition.
 
         Returns:
-            (batch_size, data_dim) predicted velocity.
+            (batch_size, data_dim) predicted velocity when output_type="velocity",
+            or dict with GMM parameters when output_type="gmm".
         """
         if t.dim() == 2:
             t = t.squeeze(-1)
@@ -342,6 +419,9 @@ class VelocityMLP(nn.Module):
             h = block(h, film_emb)
 
         h = self.output_norm(h)
+
+        if self.output_type == "gmm":
+            return self.gmm_head(h)
         return self.output_proj(h)
 
 
@@ -515,6 +595,11 @@ class VelocityModelWrapper(ModelWrapper):
     For x-prediction, converts the network's x_1 prediction to velocity
     using ``path.target_to_velocity()`` so the ODE solver receives a
     proper velocity field.
+
+    When the velocity network returns a GMM dict (``output_type="gmm"``),
+    the wrapper collapses the mixture to a single velocity vector via
+    :func:`~graph_hdc.models.gmm_utils.gm_to_mean` (deterministic) or
+    :func:`~graph_hdc.models.gmm_utils.gm_to_sample` (stochastic).
     """
 
     def __init__(
@@ -522,14 +607,26 @@ class VelocityModelWrapper(ModelWrapper):
         velocity_net: nn.Module,
         path: Optional["AffineProbPath"] = None,
         prediction_type: str = "velocity",
+        gmm_sample_mode: str = "mean",
     ):
         super().__init__(velocity_net)
         self.path = path
         self.prediction_type = prediction_type
+        self.gmm_sample_mode = gmm_sample_mode
 
     def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:
         condition = extras.get("condition", None)
         output = self.model(x_t=x, t=t, condition=condition)
+
+        # Collapse GMM dict to single velocity tensor
+        if isinstance(output, dict):
+            from graph_hdc.models.gmm_utils import gm_to_mean, gm_to_sample
+
+            if self.gmm_sample_mode == "sample":
+                output = gm_to_sample(output)
+            else:
+                output = gm_to_mean(output)
+
         if self.prediction_type == "x_prediction":
             # Clamp t away from 1 to avoid division by sigma_t = 1-t = 0
             # in target_to_velocity. This only affects the reverse ODE
@@ -884,6 +981,9 @@ class FlowMatchingModel(pl.LightningModule):
         warmup_epochs: Number of linear warmup epochs.
         velocity_arch: Velocity network architecture. ``"mlp"`` for FiLM residual
             MLP, ``"dit"`` for DiT-style Transformer with adaLN-Zero.
+        block_type: Block type for MLP architecture. ``"film"`` for classic
+            FiLM residual blocks, ``"swiglu"`` for SwiGLU + adaLN-Zero blocks.
+            Only used when ``velocity_arch="mlp"``.
         num_heads: Number of attention heads (DiT only). Must divide hidden_dim.
         num_tokens: Number of tokens to chunk the data vector into (DiT only).
         mlp_ratio: FFN hidden dimension as multiple of hidden_dim (DiT only).
@@ -908,13 +1008,18 @@ class FlowMatchingModel(pl.LightningModule):
         weight_decay: float = 1e-5,
         warmup_epochs: int = 5,
         velocity_arch: str = "mlp",
+        block_type: str = "film",
         num_heads: int = 8,
         num_tokens: int = 32,
         mlp_ratio: float = 4.0,
         vector_part: str = "both",
         cosine_loss_weight: float = 0.0,
-        dequant_sigma: float = 0.0,
+        target_noise_sigma: float = 0.0,
         cond_dropout_prob: float = 0.0,
+        num_gaussians: int = 8,
+        gmm_sample_mode: str = "mean",
+        trans_ratio: float = 0.5,
+        gm_entropy_weight: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -929,7 +1034,7 @@ class FlowMatchingModel(pl.LightningModule):
         self.default_sample_steps = default_sample_steps
         self.vector_part = vector_part
         self.cosine_loss_weight = cosine_loss_weight
-        self.dequant_sigma = dequant_sigma
+        self.target_noise_sigma = target_noise_sigma
         self.cond_dropout_prob = cond_dropout_prob
         self.lr = lr
         self.weight_decay = weight_decay
@@ -948,7 +1053,14 @@ class FlowMatchingModel(pl.LightningModule):
             velocity_condition_dim = 0
 
         # Velocity network (architecture selection)
+        output_type = "gmm" if loss_type == "gm_nll" else "velocity"
+
         if velocity_arch == "dit":
+            if output_type == "gmm":
+                raise ValueError(
+                    "GMM output (loss_type='gm_nll') is only supported "
+                    "with velocity_arch='mlp'."
+                )
             self.velocity_net = VelocityDiT(
                 data_dim=data_dim,
                 hidden_dim=hidden_dim,
@@ -968,6 +1080,9 @@ class FlowMatchingModel(pl.LightningModule):
                 time_embed_dim=time_embed_dim,
                 condition_dim=velocity_condition_dim,
                 dropout=dropout,
+                output_type=output_type,
+                num_gaussians=num_gaussians,
+                block_type=block_type,
             )
         else:
             raise ValueError(
@@ -981,13 +1096,16 @@ class FlowMatchingModel(pl.LightningModule):
         # Wrapper for the flow_matching library's ODESolver
         self.wrapper = VelocityModelWrapper(
             self.velocity_net, path=self.path, prediction_type=prediction_type,
+            gmm_sample_mode=gmm_sample_mode,
         )
 
         # OT coupler
         self.ot_coupler = MinibatchOTCoupler()
 
         # Loss criterion
-        if loss_type == "pseudo_huber":
+        if loss_type == "gm_nll":
+            self.criterion = None  # NLL computed inline via gm_nll_loss
+        elif loss_type == "pseudo_huber":
             self.criterion = PseudoHuberLoss(data_dim)
         else:
             self.criterion = nn.MSELoss()
@@ -1089,9 +1207,11 @@ class FlowMatchingModel(pl.LightningModule):
         """
         x1 = self.standardize(x1)
 
-        # Dequantization: smooth the discrete lattice during training
-        if self.training and self.dequant_sigma > 0:
-            x1 = x1 + torch.randn_like(x1) * self.dequant_sigma
+        # Target noise: smooth the discrete HDC target distribution with
+        # Gaussian noise. The sigma is managed externally by the
+        # TargetNoiseAnnealingCallback which decays it over training.
+        if self.training and self.target_noise_sigma > 0:
+            x1 = x1 + torch.randn_like(x1) * self.target_noise_sigma
 
         # Condition dropout: randomly zero out the entire condition vector
         # for a fraction of samples during training. Prevents memorization
@@ -1129,32 +1249,105 @@ class FlowMatchingModel(pl.LightningModule):
         else:
             t = torch.rand(bs, device=x1.device)
 
-        # Get path sample (x_t and target velocity dx_t)
-        path_sample = self.path.sample(x_0=x0, x_1=x1, t=t)
+        if self.loss_type == "gm_nll":
+            main_loss, gm_pred, x_t_net, t_net = self._compute_transition_loss(
+                x0, x1, t, condition,
+            )
 
-        # Predict velocity
-        v_pred = self.velocity_net(path_sample.x_t, t, condition)
+            # GMM weight entropy regularization: penalize mode collapse
+            weights = gm_pred["logweights"].softmax(dim=-1)
+            weight_entropy = -(weights * weights.clamp(min=1e-8).log()).sum(dim=-1).mean()
+            if self.hparams.gm_entropy_weight > 0:
+                main_loss = main_loss - self.hparams.gm_entropy_weight * weight_entropy
 
-        # Main loss
-        if self.prediction_type == "x_prediction":
-            main_loss = self.criterion(v_pred, path_sample.x_1)
+            # Log GMM diagnostics
+            if self.training:
+                with torch.no_grad():
+                    self._gm_logstd = gm_pred["logstds"].mean().item()
+                    self._gm_weight_entropy = weight_entropy.item()
+
+            # For cosine loss, collapse GMM to single velocity
+            from graph_hdc.models.gmm_utils import gm_to_mean
+
+            v_pred_flat = gm_to_mean(gm_pred)
         else:
-            main_loss = self.criterion(v_pred, path_sample.dx_t)
+            # Standard single-step flow matching (MSE / PseudoHuber)
+            path_sample = self.path.sample(x_0=x0, x_1=x1, t=t)
+            v_pred = self.velocity_net(path_sample.x_t, t, condition)
+
+            if self.prediction_type == "x_prediction":
+                target = path_sample.x_1
+            else:
+                target = path_sample.dx_t
+
+            main_loss = self.criterion(v_pred, target)
+            v_pred_flat = v_pred
+            x_t_net = path_sample.x_t
+            t_net = t
 
         # Auxiliary cosine similarity loss
         if self.cosine_loss_weight > 0.0:
             if self.prediction_type == "x_prediction":
-                x1_hat = v_pred  # network directly predicts x_1
+                x1_hat = v_pred_flat  # network directly predicts x_1
             else:
                 # Exact reconstruction for CondOT: x_1 = x_t + (1-t) * v
-                x1_hat = path_sample.x_t + (1.0 - t.unsqueeze(-1)) * v_pred
-            cos_sim = F.cosine_similarity(x1_hat, path_sample.x_1, dim=-1)
+                x1_hat = x_t_net + (1.0 - t_net.unsqueeze(-1)) * v_pred_flat
+            cos_sim = F.cosine_similarity(x1_hat, x1, dim=-1)
             cosine_loss = (1.0 - cos_sim).mean()
             if self.training:
                 self._cosine_loss = cosine_loss.detach().item()
             main_loss = main_loss + self.cosine_loss_weight * cosine_loss
 
         return main_loss
+
+    def _compute_transition_loss(
+        self,
+        x0: Tensor,
+        x1: Tensor,
+        t_noisy: Tensor,
+        condition: Optional[Tensor],
+    ) -> tuple[Tensor, dict, Tensor, Tensor]:
+        """GMFlow transition loss: two-timestep supervision.
+
+        Returns (loss, gm_pred, x_t_noisy, t_noisy) where gm_pred is the
+        raw network output (for diagnostics and cosine loss).
+        """
+        from graph_hdc.models.gmm_utils import gm_nll_loss, gmm_reverse_transition
+
+        eps = 1e-5
+
+        # Compute clean timestep (closer to data, higher t)
+        t_clean = t_noisy + self.hparams.trans_ratio * (1.0 - t_noisy)
+        t_clean = t_clean.clamp(max=1.0 - eps)
+        t_noisy = t_noisy.clamp(min=eps)
+
+        # Construct x_t_clean via the CondOT path
+        t_clean_exp = t_clean.unsqueeze(-1)  # (bs, 1)
+        t_noisy_exp = t_noisy.unsqueeze(-1)
+        x_t_clean = t_clean_exp * x1 + (1.0 - t_clean_exp) * x0
+
+        # Forward transition: x_t_clean → x_t_noisy (add noise)
+        alpha_trans = t_noisy_exp / t_clean_exp.clamp(min=eps)
+        sigma_clean = 1.0 - t_clean_exp
+        sigma_noisy = 1.0 - t_noisy_exp
+        sigma_trans_sq = sigma_noisy ** 2 - (alpha_trans * sigma_clean) ** 2
+        sigma_trans = sigma_trans_sq.clamp(min=0).sqrt()
+
+        fresh_noise = torch.randn_like(x_t_clean)
+        x_t_noisy = alpha_trans * x_t_clean + sigma_trans * fresh_noise
+
+        # Network predicts GMM at noisy level
+        gm_pred = self.velocity_net(x_t_noisy, t_noisy, condition)
+
+        # Reverse transition: GMM at t_noisy → GMM at t_clean
+        gm_reversed = gmm_reverse_transition(
+            gm_pred, x_t_noisy, t_noisy, t_clean, self.prediction_type,
+        )
+
+        # NLL against ground truth x_t_clean
+        loss = gm_nll_loss(gm_reversed, x_t_clean).mean()
+
+        return loss, gm_pred, x_t_noisy, t_noisy
 
     def training_step(self, batch, batch_idx) -> Tensor:
         x1 = self._extract_vectors(batch)
@@ -1168,6 +1361,15 @@ class FlowMatchingModel(pl.LightningModule):
             self.log(
                 "train/cosine_loss", self._cosine_loss, prog_bar=False,
                 batch_size=x1.shape[0], on_step=True, on_epoch=True,
+            )
+        if self.loss_type == "gm_nll" and hasattr(self, "_gm_logstd"):
+            self.log(
+                "train/gm_logstd", self._gm_logstd, prog_bar=False,
+                batch_size=x1.shape[0], on_epoch=True,
+            )
+            self.log(
+                "train/gm_weight_entropy", self._gm_weight_entropy, prog_bar=False,
+                batch_size=x1.shape[0], on_epoch=True,
             )
         return loss
 

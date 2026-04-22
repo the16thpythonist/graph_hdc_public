@@ -10,6 +10,7 @@ message passing may miss.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch_geometric.data import Data
@@ -609,12 +610,21 @@ def compute_rw_return_probabilities(
     isolated = ~nonzero
     T[isolated, isolated] = 1.0
 
-    # Compute T^k for each k and extract diagonal
-    results = []
-    for k in k_values:
-        Tk = torch.linalg.matrix_power(T, k)
-        results.append(torch.diag(Tk))
+    # Compute T^k iteratively: T, T², T³, ..., T^max(k_values)
+    # and grab diagonals at the requested k values.
+    # This is O(k_max * n²) instead of O(len(k_values) * n³).
+    k_set = set(k_values)
+    max_k = max(k_values)
+    results_map: dict[int, Tensor] = {}
 
+    Tk = T.clone()
+    for step in range(1, max_k + 1):
+        if step > 1:
+            Tk = Tk @ T
+        if step in k_set:
+            results_map[step] = torch.diag(Tk)
+
+    results = [results_map[k] for k in k_values]
     return torch.stack(results, dim=-1).float().cpu()
 
 
@@ -734,4 +744,133 @@ def augment_data_with_rw(
         clip_range=clip_range,
     )
     data.x = torch.cat([data.x, rw_binned.to(data.x.device)], dim=-1)
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Pure-numpy variants for CPU worker processes.
+#
+# Avoids PyTorch BLAS thread contention when multiple workers run in
+# parallel.  For the small dense matrices involved (≤70 × 70), numpy
+# with a single-threaded BLAS is faster than torch with thread-pool
+# overhead.
+# ---------------------------------------------------------------------------
+
+
+def compute_rw_return_probabilities_np(
+    edge_index_np: np.ndarray,
+    num_nodes: int,
+    k_values: tuple[int, ...] = (3, 6),
+) -> np.ndarray:
+    """Pure-numpy version of :func:`compute_rw_return_probabilities`.
+
+    Parameters
+    ----------
+    edge_index_np : ndarray of shape ``[2, E]``
+        Source / destination node indices (int).
+    num_nodes : int
+        Number of nodes in the graph.
+    k_values : tuple of int
+        Steps at which to extract return probabilities.
+
+    Returns
+    -------
+    ndarray of shape ``[num_nodes, len(k_values)]``, float32.
+    """
+    import numpy as np  # ensure available in worker scope
+
+    A = np.zeros((num_nodes, num_nodes), dtype=np.float64)
+    row, col = edge_index_np[0], edge_index_np[1]
+    A[row, col] = 1.0
+    A = np.clip(A + A.T, 0.0, 1.0)
+
+    deg = A.sum(axis=1)
+    inv_deg = np.zeros_like(deg)
+    nonzero = deg > 0
+    inv_deg[nonzero] = 1.0 / deg[nonzero]
+
+    T = A * inv_deg[:, None]
+    isolated = ~nonzero
+    T[isolated, isolated] = 1.0
+
+    k_set = set(k_values)
+    max_k = max(k_values)
+    results_map: dict[int, np.ndarray] = {}
+
+    Tk = T.copy()
+    for step in range(1, max_k + 1):
+        if step > 1:
+            Tk = Tk @ T
+        if step in k_set:
+            results_map[step] = np.diag(Tk)
+
+    results = np.stack([results_map[k] for k in k_values], axis=-1)
+    return results.astype(np.float32)
+
+
+def bin_rw_probabilities_np(
+    rw_probs: np.ndarray,
+    num_bins: int = 10,
+    bin_boundaries: dict[int, list[float]] | None = None,
+    k_values: tuple[int, ...] | None = None,
+    clip_range: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Pure-numpy version of :func:`bin_rw_probabilities`.
+
+    Returns int-valued float32 array of shape ``[N, F]``.
+    """
+    import numpy as np
+
+    if bin_boundaries is not None:
+        if k_values is None:
+            raise ValueError("k_values is required when bin_boundaries is provided")
+        result = np.empty_like(rw_probs)
+        for col_idx, k in enumerate(k_values):
+            boundaries = bin_boundaries.get(k)
+            if boundaries is None:
+                result[:, col_idx] = np.clip(
+                    (rw_probs[:, col_idx] * num_bins).astype(np.int64),
+                    0, num_bins - 1,
+                )
+            else:
+                result[:, col_idx] = np.clip(
+                    np.searchsorted(boundaries, rw_probs[:, col_idx], side="right"),
+                    0, num_bins - 1,
+                )
+        return result.astype(np.float32)
+
+    if clip_range is not None:
+        lo, hi = clip_range
+        scaled = (rw_probs - lo) / (hi - lo)
+        return np.clip((scaled * num_bins).astype(np.int64), 0, num_bins - 1).astype(np.float32)
+
+    return np.clip((rw_probs * num_bins).astype(np.int64), 0, num_bins - 1).astype(np.float32)
+
+
+def augment_data_with_rw_np(
+    data: Data,
+    k_values: tuple[int, ...] = (3, 6),
+    num_bins: int = 10,
+    bin_boundaries: dict[int, list[float]] | None = None,
+    clip_range: tuple[float, float] | None = None,
+) -> Data:
+    """Augment a PyG Data object using pure-numpy RW computation.
+
+    Drop-in replacement for :func:`augment_data_with_rw` that avoids
+    PyTorch BLAS overhead.  Intended for CPU worker processes.
+    """
+    import numpy as np
+
+    edge_index_np = data.edge_index.numpy()
+    num_nodes = data.x.size(0)
+
+    rw_probs = compute_rw_return_probabilities_np(edge_index_np, num_nodes, k_values)
+    rw_binned = bin_rw_probabilities_np(
+        rw_probs, num_bins,
+        bin_boundaries=bin_boundaries,
+        k_values=k_values,
+        clip_range=clip_range,
+    )
+    rw_tensor = torch.from_numpy(rw_binned)
+    data.x = torch.cat([data.x, rw_tensor], dim=-1)
     return data

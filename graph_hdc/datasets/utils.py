@@ -30,9 +30,59 @@ if TYPE_CHECKING:
     from graph_hdc.hypernet.configs import RWConfig
 
 
+def _strip_stereochemistry(data: Data) -> Data:
+    """Remove stereochemistry from a Data object and rebuild features.
+
+    Parses the SMILES, calls ``Chem.RemoveStereochemistry``, then
+    regenerates the canonical SMILES and node features so the rest of
+    the pipeline never sees ``@``/``@@`` or ``/``/``\\`` notation.
+    """
+    mol = Chem.MolFromSmiles(data.smiles)
+    if mol is None:
+        return data
+
+    Chem.RemoveStereochemistry(mol)
+    clean_smiles = Chem.MolToSmiles(mol, canonical=True)
+
+    # Rebuild mol from clean SMILES for consistent kekulisation
+    mol = Chem.MolFromSmiles(clean_smiles)
+    if mol is None:
+        return data
+
+    # Rebuild node features in ZINC format:
+    # [atom_type, degree-1, formal_charge_idx, total_Hs, is_in_ring]
+    from graph_hdc.datasets.zinc_smiles import ZINC_ATOM_TO_IDX
+
+    x = []
+    for atom in mol.GetAtoms():
+        sym = atom.GetSymbol()
+        if sym not in ZINC_ATOM_TO_IDX:
+            return data  # unsupported atom — return unchanged
+        x.append([
+            float(ZINC_ATOM_TO_IDX[sym]),
+            float(max(0, atom.GetDegree() - 1)),
+            float(atom.GetFormalCharge() if atom.GetFormalCharge() >= 0 else 2),
+            float(atom.GetTotalNumHs()),
+            float(atom.IsInRing()),
+        ])
+
+    src, dst = [], []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        src += [i, j]
+        dst += [j, i]
+
+    data = data.clone()
+    data.smiles = clean_smiles
+    data.x = torch.tensor(x, dtype=torch.float32)
+    data.edge_index = torch.tensor([src, dst], dtype=torch.long) if src else torch.zeros(2, 0, dtype=torch.long)
+    return data
+
+
 def get_split(
     split: Literal["train", "valid", "test"],
     dataset: Literal["qm9", "zinc", "pubchem16", "pubchem32", "pubchem64"] = "qm9",
+    strip_stereo: bool = True,
 ) -> InMemoryDataset:
     """
     Load a dataset split.
@@ -45,6 +95,9 @@ def get_split(
         One of {"train", "valid", "test"}
     dataset : str
         One of {"qm9", "zinc", "pubchem16", "pubchem32", "pubchem64"}
+    strip_stereo : bool
+        If True (default), remove stereochemistry (chiral centers and E/Z
+        bond geometry) from every molecule before returning.
 
     Returns
     -------
@@ -52,16 +105,22 @@ def get_split(
         The loaded dataset
     """
     if dataset == "qm9":
-        return QM9Smiles(split=split)
+        ds = QM9Smiles(split=split)
     elif dataset == "zinc":
-        return ZincSmiles(split=split)
+        ds = ZincSmiles(split=split)
     elif dataset in ("pubchem16", "pubchem32", "pubchem64"):
-        return PubChemSmiles(variant=dataset, split=split)
+        ds = PubChemSmiles(variant=dataset, split=split)
     else:
         raise ValueError(
             f"Unknown dataset: {dataset}. "
             f"Use 'qm9', 'zinc', 'pubchem16', 'pubchem32', or 'pubchem64'."
         )
+
+    if strip_stereo:
+        ds._data_list = [_strip_stereochemistry(d) for d in ds]
+        ds.data, ds.slices = ds.collate(ds._data_list)
+
+    return ds
 
 
 @dataclass
@@ -261,9 +320,9 @@ def post_compute_encodings(
 
         for i, d in enumerate(per_graph):
             d = d.clone()
-            d.node_terms = node_terms[i]
-            d.edge_terms = edge_terms[i]
-            d.graph_terms = graph_terms[i]
+            d.node_terms = node_terms[i].clone()
+            d.edge_terms = edge_terms[i].clone()
+            d.graph_terms = graph_terms[i].clone()
             augmented.append(d)
 
     return augmented

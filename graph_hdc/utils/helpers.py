@@ -226,6 +226,21 @@ class TupleIndexer:
     def size(self) -> int:
         return len(self.idx_to_tuple)
 
+    def extend(self, new_tuples: Sequence[tuple[int, ...]]) -> int:
+        """Append new tuples that are not already present.
+
+        Existing indices are not changed. Returns the number of newly
+        added tuples.
+        """
+        n_added = 0
+        for tup in new_tuples:
+            if tup not in self.tuple_to_idx:
+                idx = len(self.idx_to_tuple)
+                self.idx_to_tuple.append(tup)
+                self.tuple_to_idx[tup] = idx
+                n_added += 1
+        return n_added
+
     def get_sizes(self) -> Sequence[int]:
         return self.sizes
 

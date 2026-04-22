@@ -116,6 +116,12 @@ DROPOUT: float = 0.0
 #     "dit" (DiT-style Transformer with adaLN-Zero conditioning).
 VELOCITY_ARCH: str = "mlp"
 
+# :param BLOCK_TYPE:
+#     Block type for MLP architecture. Options: "film" (classic FiLM residual
+#     blocks), "swiglu" (SwiGLU + adaLN-Zero blocks). Only used when
+#     VELOCITY_ARCH="mlp".
+BLOCK_TYPE: str = "swiglu"
+
 # :param NUM_HEADS:
 #     Number of attention heads (DiT only). Must divide HIDDEN_DIM evenly.
 NUM_HEADS: int = 8
@@ -143,12 +149,18 @@ VECTOR_PART: str = "both"
 #     which matters for HDC decoding via circular correlation.
 COSINE_LOSS_WEIGHT: float = 0.0
 
-# :param DEQUANT_SIGMA:
-#     Dequantization noise scale (std) applied to training targets in
-#     standardized space. Smooths the discrete lattice of HDC vectors
-#     into a continuous distribution. 0.0 disables dequantization.
-#     Suggested range: [0.01, 0.2]. Start with 0.05.
-DEQUANT_SIGMA: float = 0.05
+# :param TARGET_NOISE_SIGMA:
+#     Initial noise scale (std) applied to training targets in standardized
+#     space. Smooths the discrete delta-peak HDC distribution into a mixture
+#     of Gaussians. Cosine-annealed to 0 over the first TARGET_NOISE_ANNEAL_FRAC
+#     of training via TargetNoiseAnnealingCallback. 0.0 disables target noise.
+TARGET_NOISE_SIGMA: float = 0.5
+
+# :param TARGET_NOISE_ANNEAL_FRAC:
+#     Fraction of total training steps over which target_noise_sigma is
+#     cosine-annealed from TARGET_NOISE_SIGMA to 0. The remaining training
+#     operates on the exact target distribution.
+TARGET_NOISE_ANNEAL_FRAC: float = 0.8
 
 # :param COND_DROPOUT_PROB:
 #     Probability of zeroing out the entire condition vector per sample
@@ -198,8 +210,36 @@ ENCODER_BATCH_SIZE: int = 256
 GRADIENT_CLIP_VAL: float = 1.0
 
 # :param LOSS_TYPE:
-#     Loss function for velocity matching. Options: "mse", "pseudo_huber".
+#     Loss function for velocity matching. Options: "mse", "pseudo_huber",
+#     "gm_nll" (Gaussian mixture NLL from GMFlow — predicts K mixture
+#     components instead of a single velocity, trained with NLL loss).
 LOSS_TYPE: str = "mse"
+
+# :param NUM_GAUSSIANS:
+#     Number of Gaussian mixture components for GMFlow-style NLL loss.
+#     Only used when LOSS_TYPE="gm_nll". Higher K captures more velocity
+#     modes but increases memory (K * data_dim output dims).
+NUM_GAUSSIANS: int = 8
+
+# :param GMM_SAMPLE_MODE:
+#     How to collapse GMM to a single velocity during ODE sampling.
+#     "mean": deterministic weighted average of component means.
+#     "sample": stochastic sample from the mixture (more diverse).
+#     Only used when LOSS_TYPE="gm_nll".
+GMM_SAMPLE_MODE: str = "mean"
+
+# :param TRANS_RATIO:
+#     Transition ratio for GMFlow transition loss. Controls the gap
+#     between the two timesteps: t_clean = t_noisy + trans_ratio * (1 - t_noisy).
+#     Higher values = larger gap = smoother targets. Only used with gm_nll.
+TRANS_RATIO: float = 0.5
+
+# :param GM_ENTROPY_WEIGHT:
+#     Weight for GMM weight entropy regularization. Penalizes mode
+#     collapse by encouraging all K components to maintain non-zero
+#     weights. The entropy term is subtracted from the loss (maximizing
+#     entropy). 0.0 disables. Only used with gm_nll.
+GM_ENTROPY_WEIGHT: float = 0.1
 
 # :param TIME_SAMPLING:
 #     Timestep sampling distribution. Options: "uniform", "logit_normal".
@@ -251,6 +291,16 @@ NLL_EVAL_STEPS: int = 2_000
 # :param NLL_EVAL_SAMPLES:
 #     Number of validation samples to evaluate NLL on.
 NLL_EVAL_SAMPLES: int = 1000
+
+# :param GEN_EVAL_EVERY_N_EPOCHS:
+#     How often (in epochs) to sample molecules, decode them, and track
+#     generation quality (validity, uniqueness, novelty, NUV) plus a 5x5
+#     molecule grid. 0 disables this callback.
+GEN_EVAL_EVERY_N_EPOCHS: int = 10
+
+# :param GEN_EVAL_N_SAMPLES:
+#     Number of molecules to sample and decode for generation tracking.
+GEN_EVAL_N_SAMPLES: int = 100
 
 # -----------------------------------------------------------------------------
 # System
@@ -401,20 +451,269 @@ def _fit_pca_and_diagnose(
 
 
 # =============================================================================
+# TARGET NOISE ANNEALING CALLBACK
+# =============================================================================
+
+
+class TargetNoiseAnnealingCallback(pl.Callback):
+    """Cosine-anneal ``target_noise_sigma`` on the FlowMatchingModel.
+
+    The sigma decays from ``sigma_max`` to 0 over the first
+    ``anneal_fraction`` of total training steps, then stays at 0.
+
+    Schedule:  sigma(p) = sigma_max * 0.5 * (1 + cos(pi * p / f))
+    where p = global_step / total_steps and f = anneal_fraction.
+
+    Args:
+        sigma_max: Initial target noise standard deviation.
+        anneal_fraction: Fraction of total training at which sigma reaches 0.
+    """
+
+    def __init__(self, sigma_max: float = 0.5, anneal_fraction: float = 0.8):
+        super().__init__()
+        self.sigma_max = sigma_max
+        self.anneal_fraction = anneal_fraction
+
+    def _compute_sigma(self, trainer) -> float:
+        total_steps = trainer.estimated_stepping_batches
+        if total_steps <= 0:
+            return self.sigma_max
+
+        progress = trainer.global_step / total_steps
+        if progress >= self.anneal_fraction:
+            return 0.0
+
+        phase = math.pi * progress / self.anneal_fraction
+        return self.sigma_max * 0.5 * (1.0 + math.cos(phase))
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        pl_module.target_noise_sigma = self._compute_sigma(trainer)
+
+
+# =============================================================================
+# GENERATION TRACKING CALLBACK
+# =============================================================================
+
+
+class GenerationTrackingCallback(pl.Callback):
+    """Sample molecules, decode, and track generation quality during training.
+
+    Every ``every_n_epochs`` epochs this callback:
+    1. Samples ``n_samples`` vectors from the flow model.
+    2. Splits them into edge_terms / graph_terms (or node_terms / graph_terms).
+    3. Decodes each with greedy beam search via the HyperNet.
+    4. Computes validity, uniqueness, novelty, NUV via GenerationEvaluator.
+    5. Renders the first 25 samples as a 5x5 RDKit molecule grid.
+    6. Tracks all metrics and the figure via ``experiment.track()``.
+
+    Args:
+        experiment: PyComex Experiment instance for ``track()``.
+        hypernet: HyperNet encoder/decoder (must have ``decode_graph_greedy``).
+        dataset: Base dataset name (``"zinc"`` or ``"qm9"``).
+        vector_part: Which vector part the model was trained on.
+            ``"both"`` means ``[edge_terms | graph_terms]``.
+        every_n_epochs: Evaluation frequency.
+        n_samples: Number of molecules to sample per evaluation.
+    """
+
+    def __init__(
+        self,
+        experiment: "Experiment",
+        hypernet: "HyperNet",
+        dataset: str = "zinc",
+        vector_part: str = "both",
+        every_n_epochs: int = 10,
+        n_samples: int = 100,
+    ):
+        super().__init__()
+        self.experiment = experiment
+        self.hypernet = hypernet
+        self.dataset = dataset
+        self.vector_part = vector_part
+        self.every_n_epochs = every_n_epochs
+        self.n_samples = n_samples
+        self.hv_dim = hypernet.hv_dim
+
+        # Lazy-init evaluator on first use (loads training set for novelty)
+        self._evaluator: "GenerationEvaluator | None" = None
+
+    def _get_evaluator(self):
+        if self._evaluator is None:
+            from graph_hdc.utils.evaluator import GenerationEvaluator
+            self._evaluator = GenerationEvaluator(base_dataset=self.dataset)
+        return self._evaluator
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+
+        epoch = trainer.current_epoch
+        if epoch % self.every_n_epochs != 0:
+            return
+
+        import time
+        import networkx as nx
+        from graph_hdc.hypernet.configs import FallbackDecoderSettings
+        from graph_hdc.hypernet.encoder import CorrectionLevel
+        from graph_hdc.utils.chem import reconstruct_for_eval
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, Draw
+
+        self.experiment.log(f"[GenEval] Epoch {epoch}: sampling {self.n_samples} molecules...")
+        t_start = time.time()
+
+        # ── Sample from the flow model ──
+        device = next(pl_module.parameters()).device
+        pl_module.eval()
+        with torch.no_grad():
+            samples = pl_module.sample(self.n_samples, device=device).cpu()
+
+        # ── Split into edge/node terms + graph terms ──
+        decode_device = self.hypernet.nodes_codebook.device
+        vsa_cls = self.hypernet.vsa.tensor_class
+
+        if self.vector_part == "both":
+            # Model produces [node_terms | graph_terms] but for __edge_graph
+            # the node_terms slot contains edge_terms.  Either way, the first
+            # half is what the decoder needs as edge_term.
+            edge_terms = samples[:, :self.hv_dim].to(decode_device).as_subclass(vsa_cls)
+            graph_terms = samples[:, self.hv_dim:].to(decode_device).as_subclass(vsa_cls)
+        elif self.vector_part == "graph_terms":
+            # Graph-only model — no edge terms to decode with
+            self.experiment.log("[GenEval] Skipped: vector_part='graph_terms' cannot decode standalone")
+            return
+        elif self.vector_part == "node_terms":
+            self.experiment.log("[GenEval] Skipped: vector_part='node_terms' cannot decode standalone")
+            return
+        else:
+            return
+
+        # ── Decode molecules ──
+        decoder_settings = FallbackDecoderSettings(
+            beam_size=8,
+            limit=1024,
+            top_k=1,
+        )
+
+        nx_graphs: list[nx.Graph] = []
+        final_flags: list[bool] = []
+        sims: list[float] = []
+        correction_levels: list[CorrectionLevel] = []
+        mols: list["Chem.Mol | None"] = []
+
+        for i in range(self.n_samples):
+            try:
+                result = self.hypernet.decode_graph_greedy(
+                    edge_term=edge_terms[i],
+                    graph_term=graph_terms[i],
+                    decoder_settings=decoder_settings,
+                )
+                if result.nx_graphs:
+                    g = result.nx_graphs[0]
+                    nx_graphs.append(g)
+                    final_flags.append(True)
+                    sims.append(result.cos_similarities[0] if result.cos_similarities else 0.0)
+                    correction_levels.append(result.correction_level)
+                    try:
+                        mols.append(reconstruct_for_eval(g, dataset=self.dataset))
+                    except Exception:
+                        mols.append(None)
+                else:
+                    nx_graphs.append(nx.Graph())
+                    final_flags.append(False)
+                    sims.append(0.0)
+                    correction_levels.append(result.correction_level)
+                    mols.append(None)
+            except Exception:
+                nx_graphs.append(nx.Graph())
+                final_flags.append(False)
+                sims.append(0.0)
+                correction_levels.append(CorrectionLevel.FAIL)
+                mols.append(None)
+
+        decode_time = time.time() - t_start
+
+        # ── Evaluate metrics ──
+        evaluator = self._get_evaluator()
+        metrics = evaluator.evaluate(
+            n_samples=self.n_samples,
+            samples=nx_graphs,
+            final_flags=final_flags,
+            sims=sims,
+            correction_levels=correction_levels,
+        )
+
+        validity = metrics["validity"]
+        uniqueness = metrics["uniqueness"]
+        novelty = metrics["novelty"]
+        nuv = metrics["nuv"]
+
+        self.experiment.track("gen_validity", validity)
+        self.experiment.track("gen_uniqueness", uniqueness)
+        self.experiment.track("gen_novelty", novelty)
+        self.experiment.track("gen_nuv", nuv)
+
+        self.experiment.log(
+            f"[GenEval] Epoch {epoch}: validity={validity:.1f}%, "
+            f"uniqueness={uniqueness:.1f}%, novelty={novelty:.1f}%, "
+            f"nuv={nuv:.1f}% ({decode_time:.1f}s)"
+        )
+
+        # ── Molecule grid (5x5, first 25 samples) ──
+        grid_mols = mols[:25]
+        img_size = (250, 250)
+        fig, axes = plt.subplots(5, 5, figsize=(15, 15))
+        fig.suptitle(
+            f"Epoch {epoch} — Validity: {validity:.1f}%, NUV: {nuv:.1f}%",
+            fontsize=14, fontweight="bold",
+        )
+
+        for idx, ax in enumerate(axes.flat):
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if idx < len(grid_mols):
+                mol = grid_mols[idx]
+                if mol is not None:
+                    try:
+                        if mol.GetNumConformers() == 0:
+                            AllChem.Compute2DCoords(mol)
+                        img = Draw.MolToImage(mol, size=img_size)
+                        ax.imshow(img)
+                        smiles = Chem.MolToSmiles(mol, canonical=True)
+                        ax.set_title(smiles[:30], fontsize=7, color="green")
+                    except Exception:
+                        ax.text(0.5, 0.5, "Draw\nfailed", ha="center", va="center",
+                                fontsize=10, color="orange", transform=ax.transAxes)
+                        ax.set_facecolor("#fff3e0")
+                else:
+                    # Invalid molecule — red X
+                    ax.plot([0, 1], [0, 1], "r-", lw=3, transform=ax.transAxes)
+                    ax.plot([0, 1], [1, 0], "r-", lw=3, transform=ax.transAxes)
+                    ax.set_title("invalid", fontsize=7, color="red")
+                    ax.set_facecolor("#ffebee")
+            else:
+                ax.set_visible(False)
+
+        plt.tight_layout()
+        self.experiment.track("gen_molecule_grid", fig)
+        plt.close(fig)
+
+
+# =============================================================================
 # TRAINING TRACKER CALLBACK
 # =============================================================================
 
 
 class TrainingTrackerCallback(pl.Callback):
     """
-    Tracks training progress and produces a 5x4 panel visualization.
+    Tracks training progress and produces a 5x5 panel visualization.
 
     Layout:
-        Row 1: Train+Val Overlay | Train Loss (log) | OT Cost Ratio | Learning Rate
-        Row 2: Sample Mean MAE | Sample Std MAE | Per-Dim Mean R² | Per-Dim Std R²
-        Row 3: Recon MSE | Recon Cos Sim | Per-Dim Mean Scatter | Velocity Norm
-        Row 4: Sample L2 Norm | Inter-Sample Cos Sim | Centroid Cos Sim | Grad Norm
-        Row 5: Dequant Sigma | GPU Utilization | GPU Memory | Train/Val Loss Ratio
+        Row 1: Train+Val Overlay | Train Loss (log) | OT Cost Ratio | Learning Rate | GM Weight Entropy
+        Row 2: Sample Mean MAE | Sample Std MAE | Per-Dim Mean R² | Per-Dim Std R² | GM Effective K
+        Row 3: Recon MSE | Recon Cos Sim | Per-Dim Mean Scatter | Velocity Norm | GM Log-Std
+        Row 4: Sample L2 Norm | Inter-Sample Cos Sim | Centroid Cos Sim | Grad Norm | Epoch Duration
+        Row 5: Target Noise σ | GPU Utilization | GPU Memory | Train/Val Loss Ratio | Cosine Loss
 
     Uses PyComex ``experiment.track()`` for time-series metrics and figure
     tracking, following the same pattern as ``TrainingMetricsCallback``.
@@ -442,7 +741,7 @@ class TrainingTrackerCallback(pl.Callback):
         eval_every_n_epochs: int = 5,
         num_eval_samples: int = 500,
         num_eval_sample_steps: int = 1000,
-        num_recon_steps: int = 50,
+        num_recon_steps: int = 1000,
         smoothing_window: int = 5,
     ):
         super().__init__()
@@ -492,11 +791,19 @@ class TrainingTrackerCallback(pl.Callback):
         self._ot_ratio_sum = 0.0
         self._ot_ratio_count = 0
 
-        # Row 5: System & dequantization metrics (per-epoch)
-        self.dequant_sigmas: list[float] = []
+        # Row 5: System & target noise metrics (per-epoch)
+        self.target_noise_sigmas: list[float] = []
         self.gpu_utilizations: list[float] = []
         self.gpu_memory_used: list[float] = []
         self.loss_ratios: list[float] = []
+
+        # Column 5: GMM diagnostics + general metrics (per-epoch)
+        self.gm_weight_entropies: list[float] = []
+        self.gm_effective_ks: list[float] = []
+        self.gm_logstds: list[float] = []
+        self.epoch_durations: list[float] = []
+        self.cosine_losses: list[float] = []
+        self._epoch_start_time: float = 0.0
 
         # Hardware monitoring background thread state
         self._hw_stop_event: Optional[threading.Event] = None
@@ -626,10 +933,12 @@ class TrainingTrackerCallback(pl.Callback):
     # -----------------------------------------------------------------
 
     def on_train_epoch_start(self, trainer, pl_module):
+        import time as _time
         self._grad_norm_sum = 0.0
         self._grad_norm_count = 0
         self._ot_ratio_sum = 0.0
         self._ot_ratio_count = 0
+        self._epoch_start_time = _time.time()
         self._start_hw_monitor()
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
@@ -694,9 +1003,9 @@ class TrainingTrackerCallback(pl.Callback):
         else:
             self.ot_cost_ratios.append(float("nan"))
 
-        # Dequantization sigma (may be constant or annealed in future)
-        sigma = getattr(pl_module, "dequant_sigma", 0.0)
-        self.dequant_sigmas.append(float(sigma))
+        # Target noise sigma (set by TargetNoiseAnnealingCallback)
+        sigma = getattr(pl_module, "target_noise_sigma", 0.0)
+        self.target_noise_sigmas.append(float(sigma))
 
         # Train/Val loss ratio
         if tl == tl and vl == vl and vl > 0:  # both not NaN
@@ -716,6 +1025,31 @@ class TrainingTrackerCallback(pl.Callback):
             self.experiment.track("fm_gpu_util", gpu_u)
         if gpu_m == gpu_m:
             self.experiment.track("fm_gpu_mem_mb", gpu_m)
+
+        # Column 5: GMM diagnostics + general metrics
+        import time as _time
+
+        gm_entropy = getattr(pl_module, "_gm_weight_entropy", float("nan"))
+        gm_logstd = getattr(pl_module, "_gm_logstd", float("nan"))
+        self.gm_weight_entropies.append(float(gm_entropy))
+        self.gm_logstds.append(float(gm_logstd))
+        if gm_entropy == gm_entropy:  # not NaN
+            eff_k = math.exp(gm_entropy)
+            self.gm_effective_ks.append(eff_k)
+            self.experiment.track("fm_gm_weight_entropy", gm_entropy)
+            self.experiment.track("fm_gm_effective_k", eff_k)
+            self.experiment.track("fm_gm_logstd", gm_logstd)
+        else:
+            self.gm_effective_ks.append(float("nan"))
+
+        epoch_dur = _time.time() - self._epoch_start_time
+        self.epoch_durations.append(epoch_dur)
+        self.experiment.track("fm_epoch_duration_s", epoch_dur)
+
+        cos_loss = getattr(pl_module, "_cosine_loss", float("nan"))
+        self.cosine_losses.append(float(cos_loss))
+        if cos_loss == cos_loss:
+            self.experiment.track("fm_cosine_loss", cos_loss)
 
         # Expensive evaluation every N epochs
         if epoch % self.eval_every_n_epochs == 0:
@@ -843,6 +1177,9 @@ class TrainingTrackerCallback(pl.Callback):
             val_std = model.standardize(val_sub)
             t = torch.full((val_sub.shape[0],), 0.5, device=device)
             vel = model.velocity_net(val_std, t)
+            if isinstance(vel, dict):
+                from graph_hdc.models.gmm_utils import gm_to_mean
+                vel = gm_to_mean(vel)
             v = vel.norm(dim=-1).mean().item()
             self.velocity_norms.append(v)
             self.experiment.track("fm_velocity_norm", v)
@@ -856,8 +1193,8 @@ class TrainingTrackerCallback(pl.Callback):
     # -----------------------------------------------------------------
 
     def _create_metrics_plot(self, epoch: int) -> plt.Figure:
-        """Create 5x4 grid of training metrics."""
-        fig, axes = plt.subplots(5, 4, figsize=(16, 17))
+        """Create 5x5 grid of training metrics."""
+        fig, axes = plt.subplots(5, 5, figsize=(20, 17))
 
         ep = self.epochs
         ev = self.eval_epochs
@@ -867,6 +1204,10 @@ class TrainingTrackerCallback(pl.Callback):
         self._plot_loss_overlay(axes[0, 1], ep, log_scale=True)
         self._plot_ot_cost_ratio(axes[0, 2], ep)
         self._plot_learning_rate(axes[0, 3], ep)
+        self._plot_line(
+            axes[0, 4], ep, self.gm_weight_entropies,
+            "GM Weight Entropy", "Entropy (nats)", "tab:purple",
+        )
 
         # Row 2: Distribution Match
         self._plot_line(
@@ -885,6 +1226,10 @@ class TrainingTrackerCallback(pl.Callback):
             axes[1, 3], ev, self.per_dim_std_r2s,
             "Per-Dim Std R\u00b2", "R\u00b2", "tab:green",
         )
+        self._plot_line(
+            axes[1, 4], ep, self.gm_effective_ks,
+            "GM Effective K", "exp(entropy)", "tab:purple",
+        )
 
         # Row 3: Flow Quality
         self._plot_line(
@@ -899,6 +1244,10 @@ class TrainingTrackerCallback(pl.Callback):
         self._plot_line(
             axes[2, 3], ev, self.velocity_norms,
             "Velocity Norm (t=0.5)", "L2 Norm", "tab:brown",
+        )
+        self._plot_line(
+            axes[2, 4], ep, self.gm_logstds,
+            "GM Log-Std (\u03c3)", "log(\u03c3)", "tab:pink",
         )
 
         # Row 4: Sample Health
@@ -916,12 +1265,20 @@ class TrainingTrackerCallback(pl.Callback):
             "Centroid Cos Sim", "Cos Sim", "tab:cyan",
         )
         self._plot_grad_norm(axes[3, 3], ep)
+        self._plot_line(
+            axes[3, 4], ep, self.epoch_durations,
+            "Epoch Duration", "Seconds", "tab:gray",
+        )
 
-        # Row 5: System & Dequantization
-        self._plot_dequant_sigma(axes[4, 0], ep)
+        # Row 5: System & Target Noise
+        self._plot_target_noise_sigma(axes[4, 0], ep)
         self._plot_gpu_utilization(axes[4, 1], ep)
         self._plot_gpu_memory(axes[4, 2], ep)
         self._plot_loss_ratio(axes[4, 3], ep)
+        self._plot_line(
+            axes[4, 4], ep, self.cosine_losses,
+            "Cosine Loss", "1 - cos_sim", "tab:orange",
+        )
 
         fig.suptitle(
             f"Flow Matching Training Progress \u2014 Epoch {epoch}",
@@ -1076,18 +1433,18 @@ class TrainingTrackerCallback(pl.Callback):
     # Row 5: System & Dequantization
     # -----------------------------------------------------------------
 
-    def _plot_dequant_sigma(self, ax, ep):
-        """Plot dequantization sigma over training."""
-        xs, ys = self._filter_nan(ep, self.dequant_sigmas)
+    def _plot_target_noise_sigma(self, ax, ep):
+        """Plot target noise sigma (cosine-annealed) over training."""
+        xs, ys = self._filter_nan(ep, self.target_noise_sigmas)
         if not xs:
-            ax.set_title("Dequant \u03c3")
+            ax.set_title("Target Noise \u03c3")
             ax.text(0.5, 0.5, "No data", ha="center", va="center",
                     transform=ax.transAxes, fontsize=12, color="gray")
             return
 
         xs, ys = list(xs), list(ys)
         ax.plot(xs, ys, color="tab:pink", linewidth=2)
-        ax.set_title("Dequant \u03c3")
+        ax.set_title("Target Noise \u03c3")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("\u03c3")
         ax.grid(True, alpha=0.3)
@@ -1201,8 +1558,8 @@ def experiment(e: Experiment) -> None:
     if e.VELOCITY_ARCH == "dit":
         e.log(f"  DiT config: {e.NUM_TOKENS} tokens, {e.NUM_HEADS} heads, mlp_ratio={e.MLP_RATIO}")
     e.log(f"OT coupling: {e.USE_OT_COUPLING}")
-    if e.DEQUANT_SIGMA > 0:
-        e.log(f"Dequantization: sigma={e.DEQUANT_SIGMA}")
+    if e.TARGET_NOISE_SIGMA > 0:
+        e.log(f"Target noise annealing: sigma_max={e.TARGET_NOISE_SIGMA}, anneal_frac={e.TARGET_NOISE_ANNEAL_FRAC}")
     if conditioning:
         e.log(f"Conditioning: {conditioning.name} (dim={condition_dim})")
         e.log(f"  {conditioning.description}")
@@ -1338,13 +1695,18 @@ def experiment(e: Experiment) -> None:
         weight_decay=e.WEIGHT_DECAY,
         warmup_epochs=e.WARMUP_EPOCHS,
         velocity_arch=e.VELOCITY_ARCH,
+        block_type=e.BLOCK_TYPE,
         num_heads=e.NUM_HEADS,
         num_tokens=e.NUM_TOKENS,
         mlp_ratio=e.MLP_RATIO,
         vector_part=e.VECTOR_PART,
         cosine_loss_weight=e.COSINE_LOSS_WEIGHT,
-        dequant_sigma=e.DEQUANT_SIGMA,
+        target_noise_sigma=e.TARGET_NOISE_SIGMA,
         cond_dropout_prob=e.COND_DROPOUT_PROB,
+        num_gaussians=e.NUM_GAUSSIANS,
+        gmm_sample_mode=e.GMM_SAMPLE_MODE,
+        trans_ratio=e.TRANS_RATIO,
+        gm_entropy_weight=e.GM_ENTROPY_WEIGHT,
     )
 
     # Attach PCA projection if fitted
@@ -1401,6 +1763,20 @@ def experiment(e: Experiment) -> None:
     callbacks = [
         tracking_callback,
     ]
+    if e.TARGET_NOISE_SIGMA > 0:
+        callbacks.append(TargetNoiseAnnealingCallback(
+            sigma_max=e.TARGET_NOISE_SIGMA,
+            anneal_fraction=e.TARGET_NOISE_ANNEAL_FRAC,
+        ))
+    if e.GEN_EVAL_EVERY_N_EPOCHS > 0:
+        callbacks.append(GenerationTrackingCallback(
+            experiment=e,
+            hypernet=hypernet,
+            dataset=e.DATASET,
+            vector_part=e.VECTOR_PART,
+            every_n_epochs=e.GEN_EVAL_EVERY_N_EPOCHS,
+            n_samples=e.GEN_EVAL_N_SAMPLES,
+        ))
     if e.USE_EMA:
         callbacks.append(EMAWeightAveraging(decay=e.EMA_DECAY))
     callbacks.extend([
@@ -1493,6 +1869,23 @@ def load_encoder(e: Experiment, device: torch.device):
             "ENCODER_PATH must be set to a valid HyperNet checkpoint path. "
             "Use --__TESTING__ True for quick tests without an encoder."
         )
+
+    # Prune edges codebook to observed edge pairs only — avoids the
+    # full N^2 Cartesian product which is especially costly for RRWP
+    # encoders (e.g. 581^2 = 337K entries).
+    needs_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
+    if needs_rw:
+        from graph_hdc.datasets.utils import scan_features_with_rw
+
+        e.log("Scanning dataset for observed edge pairs (with RW augmentation)...")
+        _, observed_edges = scan_features_with_rw(e.DATASET.lower(), hypernet.rw_config)
+    else:
+        from graph_hdc.datasets.utils import get_dataset_info
+
+        e.log("Loading observed edge pairs from dataset info...")
+        observed_edges = get_dataset_info(e.DATASET.lower()).edge_features
+    hypernet.limit_edges_codebook(observed_edges)
+    e.log(f"Pruned edges codebook: {hypernet.edges_codebook.shape[0]} entries")
 
     hypernet.eval()
     return hypernet

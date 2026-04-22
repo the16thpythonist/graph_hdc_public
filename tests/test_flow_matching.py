@@ -14,12 +14,20 @@ from graph_hdc.models.flow_matching import (
     MultiCondition,
     PseudoHuberLoss,
     SinusoidalTimeEmbedding,
+    SwiGLUFiLMBlock,
     VelocityDiT,
     VelocityMLP,
     VelocityModelWrapper,
     build_condition,
     get_condition,
     sample_logit_normal,
+)
+from graph_hdc.models.gmm_utils import (
+    GMMOutputHead,
+    gm_nll_loss,
+    gm_to_mean,
+    gm_to_sample,
+    gmm_reverse_transition,
 )
 
 
@@ -125,6 +133,54 @@ def test_film_residual_block_near_identity_at_init():
 
 
 # =============================================================================
+# SwiGLUFiLMBlock
+# =============================================================================
+
+
+def test_swiglu_film_block_shape():
+    block = SwiGLUFiLMBlock(HIDDEN_DIM, film_dim=HIDDEN_DIM)
+    x = torch.randn(BATCH_SIZE, HIDDEN_DIM)
+    film = torch.randn(BATCH_SIZE, HIDDEN_DIM)
+    out = block(x, film)
+    assert out.shape == (BATCH_SIZE, HIDDEN_DIM)
+
+
+def test_swiglu_film_block_near_identity_at_init():
+    block = SwiGLUFiLMBlock(HIDDEN_DIM, film_dim=HIDDEN_DIM)
+    x = torch.randn(BATCH_SIZE, HIDDEN_DIM)
+    film = torch.zeros(BATCH_SIZE, HIDDEN_DIM)
+    out = block(x, film)
+    # With zero-initialized FiLM params (scale=0, shift=0, gate=0),
+    # the residual branch is multiplied by gate=sigmoid(0)=0.5 * h,
+    # but h itself is small because the SwiGLU output is near zero at init.
+    residual = (out - x).abs().mean()
+    assert residual < 1.0, f"Residual too large at init: {residual}"
+
+
+def test_swiglu_film_block_gradient_flow():
+    block = SwiGLUFiLMBlock(HIDDEN_DIM, film_dim=HIDDEN_DIM)
+    # Perturb film_proj away from zero-init so gradients flow through film_emb
+    with torch.no_grad():
+        block.film_proj[-1].weight.add_(0.01 * torch.randn_like(block.film_proj[-1].weight))
+    x = torch.randn(BATCH_SIZE, HIDDEN_DIM, requires_grad=True)
+    film = torch.randn(BATCH_SIZE, HIDDEN_DIM, requires_grad=True)
+    out = block(x, film)
+    loss = out.sum()
+    loss.backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+    assert film.grad is not None and film.grad.abs().sum() > 0
+
+
+def test_swiglu_film_block_with_dropout():
+    block = SwiGLUFiLMBlock(HIDDEN_DIM, film_dim=HIDDEN_DIM, dropout=0.1)
+    x = torch.randn(BATCH_SIZE, HIDDEN_DIM)
+    film = torch.randn(BATCH_SIZE, HIDDEN_DIM)
+    block.train()
+    out = block(x, film)
+    assert out.shape == (BATCH_SIZE, HIDDEN_DIM)
+
+
+# =============================================================================
 # VelocityMLP
 # =============================================================================
 
@@ -152,6 +208,62 @@ def test_velocity_mlp_conditional():
     c = torch.randn(BATCH_SIZE, 16)
     out = net(x, t, condition=c)
     assert out.shape == (BATCH_SIZE, DATA_DIM)
+
+
+def test_velocity_mlp_swiglu_shape():
+    net = VelocityMLP(
+        DATA_DIM, HIDDEN_DIM, NUM_BLOCKS, TIME_EMBED_DIM, block_type="swiglu",
+    )
+    x = torch.randn(BATCH_SIZE, DATA_DIM)
+    t = torch.rand(BATCH_SIZE)
+    out = net(x, t)
+    assert out.shape == (BATCH_SIZE, DATA_DIM)
+
+
+def test_velocity_mlp_swiglu_zero_init():
+    net = VelocityMLP(
+        DATA_DIM, HIDDEN_DIM, NUM_BLOCKS, TIME_EMBED_DIM, block_type="swiglu",
+    )
+    x = torch.randn(BATCH_SIZE, DATA_DIM)
+    t = torch.rand(BATCH_SIZE)
+    out = net(x, t)
+    assert out.abs().max() < 0.5, f"Output too large at init: {out.abs().max()}"
+
+
+def test_velocity_mlp_swiglu_conditional():
+    net = VelocityMLP(
+        DATA_DIM, HIDDEN_DIM, NUM_BLOCKS, TIME_EMBED_DIM,
+        condition_dim=16, block_type="swiglu",
+    )
+    x = torch.randn(BATCH_SIZE, DATA_DIM)
+    t = torch.rand(BATCH_SIZE)
+    c = torch.randn(BATCH_SIZE, 16)
+    out = net(x, t, condition=c)
+    assert out.shape == (BATCH_SIZE, DATA_DIM)
+
+
+def test_velocity_mlp_swiglu_gradient_flow():
+    net = VelocityMLP(
+        DATA_DIM, HIDDEN_DIM, NUM_BLOCKS, TIME_EMBED_DIM, block_type="swiglu",
+    )
+    # Perturb film projections and output proj away from zero-init
+    with torch.no_grad():
+        for block in net.blocks:
+            block.film_proj[-1].weight.add_(
+                0.01 * torch.randn_like(block.film_proj[-1].weight)
+            )
+        net.output_proj.weight.add_(0.01 * torch.randn_like(net.output_proj.weight))
+    x = torch.randn(BATCH_SIZE, DATA_DIM, requires_grad=True)
+    t = torch.rand(BATCH_SIZE)
+    out = net(x, t)
+    loss = out.sum()
+    loss.backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+
+
+def test_velocity_mlp_invalid_block_type():
+    with pytest.raises(ValueError, match="Unknown block_type"):
+        VelocityMLP(DATA_DIM, HIDDEN_DIM, NUM_BLOCKS, TIME_EMBED_DIM, block_type="bad")
 
 
 # =============================================================================
@@ -977,18 +1089,18 @@ def test_cosine_loss_zero_weight_matches_original(fake_batch):
 
 
 # =============================================================================
-# Dequantization
+# Target Noise
 # =============================================================================
 
 
-def test_dequant_loss_finite(fake_batch):
-    """Dequantization produces finite losses and gradients."""
+def test_target_noise_loss_finite(fake_batch):
+    """Target noise produces finite losses and gradients."""
     m = FlowMatchingModel(
         data_dim=DATA_DIM,
         hidden_dim=HIDDEN_DIM,
         num_blocks=NUM_BLOCKS,
         time_embed_dim=TIME_EMBED_DIM,
-        dequant_sigma=0.1,
+        target_noise_sigma=0.1,
         default_sample_steps=5,
         warmup_epochs=0,
     )
@@ -1002,14 +1114,14 @@ def test_dequant_loss_finite(fake_batch):
             assert torch.isfinite(p.grad).all(), f"Non-finite grad in {name}"
 
 
-def test_dequant_disabled_matches_baseline(fake_batch):
-    """dequant_sigma=0.0 is a no-op — loss matches a model without it."""
+def test_target_noise_disabled_matches_baseline(fake_batch):
+    """target_noise_sigma=0.0 is a no-op — loss matches a model without it."""
     m = FlowMatchingModel(
         data_dim=DATA_DIM,
         hidden_dim=HIDDEN_DIM,
         num_blocks=NUM_BLOCKS,
         time_embed_dim=TIME_EMBED_DIM,
-        dequant_sigma=0.0,
+        target_noise_sigma=0.0,
         default_sample_steps=5,
         warmup_epochs=0,
     )
@@ -1033,19 +1145,19 @@ def test_dequant_disabled_matches_baseline(fake_batch):
     assert torch.allclose(loss_zero, loss_baseline)
 
 
-def test_dequant_only_during_training():
-    """Dequantization is not applied during eval (validation loss is clean)."""
+def test_target_noise_only_during_training():
+    """Target noise is not applied during eval (validation loss is clean)."""
     m = FlowMatchingModel(
         data_dim=DATA_DIM,
         hidden_dim=HIDDEN_DIM,
         num_blocks=NUM_BLOCKS,
         time_embed_dim=TIME_EMBED_DIM,
-        dequant_sigma=0.5,  # large sigma to make the difference obvious
+        target_noise_sigma=0.5,  # large sigma to make the difference obvious
         default_sample_steps=5,
         warmup_epochs=0,
     )
 
-    # Eval mode: dequantization should be skipped
+    # Eval mode: target noise should be skipped
     m.eval()
     torch.manual_seed(42)
     loss_eval = m.compute_loss(torch.randn(4, DATA_DIM))
@@ -1056,7 +1168,7 @@ def test_dequant_only_during_training():
         hidden_dim=HIDDEN_DIM,
         num_blocks=NUM_BLOCKS,
         time_embed_dim=TIME_EMBED_DIM,
-        dequant_sigma=0.0,
+        target_noise_sigma=0.0,
         default_sample_steps=5,
         warmup_epochs=0,
     )
@@ -1353,3 +1465,379 @@ def test_pca_save_load_state_dict():
     assert samples.shape == (3, PCA_ORIG_DIM)
 
 
+# =============================================================================
+# Gaussian Mixture (GMFlow) — Unit Tests
+# =============================================================================
+
+NUM_GAUSSIANS = 4
+
+
+def test_gmm_output_head_shapes():
+    """GMMOutputHead returns dict with correct shapes."""
+    head = GMMOutputHead(HIDDEN_DIM, DATA_DIM, NUM_GAUSSIANS)
+    h = torch.randn(BATCH_SIZE, HIDDEN_DIM)
+    gm = head(h)
+
+    assert isinstance(gm, dict)
+    assert gm["means"].shape == (BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM)
+    assert gm["logweights"].shape == (BATCH_SIZE, NUM_GAUSSIANS)
+    assert gm["logstds"].shape == (BATCH_SIZE,)
+
+
+def test_gmm_output_head_init():
+    """At initialization, weights are uniform, logstd=0, and components are asymmetric."""
+    head = GMMOutputHead(HIDDEN_DIM, DATA_DIM, NUM_GAUSSIANS)
+
+    # With zero input, output is just bias (zeros) — test weights/logstd
+    h_zero = torch.zeros(1, HIDDEN_DIM)
+    gm = head(h_zero)
+    expected_logw = -torch.log(torch.tensor(float(NUM_GAUSSIANS)))
+    assert torch.allclose(gm["logweights"], expected_logw.expand_as(gm["logweights"]), atol=1e-5)
+    assert gm["logstds"].abs().max() < 1e-6  # logstd=0 → sigma=1
+
+    # With non-zero input, Kaiming init breaks symmetry between components
+    h = torch.ones(1, HIDDEN_DIM)
+    gm = head(h)
+    assert not torch.allclose(gm["means"][0, 0], gm["means"][0, 1], atol=1e-6)
+
+
+def test_gm_nll_loss_shape_and_finite():
+    """NLL loss has shape (bs,) and is finite."""
+    gm = {
+        "means": torch.randn(BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM),
+        "logweights": torch.randn(BATCH_SIZE, NUM_GAUSSIANS).log_softmax(dim=-1),
+        "logstds": torch.zeros(BATCH_SIZE),
+    }
+    target = torch.randn(BATCH_SIZE, DATA_DIM)
+
+    loss = gm_nll_loss(gm, target)
+    assert loss.shape == (BATCH_SIZE,)
+    assert torch.isfinite(loss).all()
+
+
+def test_gm_nll_loss_gradient_flow():
+    """Gradients flow through all GMM parameters."""
+    means = torch.randn(BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM, requires_grad=True)
+    logweights = torch.randn(BATCH_SIZE, NUM_GAUSSIANS, requires_grad=True)
+    logstds = torch.zeros(BATCH_SIZE, requires_grad=True)
+    gm = {
+        "means": means,
+        "logweights": logweights.log_softmax(dim=-1),
+        "logstds": logstds,
+    }
+    target = torch.randn(BATCH_SIZE, DATA_DIM)
+
+    loss = gm_nll_loss(gm, target).mean()
+    loss.backward()
+
+    assert means.grad is not None and torch.isfinite(means.grad).all()
+    assert logweights.grad is not None and torch.isfinite(logweights.grad).all()
+    assert logstds.grad is not None and torch.isfinite(logstds.grad).all()
+
+
+def test_gm_to_mean_shape():
+    """gm_to_mean returns (bs, D) and is correct for uniform weights."""
+    means = torch.randn(BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM)
+    gm = {
+        "means": means,
+        "logweights": torch.zeros(BATCH_SIZE, NUM_GAUSSIANS).log_softmax(dim=-1),
+    }
+    result = gm_to_mean(gm)
+    assert result.shape == (BATCH_SIZE, DATA_DIM)
+    # With uniform weights, mean should be arithmetic mean of components
+    expected = means.mean(dim=-2)
+    assert torch.allclose(result, expected, atol=1e-5)
+
+
+def test_gm_to_sample_shape():
+    """gm_to_sample returns (bs, D) with finite values."""
+    gm = {
+        "means": torch.randn(BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM),
+        "logweights": torch.zeros(BATCH_SIZE, NUM_GAUSSIANS).log_softmax(dim=-1),
+        "logstds": torch.zeros(BATCH_SIZE),
+    }
+    result = gm_to_sample(gm)
+    assert result.shape == (BATCH_SIZE, DATA_DIM)
+    assert torch.isfinite(result).all()
+
+
+# =============================================================================
+# Gaussian Mixture (GMFlow) — Integration Tests
+# =============================================================================
+
+
+def test_velocity_mlp_gmm_output():
+    """VelocityMLP with output_type='gmm' returns dict with correct shapes."""
+    net = VelocityMLP(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        output_type="gmm",
+        num_gaussians=NUM_GAUSSIANS,
+    )
+    x_t = torch.randn(BATCH_SIZE, DATA_DIM)
+    t = torch.rand(BATCH_SIZE)
+    out = net(x_t, t)
+
+    assert isinstance(out, dict)
+    assert out["means"].shape == (BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM)
+    assert out["logweights"].shape == (BATCH_SIZE, NUM_GAUSSIANS)
+    assert out["logstds"].shape == (BATCH_SIZE,)
+
+
+def test_flow_matching_gm_nll_training_step(fake_batch):
+    """FlowMatchingModel with loss_type='gm_nll' produces finite loss."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    loss = m.training_step(fake_batch, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    for name, p in m.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), f"Non-finite grad in {name}"
+
+
+def test_flow_matching_gm_nll_sample():
+    """Sampling works with GMM model and produces correct shape."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.eval()
+    samples = m.sample(4)
+    assert samples.shape == (4, DATA_DIM)
+    assert torch.isfinite(samples).all()
+
+
+def test_flow_matching_gm_nll_with_cosine_loss(fake_batch):
+    """GMM model is compatible with auxiliary cosine loss."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        cosine_loss_weight=0.1,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    loss = m.training_step(fake_batch, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
+def test_flow_matching_gm_nll_checkpoint():
+    """GMM model state_dict save/load roundtrip works."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    sd = m.state_dict()
+
+    m2 = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m2.load_state_dict(sd, strict=True)
+
+    # Verify sampling produces same results
+    torch.manual_seed(42)
+    s1 = m.eval().sample(2)
+    torch.manual_seed(42)
+    s2 = m2.eval().sample(2)
+    assert torch.allclose(s1, s2)
+
+
+def test_flow_matching_mse_unchanged(fake_batch):
+    """Existing loss_type='mse' still works identically (backward compat)."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="mse",
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    torch.manual_seed(99)
+    loss = m.compute_loss(torch.randn(4, DATA_DIM))
+    assert torch.isfinite(loss)
+    assert loss > 0
+
+
+# =============================================================================
+# GMM Transition Loss
+# =============================================================================
+
+
+def test_gmm_reverse_transition_shapes():
+    """Reverse transition preserves GMM shapes."""
+    gm = {
+        "means": torch.randn(BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM),
+        "logweights": torch.randn(BATCH_SIZE, NUM_GAUSSIANS).log_softmax(dim=-1),
+        "logstds": torch.zeros(BATCH_SIZE),
+    }
+    x_t = torch.randn(BATCH_SIZE, DATA_DIM)
+    t_from = torch.rand(BATCH_SIZE) * 0.5  # noisy (low t)
+    t_to = t_from + 0.3  # cleaner (higher t)
+
+    gm_rev = gmm_reverse_transition(gm, x_t, t_from, t_to, "velocity")
+
+    assert gm_rev["means"].shape == (BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM)
+    assert gm_rev["logweights"].shape == (BATCH_SIZE, NUM_GAUSSIANS)
+    assert gm_rev["logstds"].shape == (BATCH_SIZE,)
+    assert torch.isfinite(gm_rev["means"]).all()
+    assert torch.isfinite(gm_rev["logstds"]).all()
+
+
+def test_gmm_reverse_transition_gradients():
+    """Gradients flow through reverse transition."""
+    means = torch.randn(BATCH_SIZE, NUM_GAUSSIANS, DATA_DIM, requires_grad=True)
+    logstds = torch.zeros(BATCH_SIZE, requires_grad=True)
+    gm = {
+        "means": means,
+        "logweights": torch.zeros(BATCH_SIZE, NUM_GAUSSIANS).log_softmax(dim=-1),
+        "logstds": logstds,
+    }
+    x_t = torch.randn(BATCH_SIZE, DATA_DIM)
+    t_from = torch.full((BATCH_SIZE,), 0.3)
+    t_to = torch.full((BATCH_SIZE,), 0.7)
+
+    gm_rev = gmm_reverse_transition(gm, x_t, t_from, t_to, "velocity")
+    loss = gm_rev["means"].sum() + gm_rev["logstds"].sum()
+    loss.backward()
+
+    assert means.grad is not None and torch.isfinite(means.grad).all()
+    assert logstds.grad is not None and torch.isfinite(logstds.grad).all()
+
+
+def test_transition_loss_training_step(fake_batch):
+    """Transition loss produces finite loss and gradients."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        trans_ratio=0.5,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    loss = m.training_step(fake_batch, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    for name, p in m.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), f"Non-finite grad in {name}"
+
+
+@pytest.mark.parametrize("pred_type", ["velocity", "x_prediction"])
+def test_transition_loss_both_prediction_types(fake_batch, pred_type):
+    """Transition loss works with both prediction types."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        prediction_type=pred_type,
+        num_gaussians=NUM_GAUSSIANS,
+        trans_ratio=0.5,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    loss = m.training_step(fake_batch, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
+def test_transition_loss_with_cosine(fake_batch):
+    """Transition loss is compatible with cosine auxiliary loss."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        trans_ratio=0.5,
+        cosine_loss_weight=0.1,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    loss = m.training_step(fake_batch, 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
+def test_transition_loss_sample():
+    """Sampling still works after configuring transition loss."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="gm_nll",
+        num_gaussians=NUM_GAUSSIANS,
+        trans_ratio=0.5,
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.eval()
+    samples = m.sample(4)
+    assert samples.shape == (4, DATA_DIM)
+    assert torch.isfinite(samples).all()
+
+
+def test_transition_loss_backward_compat(fake_batch):
+    """MSE path is unaffected by trans_ratio parameter."""
+    m = FlowMatchingModel(
+        data_dim=DATA_DIM,
+        hidden_dim=HIDDEN_DIM,
+        num_blocks=NUM_BLOCKS,
+        time_embed_dim=TIME_EMBED_DIM,
+        loss_type="mse",
+        trans_ratio=0.5,  # should be ignored
+        default_sample_steps=5,
+        warmup_epochs=0,
+    )
+    m.train()
+    torch.manual_seed(99)
+    loss = m.compute_loss(torch.randn(4, DATA_DIM))
+    assert torch.isfinite(loss)
+    assert loss > 0

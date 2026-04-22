@@ -190,6 +190,7 @@ class HyperNet(pl.LightningModule):
         else:
             self._decoding_edge_limit = MAX_ALLOWED_DECODING_EDGES_ZINC
         self._max_step_delta: float | None = None
+        self._incremental_edges: bool = False
 
     def __str__(self) -> str:
         lines = [
@@ -343,6 +344,77 @@ class HyperNet(pl.LightningModule):
         self._edges_indexer.idx_to_tuple = edge_pairs
         self._edges_indexer.tuple_to_idx = {t: i for i, t in enumerate(edge_pairs)}
 
+    def enable_incremental_edges(self) -> None:
+        """Enable incremental edge codebook mode.
+
+        Initialises an empty edge codebook and indexer that can be grown
+        via :meth:`register_edges`.  The ``edges_codebook`` property is
+        guarded so it never falls through to the catastrophic full
+        Cartesian-product build.
+        """
+        self._incremental_edges = True
+        self._edges_codebook = torch.empty(
+            0, self.hv_dim,
+            device=self.nodes_codebook.device,
+            dtype=self._dtype,
+        )
+        self._edges_indexer = TupleIndexer.__new__(TupleIndexer)
+        self._edges_indexer.sizes = []
+        self._edges_indexer.idx_to_tuple = []
+        self._edges_indexer.tuple_to_idx = {}
+        self._max_step_delta = None
+
+    def register_edges(
+        self, edge_pairs: set[tuple[tuple, tuple]]
+    ) -> int:
+        """Incrementally add new edge pairs to the edge codebook.
+
+        For each ``(src_node_tuple, dst_node_tuple)`` pair, looks up both
+        node types in ``nodes_indexer``, computes the bound hypervector,
+        and appends it to the edge codebook.  Pairs already registered or
+        referencing unknown node types are silently skipped.
+
+        Parameters
+        ----------
+        edge_pairs : set of (src_tuple, dst_tuple)
+            Directed edge pairs expressed as node-feature tuples.
+
+        Returns
+        -------
+        int
+            Number of *newly* registered pairs.
+        """
+        if self._edges_codebook is None:
+            self.enable_incremental_edges()
+
+        new_keys = []
+        new_hvs = []
+        for src_t, dst_t in edge_pairs:
+            src_idx = self.nodes_indexer.get_idx(src_t)
+            dst_idx = self.nodes_indexer.get_idx(dst_t)
+            if src_idx is None or dst_idx is None:
+                continue
+            key = (src_idx, dst_idx)
+            if key in self._edges_indexer.tuple_to_idx:
+                continue
+            new_keys.append(key)
+            new_hvs.append(
+                self.nodes_codebook[src_idx].bind(self.nodes_codebook[dst_idx])
+            )
+
+        if not new_hvs:
+            return 0
+
+        new_tensor = torch.stack(new_hvs).to(self._edges_codebook.device)
+        self._edges_codebook = torch.cat(
+            [self._edges_codebook, new_tensor], dim=0
+        )
+        self._edges_indexer.extend(new_keys)
+        # Invalidate cached decoding threshold — it depends on codebook
+        # contents and must be recomputed after expansion.
+        self._max_step_delta = None
+        return len(new_keys)
+
     def rebuild_unpruned_codebook(self) -> None:
         """Rebuild the full unpruned codebook from the original seed.
 
@@ -457,9 +529,27 @@ class HyperNet(pl.LightningModule):
     def edges_codebook(self):
         """Lazily build edges codebook on first access (can be very large)."""
         if self._edges_codebook is None:
+            if self._incremental_edges:
+                raise RuntimeError(
+                    "Edge codebook is in incremental mode but has not been "
+                    "initialised.  Call enable_incremental_edges() or "
+                    "register_edges() before decoding.  The full Cartesian "
+                    "product is too large for this encoder "
+                    f"({self.nodes_codebook.shape[0]}² nodes)."
+                )
             self._edges_codebook = cartesian_bind_tensor(
                 [self.nodes_codebook, self.nodes_codebook]
             ).to(self.nodes_codebook.device)
+        if (
+            self._incremental_edges
+            and self._edges_codebook is not None
+            and self._edges_codebook.shape[0] == 0
+        ):
+            raise RuntimeError(
+                "Edge codebook is in incremental mode but empty. "
+                "Call register_edges() with observed edge pairs before "
+                "decoding.  The codebook grows as training data is observed."
+            )
         return self._edges_codebook
 
     @edges_codebook.setter
@@ -470,6 +560,11 @@ class HyperNet(pl.LightningModule):
     def edges_indexer(self):
         """Lazily build edges indexer on first access."""
         if self._edges_indexer is None:
+            if self._incremental_edges:
+                raise RuntimeError(
+                    "Edge indexer is in incremental mode but empty. "
+                    "Call register_edges() first."
+                )
             self._edges_indexer = TupleIndexer(
                 [self.nodes_indexer.size(), self.nodes_indexer.size()]
             )
@@ -1900,6 +1995,7 @@ class HyperNet(pl.LightningModule):
         else:
             instance._decoding_edge_limit = 122
         instance._max_step_delta = None
+        instance._incremental_edges = False
 
         # Restore encoder maps
         instance.node_encoder_map = cls._deserialize_encoder_map(state["encoder_maps"]["node"], device)
