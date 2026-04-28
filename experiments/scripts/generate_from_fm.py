@@ -21,6 +21,7 @@ import resource
 import time
 from pathlib import Path
 
+import numpy as np
 import psutil
 import torch
 from rdkit import Chem
@@ -34,7 +35,14 @@ from graph_hdc.hypernet.configs import (
     create_config_with_rw,
 )
 from graph_hdc.models.flow_matching import FlowMatchingModel
-from graph_hdc.utils.chem import reconstruct_for_eval
+from graph_hdc.utils.chem import reconstruct_for_eval, sanitize_mol_final
+from graph_hdc.utils.evaluator import (
+    calculate_internal_diversity,
+    rdkit_logp,
+    rdkit_qed,
+    rdkit_sa_score,
+)
+from graph_hdc.utils.experiment_helpers import get_canonical_smiles
 
 
 # =============================================================================
@@ -157,6 +165,8 @@ def decode_molecule(
         except Exception:
             mol = None
         if mol is not None:
+            mol = sanitize_mol_final(mol)
+        if mol is not None:
             try:
                 smiles = Chem.MolToSmiles(mol, canonical=True)
                 return {
@@ -200,6 +210,11 @@ def main():
     parser.add_argument("--beam_size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--ref_subsample", type=int, default=5000,
+        help="Max training molecules to sample for novelty + reference stats. "
+             "Set to 0 to skip reference comparison.",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -333,12 +348,115 @@ def main():
     validity = 100.0 * valid_count / args.n_samples if args.n_samples > 0 else 0
     uniqueness = 100.0 * len(unique_smiles) / valid_count if valid_count > 0 else 0
 
+    # Per-molecule properties (QED, LogP, SA)
+    valid_mols: list[Chem.Mol] = []
+    for r in results:
+        if not r["valid"] or r["smiles"] is None:
+            r["qed"] = None
+            r["logp"] = None
+            r["sa_score"] = None
+            continue
+        mol = Chem.MolFromSmiles(r["smiles"])
+        if mol is None:
+            r["qed"] = None
+            r["logp"] = None
+            r["sa_score"] = None
+            continue
+        valid_mols.append(mol)
+        try:
+            r["qed"] = float(rdkit_qed(mol))
+        except Exception:
+            r["qed"] = None
+        try:
+            r["logp"] = float(rdkit_logp(mol))
+        except Exception:
+            r["logp"] = None
+        try:
+            r["sa_score"] = float(rdkit_sa_score(mol))
+        except Exception:
+            r["sa_score"] = None
+
+    def _stats(values):
+        arr = [v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))]
+        if not arr:
+            return {"mean": None, "std": None, "min": None, "max": None, "n": 0}
+        return {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+            "n": len(arr),
+        }
+
+    qed_stats = _stats([r.get("qed") for r in results])
+    logp_stats = _stats([r.get("logp") for r in results])
+    sa_stats = _stats([r.get("sa_score") for r in results])
+
+    # Internal diversity (avg pairwise Tanimoto distance among valid mols)
+    diversity = calculate_internal_diversity(valid_mols) if len(valid_mols) >= 2 else 0.0
+
+    # Novelty (full train set) + reference dataset stats (subsampled)
+    training_smiles: set = set()
+    novelty = 0.0
+    n_novel = 0
+    ref_qed_stats = ref_logp_stats = ref_sa_stats = None
+    n_ref_mols = 0
+    if args.ref_subsample > 0:
+        log_mem("before train split load")
+        print(f"\nLoading full {args.dataset} train split for novelty...")
+        ref_dataset = get_split("train", dataset=args.dataset)
+        n_train = len(ref_dataset)
+
+        # Novelty: canonicalise every training SMILES (full set, no subsample).
+        # Use the cached `data.smiles` field directly — it's already canonical
+        # in these PyG datasets, so we avoid building a Chem.Mol per row.
+        for i in tqdm(range(n_train), desc="Train SMILES (novelty)", unit="mol"):
+            smi = ref_dataset[i].smiles
+            ref_mol = Chem.MolFromSmiles(smi)
+            if ref_mol is None:
+                continue
+            canon = get_canonical_smiles(ref_mol)
+            if canon is not None:
+                training_smiles.add(canon)
+
+        novel_smiles = unique_smiles - training_smiles
+        n_novel = len(novel_smiles)
+        novelty = 100.0 * n_novel / valid_count if valid_count > 0 else 0.0
+        print(f"  Training canonical SMILES: {len(training_smiles)} (from {n_train} rows)")
+        print(f"  Novel: {n_novel} ({novelty:.1f}%)")
+
+        # Reference property stats: subsampled (expensive RDKit descriptor calls).
+        n_ref = min(args.ref_subsample, n_train)
+        print(f"\nComputing reference property stats on {n_ref} subsampled mols...")
+        indices = torch.randperm(n_train)[:n_ref].tolist()
+        ref_mols: list[Chem.Mol] = []
+        for i in tqdm(indices, desc="Reference mols", unit="mol"):
+            ref_mol = Chem.MolFromSmiles(ref_dataset[i].smiles)
+            if ref_mol is not None:
+                ref_mols.append(ref_mol)
+        n_ref_mols = len(ref_mols)
+
+        ref_qed_stats = _stats([rdkit_qed(m) for m in ref_mols])
+        ref_logp_stats = _stats([rdkit_logp(m) for m in ref_mols])
+        ref_sa_stats = _stats([rdkit_sa_score(m) for m in ref_mols])
+        print(f"  Reference molecules: {n_ref_mols}")
+
     print(f"\n{'='*60}")
     print("GENERATION RESULTS")
     print(f"{'='*60}")
     print(f"  Total samples:  {args.n_samples}")
     print(f"  Valid:          {valid_count} ({validity:.1f}%)")
     print(f"  Unique:         {len(unique_smiles)} ({uniqueness:.1f}%)")
+    if args.ref_subsample > 0:
+        print(f"  Novel:          {n_novel} ({novelty:.1f}%)")
+    print(f"  Diversity:      {diversity:.1f}%")
+    print(f"  QED:            mean={qed_stats['mean']}  std={qed_stats['std']}  (n={qed_stats['n']})")
+    print(f"  LogP:           mean={logp_stats['mean']}  std={logp_stats['std']}  (n={logp_stats['n']})")
+    print(f"  SA score:       mean={sa_stats['mean']}  std={sa_stats['std']}  (n={sa_stats['n']})")
+    if ref_qed_stats is not None:
+        print(f"  [ref] QED:      mean={ref_qed_stats['mean']}  std={ref_qed_stats['std']}")
+        print(f"  [ref] LogP:     mean={ref_logp_stats['mean']}  std={ref_logp_stats['std']}")
+        print(f"  [ref] SA score: mean={ref_sa_stats['mean']}  std={ref_sa_stats['std']}")
     print(f"  Sample time:    {sample_time:.2f}s")
     print(f"  Decode time:    {decode_time:.2f}s (avg {sum(decode_times)/len(decode_times):.2f}s/mol)")
     print(f"  Per-mol times:  {', '.join(f'{t:.1f}s' for t in decode_times)}")
@@ -369,10 +487,27 @@ def main():
         "summary": {
             "validity_pct": validity,
             "uniqueness_pct": uniqueness,
+            "novelty_pct": novelty,
+            "diversity_pct": diversity,
             "n_valid": valid_count,
             "n_unique": len(unique_smiles),
+            "n_novel": n_novel,
             "sample_time_sec": sample_time,
             "decode_time_sec": decode_time,
+        },
+        "properties": {
+            "generated": {
+                "qed": qed_stats,
+                "logp": logp_stats,
+                "sa_score": sa_stats,
+            },
+            "reference": {
+                "qed": ref_qed_stats,
+                "logp": ref_logp_stats,
+                "sa_score": ref_sa_stats,
+                "n_property_subsample": n_ref_mols,
+                "n_training_smiles": len(training_smiles),
+            } if ref_qed_stats is not None else None,
         },
         "codebook_stats": {
             "observed_node_types": len(observed_nodes),
