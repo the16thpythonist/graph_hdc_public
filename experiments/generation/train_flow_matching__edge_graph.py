@@ -72,7 +72,7 @@ experiment = Experiment.extend(
 )
 
 
-@experiment.hook("load_and_encode_data", default=True)
+@experiment.hook("load_and_encode_data", default=False)
 def load_and_encode_data(
     e: Experiment,
     hypernet: HyperNet,

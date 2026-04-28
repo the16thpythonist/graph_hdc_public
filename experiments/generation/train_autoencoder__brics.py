@@ -99,8 +99,18 @@ MAX_GENERATED_NODES: int = 64
 
 # :param ENUMERATE_ATTACHMENTS:
 #     Whether to expand the fragment library with enumerated attachment
-#     point variants (increases fragment diversity).
+#     point variants (increases fragment diversity).  Has no effect when
+#     ``USE_GENERIC_LINKING`` is False — enumeration relies on the
+#     universal wildcard label (0) which is only allowed in generic mode.
 ENUMERATE_ATTACHMENTS: bool = True
+
+# :param USE_GENERIC_LINKING:
+#     When True, fragments may carry the universal wildcard attachment label
+#     (0) and the combiner accepts wildcard pairs.  This enables the
+#     "generic" linking strategy used by ``expand_with_enumerated_positions``.
+#     When False (default), only canonical BRICS labels (1-16) and their
+#     official compatibility table are used; enumeration becomes a no-op.
+USE_GENERIC_LINKING: bool = False
 
 # :param USE_EMA:
 #     Enable EMA weight averaging for streaming training.
@@ -305,6 +315,7 @@ def load_and_encode_data(
             _e.DATASET.lower(),
             f"enum_{_e.ENUMERATE_ATTACHMENTS}",
             f"maxvar_{_e.ENUM_MAX_VARIANTS_PER_FRAGMENT}",
+            f"generic_{_e.USE_GENERIC_LINKING}",
         ),
     )
     def build_fragment_library():
@@ -318,9 +329,16 @@ def load_and_encode_data(
             all_data = all_data[:200]
         e.log(f"  Dataset size (all splits): {len(all_data)}")
 
-        lib = FragmentLibrary(min_atoms=2, max_atoms=30)
+        lib = FragmentLibrary(
+            min_atoms=2,
+            max_atoms=30,
+            use_generic_linking=e.USE_GENERIC_LINKING,
+        )
         lib.build_from_dataset(all_data, show_progress=True)
-        e.log(f"  Fragment library: {lib.num_fragments} fragments")
+        e.log(
+            f"  Fragment library: {lib.num_fragments} fragments "
+            f"(use_generic_linking={lib.use_generic_linking})"
+        )
 
         if e.ENUMERATE_ATTACHMENTS:
             n_before = lib.num_fragments
@@ -371,7 +389,7 @@ def load_and_encode_data(
             scope=lambda _e: (
                 "edge_pairs",
                 _e.DATASET.lower(),
-                Path(_e.ENCODER_PATH).stem if _e.ENCODER_PATH else "test",
+                _e.apply_hook("encoder_config_hash"),
             ),
         )
         def collect_dataset_edge_pairs():
@@ -444,7 +462,7 @@ def load_and_encode_data(
         scope=lambda _e: (
             "valid_encoding",
             _e.DATASET.lower(),
-            Path(_e.ENCODER_PATH).stem if _e.ENCODER_PATH else "test",
+            _e.apply_hook("encoder_config_hash"),
             f"n_{_e.NUM_VALID_SAMPLES or 'all'}",
         ),
     )

@@ -100,6 +100,68 @@ def is_valid_molecule(mol: Chem.Mol) -> bool:
     return err == SanitizeFlags.SANITIZE_NONE
 
 
+def sanitize_mol_final(mol: Chem.Mol) -> Chem.Mol | None:
+    """Best-effort syntactic cleanup of generation artifacts.
+
+    Removes leftovers from the graph-to-mol assembly (radical electrons and
+    the ``NoImplicit`` lock that forces bracket notation in SMILES) so that
+    atoms with open valence get implicit hydrogens filled in by RDKit.
+    E.g. ``O=[S]N1CCOCC1`` becomes ``O=SN1CCOCC1``.
+
+    Strategy:
+    1. Passive — clear radicals, unlock implicit-H computation, re-sanitize.
+       Handles most cases where the chemistry is otherwise sound.
+    2. Active fallback — explicitly fill each atom's valence shortfall with
+       hydrogens (pick the smallest allowed valence ≥ current bond-order sum),
+       then sanitize again.
+    3. If both fail, return the best-effort mol even if unsanitized.
+
+    Returns ``None`` only if the input is ``None``; otherwise always returns
+    a ``Chem.Mol``.
+    """
+    if mol is None:
+        return None
+
+    def _reset_flags(m: Chem.Mol) -> None:
+        for atom in m.GetAtoms():
+            atom.SetNumRadicalElectrons(0)
+            atom.SetNoImplicit(False)
+
+    # Pass 1 — passive
+    work = Chem.RWMol(mol)
+    _reset_flags(work)
+    try:
+        out = work.GetMol()
+        Chem.SanitizeMol(out)
+        return out
+    except Exception:
+        pass
+
+    # Pass 2 — active: fill valence shortfall with explicit Hs
+    work = Chem.RWMol(mol)
+    _reset_flags(work)
+    try:
+        work.UpdatePropertyCache(strict=False)
+    except Exception:
+        pass
+    pt = Chem.GetPeriodicTable()
+    for atom in work.GetAtoms():
+        bond_sum = sum(b.GetBondTypeAsDouble() for b in atom.GetBonds())
+        existing_hs = atom.GetNumExplicitHs()
+        current = bond_sum + existing_hs
+        valence_list = pt.GetValenceList(atom.GetAtomicNum())
+        target = next((v for v in valence_list if v >= current), valence_list[-1])
+        hs_to_add = max(0, int(round(target - current)))
+        atom.SetNumExplicitHs(existing_hs + hs_to_add)
+
+    try:
+        out = work.GetMol()
+        Chem.SanitizeMol(out)
+        return out
+    except Exception:
+        return work.GetMol()
+
+
 def canonical_key(mol: Chem.Mol) -> str:
     """
     Generate a stable canonical SMILES key for uniqueness/novelty checks.
@@ -247,6 +309,73 @@ def nx_to_mol(
     return mol, node_to_idx
 
 
+def _find_augmenting_path(
+    start: int,
+    target_valence: dict,
+    current_valence: dict,
+    bond_orders: dict,
+    adj: dict,
+) -> list[tuple[tuple[int, int], int]] | None:
+    """BFS for an alternating bond-order path between two deficit atoms.
+
+    Starts at ``start`` (which must have unsatisfied valence) and walks
+    edges alternately:
+        - "low" edges (current bond order < 3) that we'd UPGRADE (+1)
+        - "high" edges (current bond order > 1) that we'd DOWNGRADE (-1)
+
+    The first and last edges are both "low" upgrades, so the path is
+    odd-length and both endpoints have an incident +1 edge. Returns the
+    list of ``(edge_key, delta)`` ops to apply, or ``None`` if no path
+    exists. State key ``(atom, want_low)`` lets us re-visit an atom in
+    the opposite polarity (necessary for some ring crossings).
+    """
+    visited: set[tuple[int, bool]] = {(start, True)}
+    parent: dict[tuple[int, bool], tuple] = {(start, True): None}
+    queue: list[tuple[int, bool]] = [(start, True)]
+    end_state: tuple[int, bool] | None = None
+
+    while queue and end_state is None:
+        node, want_low = queue.pop(0)
+        for nbr in adj.get(node, []):
+            ek = (min(node, nbr), max(node, nbr))
+            order = bond_orders[ek]
+            if want_low:
+                if order >= 3:
+                    continue
+                next_state = (nbr, False)
+                if next_state in visited:
+                    continue
+                visited.add(next_state)
+                parent[next_state] = (node, want_low, ek, +1)
+                # Terminate if nbr is a different deficit atom
+                if nbr != start and target_valence[nbr] > current_valence[nbr]:
+                    end_state = next_state
+                    break
+                queue.append(next_state)
+            else:
+                if order <= 1:
+                    continue
+                next_state = (nbr, True)
+                if next_state in visited:
+                    continue
+                visited.add(next_state)
+                parent[next_state] = (node, want_low, ek, -1)
+                queue.append(next_state)
+
+    if end_state is None:
+        return None
+
+    # Reconstruct path from end_state back to start
+    path: list[tuple[tuple[int, int], int]] = []
+    state = end_state
+    while parent[state] is not None:
+        prev_node, prev_want, ek, delta = parent[state]
+        path.append((ek, delta))
+        state = (prev_node, prev_want)
+    path.reverse()
+    return path
+
+
 def _infer_bond_orders(mol, edges, G, nodes, atom_symbols):
     """Infer bond orders based on valence requirements."""
     # Get target valences
@@ -370,6 +499,86 @@ def _infer_bond_orders(mol, edges, G, nodes, atom_symbols):
         current_valence[u] += 1
         current_valence[v] += 1
 
+
+    # ── Ring-aware Kekulé pre-pass (2026-04-28) ─────────────────────────
+    # The greedy + 1-hop-swap loop below cannot reliably alternate
+    # double bonds around aromatic rings (especially fused systems like
+    # naphthalene/quinoline), and locks in wrong commitments that the
+    # downstream sanitiser then "fixes" by neutralising charges and
+    # adding stray hydrogens.
+    #
+    # Strategy: detect rings via cycle basis on the heavy-atom skeleton
+    # and, for each ring whose atoms collectively carry valence deficit
+    # (aromatic ring → every ring atom has deficit ≥ 1; or a 5-ring
+    # with one heteroatom donor → exactly one atom with deficit 0),
+    # assign double bonds in alternating fashion BEFORE running the
+    # greedy pass. Saturated rings (cyclohexane, piperidine etc.) have
+    # zero deficits and are skipped — so this is safe even though the
+    # encoder only records ``is_in_ring`` (not ``is_aromatic``).
+    #
+    # Process smallest rings first so fused systems (quinoline) settle
+    # one ring at a time, with the shared edge already committed when
+    # the second ring is processed.
+    skeleton = nx.Graph()
+    skeleton.add_nodes_from(range(len(nodes)))
+    skeleton.add_edges_from(edges)
+    try:
+        cycles = nx.cycle_basis(skeleton)
+    except Exception:
+        cycles = []
+    cycles.sort(key=len)
+
+    def _edge_key(a: int, b: int) -> tuple[int, int]:
+        return (min(a, b), max(a, b))
+
+    for cycle in cycles:
+        n = len(cycle)
+        if n < 3:
+            continue
+        deficits = [target_valence[a] - current_valence[a] for a in cycle]
+        ring_edges = [_edge_key(cycle[i], cycle[(i + 1) % n]) for i in range(n)]
+
+        # Skip rings with no deficit anywhere — they are saturated.
+        if all(d <= 0 for d in deficits):
+            continue
+        # Skip rings where the deficit pattern is incompatible with
+        # alternating doubles (e.g. only one atom has deficit) — let
+        # the greedy fallback try to handle it.
+        n_with_deficit = sum(1 for d in deficits if d > 0)
+        if n_with_deficit < 2:
+            continue
+
+        # Try both alternating phases. For each phase, simulate the
+        # promotions and count satisfied atoms; pick the better one.
+        best_phase = None
+        best_score = -1
+        for phase in (0, 1):
+            promotions: list[tuple[int, int]] = []
+            sim_def = list(deficits)
+            for i in range(phase, n, 2):
+                u_idx, v_idx = i, (i + 1) % n
+                a, b = cycle[u_idx], cycle[v_idx]
+                ek = _edge_key(a, b)
+                if (
+                    sim_def[u_idx] > 0
+                    and sim_def[v_idx] > 0
+                    and bond_orders[ek] < 3
+                ):
+                    promotions.append(ek)
+                    sim_def[u_idx] -= 1
+                    sim_def[v_idx] -= 1
+            score = sum(1 for d in sim_def if d == 0)
+            if score > best_score:
+                best_score = score
+                best_phase = promotions
+
+        if best_phase:
+            for ek in best_phase:
+                bond_orders[ek] += 1
+                a, b = ek
+                current_valence[a] += 1
+                current_valence[b] += 1
+
     # BUG FIX (2026-04-17): Fix bond orders in aromatic rings.
     #
     # A single greedy pass depends on edge iteration order: for a 6-membered
@@ -426,38 +635,44 @@ def _infer_bond_orders(mol, edges, G, nodes, atom_symbols):
                     changed = True
                     overall_changed = True
 
-        # Augmenting step: find one swap to unblock a stuck atom
+        # ── Multi-hop augmenting path (2026-04-28) ─────────────────────
+        # Replaces the previous 1-hop swap. Finds an alternating path
+        # (single → 2+ → single → ... → single) from one deficit atom to
+        # ANOTHER deficit atom via BFS, then flips it: singles become
+        # doubles, doubles become singles. Properties:
+        #
+        # • Both end atoms gain +1 valence (deficit reduced by 1).
+        # • Every intermediate atom has exactly two incident edges in
+        #   the path with opposite deltas (+1 and -1) → net 0 valence
+        #   change → its HDC-determined target stays satisfied.
+        # • Reduces total deficit by exactly 2 per path (vs. 1-hop which
+        #   only relocates deficit and depends on subsequent iterations).
+        #
+        # This is the standard b-matching augmenting-path formulation,
+        # and is strictly more powerful than the 1-hop swap (1-hop is
+        # the length-1 special case). Necessary for cases where two
+        # deficit atoms sit several edges apart through saturated
+        # intermediates (e.g. ring atoms whose ring doubles must be
+        # shifted to satisfy exocyclic =O / =CH groups).
         augmented = False
         for atom in range(len(nodes)):
-            deficit = target_valence[atom] - current_valence[atom]
-            if deficit <= 0:
+            if target_valence[atom] - current_valence[atom] <= 0:
                 continue
-            for nbr in adj.get(atom, []):
-                edge_key = (min(atom, nbr), max(atom, nbr))
-                if bond_orders[edge_key] >= 3:
-                    continue
-                nbr_deficit = target_valence[nbr] - current_valence[nbr]
-                if nbr_deficit > 0:
-                    continue  # Both have deficit — greedy pass handles this
-                # nbr is satisfied; find one of its OTHER double+ bonds to downgrade
-                for nbr2 in adj.get(nbr, []):
-                    if nbr2 == atom:
-                        continue
-                    edge_key2 = (min(nbr, nbr2), max(nbr, nbr2))
-                    if bond_orders[edge_key2] <= 1:
-                        continue
-                    # Downgrade nbr-nbr2, upgrade atom-nbr
-                    bond_orders[edge_key2] -= 1
-                    current_valence[nbr2] -= 1
-                    bond_orders[edge_key] += 1
-                    current_valence[atom] += 1
-                    augmented = True
-                    overall_changed = True
-                    break
-                if augmented:
-                    break
-            if augmented:
-                break
+            path = _find_augmenting_path(
+                atom, target_valence, current_valence, bond_orders, adj,
+            )
+            if path is None:
+                continue
+            # Apply path flip: each (edge_key, delta) updates bond order
+            # AND both endpoint valences. Order of application doesn't
+            # matter because the deltas balance per intermediate atom.
+            for ek, delta in path:
+                bond_orders[ek] += delta
+                current_valence[ek[0]] += delta
+                current_valence[ek[1]] += delta
+            augmented = True
+            overall_changed = True
+            break
 
     # Convert to RDKit bond types
     bond_type_map = {

@@ -1,0 +1,5 @@
+# Fingerprint -> HDC translator trained on the QM9 SMILES dataset.
+# Inherits everything from train_fingerprint_to_hdc.py and only swaps CSV_PATH.
+extend: train_fingerprint_to_hdc.py
+parameters:
+  CSV_PATH: data/qm9_smiles.csv

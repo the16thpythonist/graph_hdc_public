@@ -52,6 +52,12 @@ htmlcov/
 .ruff_cache/
 .mypy_cache/
 
+# Local Claude Code session state
+.claude/
+
+# PyComex experiment caches (multi-GB)
+experiments/**/.cache/
+
 # Experiments results and checkpoints
 experiments/results/
 experiments/**/results/

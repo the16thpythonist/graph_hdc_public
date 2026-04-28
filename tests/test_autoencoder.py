@@ -13,7 +13,8 @@ from graph_hdc.models.autoencoder import (
 
 DATA_DIM = 64
 LATENT_DIM = 16
-ENCODER_HIDDEN = [32]
+TRUNK_DIM = 32
+N_BLOCKS = 1
 
 
 @pytest.fixture
@@ -21,7 +22,9 @@ def model():
     return HDCAutoencoder(
         data_dim=DATA_DIM,
         latent_dim=LATENT_DIM,
-        encoder_hidden_dims=ENCODER_HIDDEN,
+        trunk_dim=TRUNK_DIM,
+        n_encoder_blocks=N_BLOCKS,
+        n_decoder_blocks=N_BLOCKS,
     )
 
 
@@ -44,7 +47,9 @@ class TestSaveLoad:
         loaded = HDCAutoencoder.load(path)
         assert loaded.hparams["data_dim"] == DATA_DIM
         assert loaded.hparams["latent_dim"] == LATENT_DIM
-        assert loaded.hparams["encoder_hidden_dims"] == ENCODER_HIDDEN
+        assert loaded.hparams["trunk_dim"] == TRUNK_DIM
+        assert loaded.hparams["n_encoder_blocks"] == N_BLOCKS
+        assert loaded.hparams["n_decoder_blocks"] == N_BLOCKS
 
     def test_save_load_roundtrip(self, model, sample_input, tmp_path):
         path = tmp_path / "model.ckpt"
@@ -64,7 +69,9 @@ class TestSaveLoad:
         model = HDCAutoencoder(
             data_dim=DATA_DIM,
             latent_dim=LATENT_DIM,
-            encoder_hidden_dims=ENCODER_HIDDEN,
+            trunk_dim=TRUNK_DIM,
+            n_encoder_blocks=N_BLOCKS,
+            n_decoder_blocks=N_BLOCKS,
             recon_loss_type=loss_type,
         )
         model.eval()
@@ -86,7 +93,9 @@ class TestSaveLoad:
         model = HDCAutoencoder(
             data_dim=DATA_DIM,
             latent_dim=LATENT_DIM,
-            encoder_hidden_dims=ENCODER_HIDDEN,
+            trunk_dim=TRUNK_DIM,
+            n_encoder_blocks=N_BLOCKS,
+            n_decoder_blocks=N_BLOCKS,
             variational=True,
         )
         model.eval()

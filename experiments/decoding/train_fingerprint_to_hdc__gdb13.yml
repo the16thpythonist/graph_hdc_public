@@ -1,0 +1,15 @@
+# Fingerprint -> HDC translator trained on the GDB-13 ABCDEFGH subset.
+# Inherits everything from train_fingerprint_to_hdc.py and only swaps CSV_PATH.
+#
+# The GDB-13 ABCDEFGH subset applies all 8 cumulative drug-likeness + scaffold
+# filters defined by Blum, van Deursen, Reymond (2011):
+#     "Visualisation and subsets of the chemical universe database GDB-13 for
+#     virtual screening", J. Comput-Aided Mol. Des. 25:637–647 (Table 2).
+# Contains ~1.47M molecules — the most restrictive cumulative subset of
+# GDB-13 (from A=~635M down to ABCDEFGH=~1.4M).
+#
+# Downloaded from: https://zenodo.org/record/5172018/files/GDB13_Subset-ABCDEFGH.smi.gz
+# Preprocessed into data/gdb13_abcdefgh_smiles.csv (header "smiles", 1,470,284 rows).
+extend: train_fingerprint_to_hdc.py
+parameters:
+  CSV_PATH: data/gdb13_abcdefgh_smiles.csv

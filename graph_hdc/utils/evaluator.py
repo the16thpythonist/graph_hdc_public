@@ -11,12 +11,124 @@ from collections.abc import Callable
 import networkx as nx
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import QED, AllChem, Crippen, DataStructs
+from rdkit.Chem import QED, AllChem, Crippen, DataStructs, Descriptors
 from rdkit.Contrib.SA_Score import sascorer
 
 from graph_hdc.datasets import QM9Smiles, ZincSmiles
 from graph_hdc.hypernet import CorrectionLevel
 from graph_hdc.utils.chem import canonical_key, is_valid_molecule, reconstruct_for_eval
+
+
+# 3x3 grid property configuration: (key, display label, histogram range, RDKit fn).
+# Order defines both the output dict keys and the panel layout (row-major).
+PROPERTY_GRID_CONFIG: list[tuple[str, str, tuple[float, float], Callable]] = [
+    ("logp",                "logP",               (-5.0, 10.0),  lambda m: Crippen.MolLogP(m)),
+    ("qed",                 "QED",                (0.0, 1.0),    lambda m: QED.qed(m)),
+    ("sa_score",            "SA Score",           (1.0, 10.0),   lambda m: sascorer.calculateScore(m)),
+    ("heavy_atoms",         "Heavy atoms",        (0.0, 50.0),   lambda m: float(m.GetNumHeavyAtoms())),
+    ("max_ring_size",       "Max ring size",      (0.0, 20.0),   lambda m: float(rdkit_max_ring_size(m))),
+    ("fraction_sp3",        "Fraction sp3",       (0.0, 1.0),    lambda m: Descriptors.FractionCSP3(m)),
+    ("num_rings",           "# Rings",            (0.0, 10.0),   lambda m: float(Descriptors.RingCount(m))),
+    ("num_aromatic_rings",  "# Aromatic rings",   (0.0, 8.0),    lambda m: float(Descriptors.NumAromaticRings(m))),
+    ("num_rotatable_bonds", "# Rotatable bonds",  (0.0, 15.0),   lambda m: float(Descriptors.NumRotatableBonds(m))),
+]
+
+
+def compute_property_dict(mols: list[Chem.Mol]) -> dict[str, list[float]]:
+    """Compute all 9 grid properties for a list of valid molecules."""
+    out: dict[str, list[float]] = {key: [] for key, _, _, _ in PROPERTY_GRID_CONFIG}
+    for m in mols:
+        if m is None:
+            continue
+        for key, _, _, fn in PROPERTY_GRID_CONFIG:
+            try:
+                out[key].append(float(fn(m)))
+            except Exception:
+                pass
+    return out
+
+
+def histogram_kl_divergence(
+    gen: list[float] | np.ndarray,
+    ref: list[float] | np.ndarray,
+    bins: int = 100,
+    value_range: tuple[float, float] | None = None,
+    eps: float = 1e-10,
+) -> float:
+    """KL(gen || ref) between histograms of two scalar distributions."""
+    gen_arr = np.asarray(gen, dtype=float)
+    ref_arr = np.asarray(ref, dtype=float)
+    if gen_arr.size == 0 or ref_arr.size == 0:
+        return float("nan")
+    if value_range is None:
+        lo = min(float(gen_arr.min()), float(ref_arr.min()))
+        hi = max(float(gen_arr.max()), float(ref_arr.max()))
+        if hi == lo:
+            return 0.0
+        value_range = (lo, hi)
+    gen_hist, _ = np.histogram(gen_arr, bins=bins, range=value_range, density=False)
+    ref_hist, _ = np.histogram(ref_arr, bins=bins, range=value_range, density=False)
+    p = gen_hist.astype(float) + eps
+    q = ref_hist.astype(float) + eps
+    p = p / p.sum()
+    q = q / q.sum()
+    return float(np.sum(p * (np.log(p) - np.log(q))))
+
+
+def compute_fcd_score(
+    gen_smiles: list[str],
+    ref_smiles: list[str],
+    device: str = "cpu",
+) -> float:
+    """Fréchet ChemNet Distance between two SMILES lists."""
+    try:
+        from fcd_torch import FCD
+    except ImportError:
+        return float("nan")
+    try:
+        fcd = FCD(device=device, n_jobs=1, canonize=True)
+        return float(fcd(ref=ref_smiles, gen=gen_smiles))
+    except Exception:
+        return float("nan")
+
+
+def plot_property_grid(
+    gen_props: dict[str, list[float]],
+    ref_props: dict[str, list[float]],
+    kl_values: dict[str, float] | None = None,
+    title: str | None = None,
+):
+    """Render a 3x3 grid of overlaid histograms (gen vs reference)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    bins = 40
+    for ax, (key, label, vrange, _) in zip(axes.flat, PROPERTY_GRID_CONFIG, strict=False):
+        gen_vals = gen_props.get(key, [])
+        ref_vals = ref_props.get(key, [])
+        if ref_vals:
+            ax.hist(
+                ref_vals, bins=bins, range=vrange, density=True,
+                color="tab:gray", alpha=0.55, label=f"dataset (n={len(ref_vals)})",
+            )
+        if gen_vals:
+            ax.hist(
+                gen_vals, bins=bins, range=vrange, density=True,
+                color="tab:red", alpha=0.55, label=f"generated (n={len(gen_vals)})",
+            )
+        title_str = label
+        if kl_values is not None and key in kl_values and np.isfinite(kl_values[key]):
+            title_str += f"   KL={kl_values[key]:.3f}"
+        ax.set_title(title_str)
+        ax.set_xlabel(label)
+        ax.set_ylabel("density")
+        ax.legend(loc="best", fontsize=8)
+    if title:
+        fig.suptitle(title, fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    return fig
 
 
 def rdkit_logp(m: Chem.Mol) -> float:
@@ -116,6 +228,18 @@ class GenerationEvaluator:
         self.sims: list[float] | None = None
         self.correction_levels: list[CorrectionLevel] | None = None
 
+        # Optional injected reference property distributions (used for KL).
+        # Populated via set_reference_properties(); not computed eagerly.
+        self._reference_properties: dict[str, list[float]] | None = None
+
+    def set_reference_properties(self, props: dict[str, list[float]]) -> None:
+        """Inject pre-computed reference (training-set) property distributions.
+
+        Expected keys match ``PROPERTY_GRID_CONFIG``.  Used by ``evaluate()``
+        when ``compute_kl=True`` to compute per-property KL divergences.
+        """
+        self._reference_properties = dict(props)
+
     def to_mols_and_validate(self, samples: list[nx.Graph]) -> tuple[list[Chem.Mol | None], list[bool]]:
         """Convert NetworkX graphs to RDKit molecules and validate."""
         mols: list[Chem.Mol | None] = []
@@ -135,6 +259,10 @@ class GenerationEvaluator:
         final_flags: list[bool],
         sims: list[float],
         correction_levels: list[CorrectionLevel],
+        *,
+        compute_kl: bool = False,
+        compute_fcd: bool = False,
+        fcd_device: str = "cpu",
     ) -> dict[str, float]:
         """
         Evaluate unconditional generation metrics.
@@ -228,7 +356,34 @@ class GenerationEvaluator:
                 prop_stats["max_ring_size_mean"] = float("nan")
                 prop_stats["max_ring_size_std"] = float("nan")
 
-        return {
+        # Optional: per-property KL divergence against injected reference.
+        # Also attaches ``_gen_properties`` (the full 9-property dict) so
+        # callers can render the distribution grid without recomputing.
+        kl_block: dict[str, float] = {}
+        gen_props: dict[str, list[float]] | None = None
+        if compute_kl and valid_mols:
+            gen_props = compute_property_dict(valid_mols)
+            ref = self._reference_properties
+            if ref is not None:
+                for key, _, vrange, _ in PROPERTY_GRID_CONFIG:
+                    kl_block[f"kl_{key}"] = histogram_kl_divergence(
+                        gen_props.get(key, []),
+                        ref.get(key, []),
+                        bins=100,
+                        value_range=vrange,
+                    )
+
+        # Optional: Fréchet ChemNet Distance against the training set.
+        fcd_block: dict[str, float] = {}
+        if compute_fcd and valid_mols:
+            gen_smiles = [canonical_key(m) for m in valid_mols]
+            gen_smiles = [s for s in gen_smiles if s]
+            if gen_smiles and self.train_smiles_list:
+                fcd_block["fcd"] = compute_fcd_score(
+                    gen_smiles, self.train_smiles_list, device=fcd_device,
+                )
+
+        result: dict = {
             "dataset": self.base_dataset,
             "final_flags": 100.0 * sum(final_flags) / n_samples if n_samples else 0.0,
             "validity": validity,
@@ -239,7 +394,14 @@ class GenerationEvaluator:
             "internal_diversity_p2": internal_div_p2,
             "cos_sim": sims_eval,
             **prop_stats,
+            **kl_block,
+            **fcd_block,
         }
+        if gen_props is not None:
+            # Under a leading underscore so pycomex-style plain dict logging
+            # doesn't try to serialize the whole distribution.
+            result["_gen_properties"] = gen_props
+        return result
 
     def evaluate_conditional(
         self,

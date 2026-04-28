@@ -2,13 +2,15 @@
 """
 Train Fingerprint-to-HDC Translation Network.
 
-Trains a deep residual MLP (TranslatorMLP) to map ECFP4 Morgan fingerprints
-(2048-bit) to HDC hypervectors.  After training, evaluates end-to-end
-molecular reconstruction:
+Trains a SwiGLU residual MLP (TranslatorMLP) to map ECFP4 Morgan fingerprints
+(2048-bit) to HDC hypervectors of the form ``[edge_terms | graph_embedding]``
+(the same target format used by the autoencoder experiment).  After training,
+evaluates end-to-end molecular reconstruction via the HyperNet's greedy
+decoder:
 
-    SMILES → ECFP4 → TranslatorMLP → predicted HDC
-        → decode_nodes_from_hdc → FlowEdgeDecoder.sample() → graph
-        → compare with original molecule
+    SMILES → ECFP4 → TranslatorMLP → predicted [edge_terms | graph_embedding]
+           → hypernet.decode_graph_greedy → reconstruct_for_eval → RDKit mol
+           → compare with original molecule.
 
 This is the BASE EXPERIMENT.  Child experiments can inherit via
 Experiment.extend() and override hooks to swap the model architecture
@@ -20,8 +22,7 @@ Usage:
 
     # Full training (uses data/qm9_smiles.csv by default)
     python train_fingerprint_to_hdc.py \\
-        --HYPERNET_PATH /path/to/encoder.ckpt \\
-        --FLOW_EDGE_DECODER_PATH /path/to/decoder.ckpt
+        --HYPERNET_PATH /path/to/encoder.ckpt
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from pytorch_lightning import Trainer
@@ -47,27 +49,19 @@ from pytorch_lightning.loggers import CSVLogger
 from rdkit import Chem
 from rdkit.Chem import rdFingerprintGenerator
 from torch.utils.data import DataLoader, TensorDataset
-from torch_geometric.data import Data
 
 from graph_hdc.datasets.zinc_smiles import mol_to_data as mol_to_zinc_data
 from graph_hdc.hypernet import load_hypernet
+from graph_hdc.hypernet.configs import FallbackDecoderSettings
 from graph_hdc.hypernet.multi_hypernet import MultiHyperNet
-from graph_hdc.models.flow_edge_decoder import (
-    FlowEdgeDecoder,
-    get_node_feature_bins,
-    node_tuples_to_onehot,
-    preprocess_for_flow_edge_decoder,
-)
 from graph_hdc.models.translator_mlp import TranslatorMLP
+from graph_hdc.utils.chem import reconstruct_for_eval
 from graph_hdc.utils.experiment_helpers import (
     GracefulInterruptHandler,
-    compute_hdc_distance,
     compute_tanimoto_similarity,
     create_reconstruction_plot,
-    decode_nodes_from_hdc,
     get_canonical_smiles,
     is_valid_mol,
-    pyg_to_mol,
 )
 
 # =============================================================================
@@ -100,8 +94,16 @@ TEST_RATIO: float = 0.1
 
 # :param HYPERNET_PATH:
 #     Path to a saved HyperNet / MultiHyperNet / RRWPHyperNet checkpoint.
-#     This encoder is used to compute the ground-truth HDC targets.
-HYPERNET_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/hypernet_encoder.ckpt"
+#     This encoder is used both to compute the ground-truth HDC targets and
+#     to greedily decode predicted HDC vectors back to molecular graphs.
+#     Matches the encoder used in the autoencoder experiment.
+HYPERNET_PATH: str = "/media/ssd2/Programming/_branch/graph_hdc_public/experiments/encoders/zinc_d1024_depth3_k6_10_14_b8.ckpt"
+
+# :param DATASET:
+#     Dataset key passed to ``reconstruct_for_eval`` during evaluation. Kept
+#     as ``"zinc"`` even for QM9 CSVs because the loaded hypernet was trained
+#     on ZINC and ``mol_to_zinc_data`` produces ZINC-schema node features.
+DATASET: str = "zinc"
 
 # -----------------------------------------------------------------------------
 # Fingerprint
@@ -120,21 +122,19 @@ FP_NBITS: int = 2048
 # -----------------------------------------------------------------------------
 
 # :param HIDDEN_DIMS:
-#     Hidden layer dimensions for the TranslatorMLP.  Consecutive equal dims
-#     produce residual blocks; dimension changes use linear projections.
-HIDDEN_DIMS: tuple = (1024 * 4, 1024 * 2, 1024 * 2, 1024, 1024, 1024, 1024, 1024 * 2, 1024 * 2, 1024 * 4)
+#     Hidden-stage widths for the TranslatorMLP. Each entry produces a
+#     ProjectionBlock: Linear(prev, h) followed by ``RESBLOCK_DEPTH`` SwiGLU
+#     residual blocks at width h. A final plain Linear maps to the HDC dim.
+HIDDEN_DIMS: tuple = (2048, 2048, 2048, 2048)
 
-# :param ACTIVATION:
-#     Activation function.  One of "relu", "gelu", "silu", "leaky_relu", "tanh".
-ACTIVATION: str = "relu"
+# :param RESBLOCK_DEPTH:
+#     Number of SwiGLU residual blocks stacked inside each ProjectionBlock.
+RESBLOCK_DEPTH: int = 2
 
-# :param NORM:
-#     Normalisation layer.  One of "lay_norm", "batch_norm", "none".
-NORM: str = "lay_norm"
-
-# :param DROPOUT:
-#     Dropout probability inside residual / projection blocks.
-DROPOUT: float = 0.25
+# :param BERHU_C_FRACTION:
+#     Fraction of the batch's max absolute residual used as the BerHu
+#     threshold c (detached). Values < c are L1, values > c are L2-scaled.
+BERHU_C_FRACTION: float = 0.1
 
 # -----------------------------------------------------------------------------
 # Training
@@ -146,43 +146,24 @@ EPOCHS: int = 500
 
 # :param BATCH_SIZE:
 #     Mini-batch size.
-BATCH_SIZE: int = 256
+BATCH_SIZE: int = 64
 
 # :param LEARNING_RATE:
 #     Initial learning rate for AdamW.
-LEARNING_RATE: float = 2e-4
+LEARNING_RATE: float = 1e-4
 
 # :param WEIGHT_DECAY:
 #     Weight decay (L2 regularization).
-WEIGHT_DECAY: float = 0e-5
-
-# :param COSINE_LOSS_WEIGHT:
-#     Weight of the cosine-similarity loss component.
-COSINE_LOSS_WEIGHT: float = 1.0
-
-# :param MSE_LOSS_WEIGHT:
-#     Weight of the MSE loss component.
-MSE_LOSS_WEIGHT: float = 1.0
-
-# :param INFONCE_LOSS_WEIGHT:
-#     Weight of the InfoNCE (NT-Xent) contrastive loss component.
-#     Encourages the model to preserve neighborhood structure: similar
-#     fingerprints map to similar HDC vectors.  Set to 0.0 to disable.
-INFONCE_LOSS_WEIGHT: float = 0.1
-
-# :param INFONCE_TEMPERATURE:
-#     Temperature for InfoNCE softmax.  Lower = sharper distribution
-#     (harder negatives).  Typical range: 0.05–0.1.
-INFONCE_TEMPERATURE: float = 0.07
+WEIGHT_DECAY: float = 1e-4
 
 # :param WARMUP_EPOCHS:
 #     Number of epochs for linear LR warmup.  Set to 0 to disable warmup.
-WARMUP_EPOCHS: int = 10
+WARMUP_EPOCHS: int = 3
 
 # :param USE_PROCRUSTES_INIT:
 #     Whether to initialize the output layer via least-squares (Procrustes)
 #     fit on the training data before training begins.
-USE_PROCRUSTES_INIT: bool = True
+USE_PROCRUSTES_INIT: bool = False
 
 # :param PROCRUSTES_NUM_SAMPLES:
 #     Number of training samples used for the Procrustes fit.
@@ -194,43 +175,52 @@ PROCRUSTES_NUM_SAMPLES: int = 0
 GRADIENT_CLIP_VAL: float = 1.0
 
 # -----------------------------------------------------------------------------
-# FlowEdgeDecoder (evaluation only)
+# Greedy Decoder (evaluation only)
 # -----------------------------------------------------------------------------
 
-# :param FLOW_EDGE_DECODER_PATH:
-#     Path to a pre-trained FlowEdgeDecoder checkpoint (.ckpt).
-#     Used only during the end-of-training reconstruction evaluation.
-FLOW_EDGE_DECODER_PATH: str = "/media/ssd2/Programming/graph_hdc_public/experiments/decoding/results/train_flow_edge_decoder_streaming/GOOD/last.ckpt"
+# :param BEAM_SIZE:
+#     Beam width for ``hypernet.decode_graph_greedy``. Larger values recover
+#     more graphs but scale roughly linearly in decode cost.
+BEAM_SIZE: int = 32
 
-# :param SAMPLE_STEPS:
-#     Number of denoising steps for FlowEdgeDecoder sampling.
-SAMPLE_STEPS: int = 50
+# :param LIMIT:
+#     Population limit for the greedy beam search.
+LIMIT: int = 2048
 
-# :param ETA:
-#     Stochasticity parameter for FlowEdgeDecoder sampling.
-ETA: float = 0.0
-
-# :param SAMPLE_TIME_DISTORTION:
-#     Time distortion during sampling.  Options: "identity", "polydec".
-SAMPLE_TIME_DISTORTION: str = "polydec"
-
-# :param NUM_REPETITIONS:
-#     Best-of-N repetitions per molecule during FlowEdgeDecoder sampling.
-#     Each molecule is decoded this many times and the result with the
-#     lowest HDC cosine distance is kept.
-NUM_REPETITIONS: int = 128
+# :param TOP_K:
+#     Top-k candidates considered at each greedy step.
+TOP_K: int = 1
 
 # -----------------------------------------------------------------------------
-# Evaluation
+# Intermediate reconstruction eval (during training)
+# -----------------------------------------------------------------------------
+
+# :param RECON_EVAL_EVERY_N_EPOCHS:
+#     Run an intermediate molecular-reconstruction eval every N validation
+#     epochs. Set to 0 to disable.
+RECON_EVAL_EVERY_N_EPOCHS: int = 10
+
+# :param RECON_EVAL_N_SAMPLES:
+#     Number of (test_data) molecules used for each intermediate eval.
+RECON_EVAL_N_SAMPLES: int = 25
+
+# :param RECON_EVAL_BEAM_SIZE:
+#     Beam width for the *intermediate* greedy decode. Smaller than the final
+#     eval's BEAM_SIZE to keep the periodic eval cheap.
+RECON_EVAL_BEAM_SIZE: int = 8
+
+# :param RECON_EVAL_LIMIT:
+#     Population limit for the *intermediate* greedy decode.
+RECON_EVAL_LIMIT: int = 1024
+
+# -----------------------------------------------------------------------------
+# Evaluation (end of training)
 # -----------------------------------------------------------------------------
 
 # :param NUM_TEST_SAMPLES:
-#     Maximum number of test molecules to run through reconstruction eval.
+#     Maximum number of test molecules to run through the final reconstruction
+#     eval at the end of training.
 NUM_TEST_SAMPLES: int = 100
-
-# :param RECONSTRUCTION_BATCH_SIZE:
-#     Batch size for FlowEdgeDecoder sampling during evaluation.
-RECONSTRUCTION_BATCH_SIZE: int = 1
 
 # -----------------------------------------------------------------------------
 # System
@@ -268,43 +258,46 @@ __TESTING__: bool = False
 
 class TrainingMetricsCallback(Callback):
     """
-    Track per-epoch training diagnostics and produce a 2x4 metrics grid.
+    Per-epoch training diagnostics for the BerHu fingerprint\u2192HDC translator.
 
-    Tracks losses (combined, cosine, MSE), cosine similarity, learning rate,
-    gradient norm, parameter delta, and weight norm.  After each validation
-    epoch the plot is overwritten so the latest version is always on disk.
+    Produces a 2x5 grid:
+        Row 1: train/val loss, per-sample val loss histogram, per-sample val
+               cosine-sim histogram, mean\u00b1IQR cosine sim, mean\u00b1std L2.
+        Row 2: learning rate, gradient norm, parameter delta, weight norm,
+               train-val overfit gap.
+
+    Per-sample val stats (loss, cosine, L2) are pulled directly off the
+    LightningModule \u2014 TranslatorMLP stashes them during validation_step.
     """
 
     def __init__(self, experiment: Experiment):
         super().__init__()
         self.experiment = experiment
 
-        # Loss curves
+        # Per-epoch scalar curves.
         self.train_loss: list[float] = []
         self.val_loss: list[float] = []
-        self.train_cosine: list[float] = []
-        self.val_cosine: list[float] = []
-        self.train_mse: list[float] = []
-        self.val_mse: list[float] = []
-
-        # Derived: cosine similarity = 1 - cosine_loss
-        self.cosine_sim_train: list[float] = []
-        self.cosine_sim_val: list[float] = []
-
-        # InfoNCE loss
-        self.train_infonce: list[float] = []
-        self.val_infonce: list[float] = []
-
-        # Overfitting gap
         self.overfit_gap: list[float] = []
-
-        # Training diagnostics
         self.lr: list[float] = []
         self.grad_norm: list[float] = []
         self.param_delta: list[float] = []
         self.weight_norm: list[float] = []
 
-        # Internal state
+        # Per-epoch distribution summaries (train and val).
+        self.cos_train_mean: list[float] = []
+        self.cos_train_q25: list[float] = []
+        self.cos_train_q75: list[float] = []
+        self.cos_val_mean: list[float] = []
+        self.cos_val_q25: list[float] = []
+        self.cos_val_q75: list[float] = []
+        self.l2_val_mean: list[float] = []
+        self.l2_val_std: list[float] = []
+
+        # Latest-epoch raw per-sample arrays for histograms.
+        self._latest_val_loss: np.ndarray | None = None
+        self._latest_val_cosine: np.ndarray | None = None
+
+        # Internal state.
         self._param_snapshot: dict[str, torch.Tensor] = {}
         self._last_grad_norm: float | None = None
 
@@ -315,19 +308,22 @@ class TrainingMetricsCallback(Callback):
     @staticmethod
     def _get_metric(trainer: Trainer, key: str) -> float | None:
         val = trainer.callback_metrics.get(key)
-        if val is not None:
-            return float(val)
-        return None
+        return float(val) if val is not None else None
 
     @staticmethod
     def _smooth(values: list[float], alpha: float = 0.3) -> list[float]:
-        """Exponential moving average for smoothed curves."""
         if not values:
             return []
         s = [values[0]]
         for v in values[1:]:
             s.append(alpha * v + (1 - alpha) * s[-1])
         return s
+
+    @staticmethod
+    def _collect_tensor_list(tensors: list[torch.Tensor]) -> np.ndarray | None:
+        if not tensors:
+            return None
+        return torch.cat(tensors, dim=0).numpy()
 
     # ------------------------------------------------------------------
     # Lightning hooks
@@ -348,33 +344,21 @@ class TrainingMetricsCallback(Callback):
         self._last_grad_norm = math.sqrt(total_norm_sq)
 
     def on_train_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
-        # Combined loss
         tl = self._get_metric(trainer, "train/loss")
         if tl is not None:
             self.train_loss.append(tl)
             self.experiment.track("loss_train", tl)
 
-        # Cosine loss
-        tc = self._get_metric(trainer, "train/cosine")
+        tc = self._get_metric(trainer, "train/cosine_sim")
         if tc is not None:
-            self.train_cosine.append(tc)
-            self.experiment.track("cosine_train", tc)
-            self.cosine_sim_train.append(1.0 - tc)
-            self.experiment.track("cosine_sim_train", 1.0 - tc)
+            # Train-time per-sample cosine isn't stored (would cost memory);
+            # use the epoch mean as both mean and IQR center.
+            self.cos_train_mean.append(tc)
+            self.cos_train_q25.append(tc)
+            self.cos_train_q75.append(tc)
+            self.experiment.track("cosine_sim_train", tc)
 
-        # MSE loss
-        tm = self._get_metric(trainer, "train/mse")
-        if tm is not None:
-            self.train_mse.append(tm)
-            self.experiment.track("mse_train", tm)
-
-        # InfoNCE loss
-        ti = self._get_metric(trainer, "train/infonce")
-        if ti is not None:
-            self.train_infonce.append(ti)
-            self.experiment.track("infonce_train", ti)
-
-        # Learning rate
+        # Learning rate.
         lr = None
         for opt in trainer.optimizers:
             for pg in opt.param_groups:
@@ -384,12 +368,12 @@ class TrainingMetricsCallback(Callback):
             self.lr.append(lr)
             self.experiment.track("learning_rate", lr)
 
-        # Gradient norm
+        # Gradient norm.
         if self._last_grad_norm is not None:
             self.grad_norm.append(self._last_grad_norm)
             self.experiment.track("grad_norm", self._last_grad_norm)
 
-        # Parameter delta and weight norm
+        # Parameter delta + weight norm.
         delta_sq = 0.0
         total_norm_sq = 0.0
         for n, p in pl_module.named_parameters():
@@ -408,31 +392,31 @@ class TrainingMetricsCallback(Callback):
             self.val_loss.append(vl)
             self.experiment.track("loss_val", vl)
 
-        vc = self._get_metric(trainer, "val/cosine")
-        if vc is not None:
-            self.val_cosine.append(vc)
-            self.experiment.track("cosine_val", vc)
-            self.cosine_sim_val.append(1.0 - vc)
-            self.experiment.track("cosine_sim_val", 1.0 - vc)
+        # Per-sample val distributions (stashed by TranslatorMLP).
+        losses = self._collect_tensor_list(getattr(pl_module, "_val_per_sample_loss", []))
+        cosines = self._collect_tensor_list(getattr(pl_module, "_val_per_sample_cosine", []))
+        l2s = self._collect_tensor_list(getattr(pl_module, "_val_per_sample_l2", []))
 
-        vm = self._get_metric(trainer, "val/mse")
-        if vm is not None:
-            self.val_mse.append(vm)
-            self.experiment.track("mse_val", vm)
+        self._latest_val_loss = losses
+        self._latest_val_cosine = cosines
 
-        # InfoNCE loss
-        vi = self._get_metric(trainer, "val/infonce")
-        if vi is not None:
-            self.val_infonce.append(vi)
-            self.experiment.track("infonce_val", vi)
+        if cosines is not None and cosines.size > 0:
+            self.cos_val_mean.append(float(np.mean(cosines)))
+            self.cos_val_q25.append(float(np.quantile(cosines, 0.25)))
+            self.cos_val_q75.append(float(np.quantile(cosines, 0.75)))
+            self.experiment.track("cosine_sim_val", self.cos_val_mean[-1])
 
-        # Overfitting gap (val - train; positive = overfitting)
+        if l2s is not None and l2s.size > 0:
+            self.l2_val_mean.append(float(np.mean(l2s)))
+            self.l2_val_std.append(float(np.std(l2s)))
+            self.experiment.track("l2_val_mean", self.l2_val_mean[-1])
+
+        # Overfit gap.
         if self.train_loss and self.val_loss:
             gap = self.val_loss[-1] - self.train_loss[-1]
             self.overfit_gap.append(gap)
             self.experiment.track("overfit_gap", gap)
 
-        # Generate figure (skip very first sanity-check validation)
         if len(self.val_loss) >= 2:
             self._plot(trainer)
 
@@ -447,74 +431,92 @@ class TrainingMetricsCallback(Callback):
             fontsize=14, fontweight="bold",
         )
 
-        epochs_t = list(range(1, len(self.train_loss) + 1))
-        epochs_v = list(range(1, len(self.val_loss) + 1))
-
-        # ---- Row 1, Col 1: Train/Val Combined Loss ----
+        # ---- Row 1, Col 1: Train/Val Loss (BerHu) ----
         ax = axes[0, 0]
         if self.train_loss:
-            ax.plot(epochs_t, self.train_loss, "C0", alpha=0.3, linewidth=0.8)
-            ax.plot(epochs_t, self._smooth(self.train_loss), "C0", label="train")
+            ep = list(range(1, len(self.train_loss) + 1))
+            ax.plot(ep, self.train_loss, "C0", alpha=0.3, linewidth=0.8)
+            ax.plot(ep, self._smooth(self.train_loss), "C0", label="train")
         if self.val_loss:
-            ax.plot(epochs_v, self.val_loss, "C1", alpha=0.3, linewidth=0.8)
-            ax.plot(epochs_v, self._smooth(self.val_loss), "C1", label="val")
+            ep = list(range(1, len(self.val_loss) + 1))
+            ax.plot(ep, self.val_loss, "C1", alpha=0.3, linewidth=0.8)
+            ax.plot(ep, self._smooth(self.val_loss), "C1", label="val")
             ax.axhline(min(self.val_loss), color="gray", linestyle=":", alpha=0.5)
             ax.annotate(
                 f"best: {min(self.val_loss):.4f}",
                 xy=(0.02, 0.02), xycoords="axes fraction", fontsize=8, color="gray",
             )
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Loss")
-        ax.set_title("Combined Loss")
+        ax.set_ylabel("BerHu Loss")
+        ax.set_title("Train / Val Loss")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-        # ---- Row 1, Col 2: Train/Val Cosine Loss ----
+        # ---- Row 1, Col 2: Per-sample Val Loss Histogram ----
         ax = axes[0, 1]
-        if self.train_cosine:
-            ep = list(range(1, len(self.train_cosine) + 1))
-            ax.plot(ep, self.train_cosine, "C0", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.train_cosine), "C0", label="train")
-        if self.val_cosine:
-            ep = list(range(1, len(self.val_cosine) + 1))
-            ax.plot(ep, self.val_cosine, "C1", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.val_cosine), "C1", label="val")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Cosine Loss")
-        ax.set_title("Cosine Loss (1 - sim)")
-        ax.legend(fontsize=8)
+        if self._latest_val_loss is not None and self._latest_val_loss.size > 0:
+            ax.hist(self._latest_val_loss, bins=40, color="C1", alpha=0.75)
+            ax.axvline(float(np.mean(self._latest_val_loss)), color="black",
+                       linestyle="--", alpha=0.7, label=f"mean {np.mean(self._latest_val_loss):.4f}")
+            ax.axvline(float(np.median(self._latest_val_loss)), color="gray",
+                       linestyle=":", alpha=0.7, label=f"median {np.median(self._latest_val_loss):.4f}")
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "no val samples yet", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10, color="gray")
+        ax.set_xlabel("Per-sample BerHu loss")
+        ax.set_ylabel("Count")
+        ax.set_title("Val Loss Distribution (latest epoch)")
         ax.grid(True, alpha=0.3)
 
-        # ---- Row 1, Col 3: Train/Val MSE Loss ----
+        # ---- Row 1, Col 3: Per-sample Val Cosine Similarity Histogram ----
         ax = axes[0, 2]
-        if self.train_mse:
-            ep = list(range(1, len(self.train_mse) + 1))
-            ax.plot(ep, self.train_mse, "C0", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.train_mse), "C0", label="train")
-        if self.val_mse:
-            ep = list(range(1, len(self.val_mse) + 1))
-            ax.plot(ep, self.val_mse, "C1", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.val_mse), "C1", label="val")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("MSE")
-        ax.set_title("MSE Loss")
-        ax.legend(fontsize=8)
+        if self._latest_val_cosine is not None and self._latest_val_cosine.size > 0:
+            ax.hist(self._latest_val_cosine, bins=40, color="C2", alpha=0.75,
+                    range=(-0.1, 1.0))
+            ax.axvline(float(np.mean(self._latest_val_cosine)), color="black",
+                       linestyle="--", alpha=0.7,
+                       label=f"mean {np.mean(self._latest_val_cosine):.3f}")
+            ax.axvline(float(np.median(self._latest_val_cosine)), color="gray",
+                       linestyle=":", alpha=0.7,
+                       label=f"median {np.median(self._latest_val_cosine):.3f}")
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "no val samples yet", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10, color="gray")
+        ax.set_xlabel("cos(pred, target)")
+        ax.set_ylabel("Count")
+        ax.set_title("Val Cosine Sim Distribution (latest)")
         ax.grid(True, alpha=0.3)
 
-        # ---- Row 1, Col 4: Mean Cosine Similarity ----
+        # ---- Row 1, Col 4: Cosine Sim Mean \u00b1 IQR over epochs ----
         ax = axes[0, 3]
-        if self.cosine_sim_train:
-            ep = list(range(1, len(self.cosine_sim_train) + 1))
-            ax.plot(ep, self.cosine_sim_train, "C0", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.cosine_sim_train), "C0", label="train")
-        if self.cosine_sim_val:
-            ep = list(range(1, len(self.cosine_sim_val) + 1))
-            ax.plot(ep, self.cosine_sim_val, "C1", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.cosine_sim_val), "C1", label="val")
+        if self.cos_train_mean:
+            ep = list(range(1, len(self.cos_train_mean) + 1))
+            ax.plot(ep, self.cos_train_mean, "C0", label="train (mean)")
+        if self.cos_val_mean:
+            ep = list(range(1, len(self.cos_val_mean) + 1))
+            ax.fill_between(ep, self.cos_val_q25, self.cos_val_q75,
+                            color="C1", alpha=0.25, label="val IQR")
+            ax.plot(ep, self.cos_val_mean, "C1", label="val (mean)")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Cosine Similarity")
-        ax.set_title("Mean Cosine Similarity")
+        ax.set_title("Cosine Sim \u2014 Mean / IQR")
         ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # ---- Row 1, Col 5: Val L2 distance mean \u00b1 std ----
+        ax = axes[0, 4]
+        if self.l2_val_mean:
+            ep = list(range(1, len(self.l2_val_mean) + 1))
+            lo = [m - s for m, s in zip(self.l2_val_mean, self.l2_val_std)]
+            hi = [m + s for m, s in zip(self.l2_val_mean, self.l2_val_std)]
+            ax.fill_between(ep, lo, hi, color="C3", alpha=0.25, label="\u00b1 std")
+            ax.plot(ep, self.l2_val_mean, "C3", label="mean")
+            ax.legend(fontsize=8)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("||pred - target||_2")
+        ax.set_title("Val L2 Distance")
         ax.grid(True, alpha=0.3)
 
         # ---- Row 2, Col 1: Learning Rate ----
@@ -559,27 +561,7 @@ class TrainingMetricsCallback(Callback):
         ax.set_title("Total Weight Norm")
         ax.grid(True, alpha=0.3)
 
-        # ---- Row 1, Col 5: InfoNCE Loss ----
-        ax = axes[0, 4]
-        if self.train_infonce:
-            ep = list(range(1, len(self.train_infonce) + 1))
-            ax.plot(ep, self.train_infonce, "C0", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.train_infonce), "C0", label="train")
-        if self.val_infonce:
-            ep = list(range(1, len(self.val_infonce) + 1))
-            ax.plot(ep, self.val_infonce, "C1", alpha=0.3, linewidth=0.8)
-            ax.plot(ep, self._smooth(self.val_infonce), "C1", label="val")
-        if not self.train_infonce and not self.val_infonce:
-            ax.text(0.5, 0.5, "InfoNCE disabled\n(weight = 0)",
-                    ha="center", va="center", transform=ax.transAxes,
-                    fontsize=10, color="gray")
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("InfoNCE")
-        ax.set_title("InfoNCE Loss")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-        # ---- Row 2, Col 5: Train-Val Gap (overfitting indicator) ----
+        # ---- Row 2, Col 5: Overfit Gap ----
         ax = axes[1, 4]
         if self.overfit_gap:
             ep = list(range(1, len(self.overfit_gap) + 1))
@@ -593,6 +575,231 @@ class TrainingMetricsCallback(Callback):
 
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         self.experiment.track("training_metrics", fig)
+        plt.close(fig)
+
+
+# =============================================================================
+# RECONSTRUCTION EVAL CALLBACK
+# =============================================================================
+
+
+class ReconstructionEvalCallback(Callback):
+    """
+    Periodic molecular-reconstruction evaluation during training.
+
+    Every ``every_n_epochs`` validation epochs, runs:
+        fingerprint -> TranslatorMLP -> predicted [edge_terms | graph_embedding]
+                    -> hypernet.decode_graph_greedy
+                    -> reconstruct_for_eval -> RDKit mol
+    on the first ``n_samples`` items of ``test_data``, and writes a
+    side-by-side (original | reconstructed) grid figure with SMILES in titles.
+
+    Tracks scalar metrics (validity, exact-match rate, mean Tanimoto, mean
+    cos(pred, gt)) via ``experiment.track`` so they auto-plot under .track/.
+    """
+
+    def __init__(
+        self,
+        experiment: Experiment,
+        hypernet,
+        test_data: List[Dict[str, Any]],
+        device: torch.device,
+        actual_hdc_dim: int,
+        dataset: str,
+        n_samples: int = 50,
+        every_n_epochs: int = 10,
+        beam_size: int = 8,
+        limit: int = 1024,
+        top_k: int = 1,
+        max_grid_pairs: int = 10,
+    ):
+        super().__init__()
+        self.experiment = experiment
+        self.hypernet = hypernet
+        self.test_data = test_data
+        self.device = device
+        self.hv_dim = actual_hdc_dim
+        self.dataset = dataset
+        self.n_samples = n_samples
+        self.every_n_epochs = every_n_epochs
+        self.decoder_settings = FallbackDecoderSettings(
+            beam_size=beam_size, limit=limit, top_k=top_k,
+        )
+        self.max_grid_pairs = max_grid_pairs
+
+        self._decode_device = hypernet.nodes_codebook.device
+        self._vsa_cls = hypernet.vsa.tensor_class
+
+    def on_validation_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.sanity_checking or self.every_n_epochs <= 0:
+            return
+        epoch = trainer.current_epoch
+        if epoch % self.every_n_epochs != 0:
+            return
+        self._evaluate(pl_module, epoch)
+
+    @torch.no_grad()
+    def _evaluate(self, model: pl.LightningModule, epoch: int) -> None:
+        from rdkit.Chem import AllChem, Draw
+
+        n = min(self.n_samples, len(self.test_data))
+        if n == 0:
+            return
+
+        self.experiment.log(
+            f"[ReconEval] Epoch {epoch}: decoding {n} molecules "
+            f"(beam={self.decoder_settings.beam_size}, limit={self.decoder_settings.limit})..."
+        )
+
+        was_training = model.training
+        model.eval()
+
+        n_valid = 0
+        n_exact = 0
+        tanimoto_sims: list[float] = []
+        cosines: list[float] = []
+        mol_pairs: list[tuple] = []  # (orig_mol, recon_mol, cos_sim, is_exact, orig_smi, recon_smi)
+
+        for idx in range(n):
+            item = self.test_data[idx]
+            original_smiles = item["smiles"]
+            fp = item["fingerprint"].unsqueeze(0).to(self.device)
+            gt_hdc = item["hdc_vector"].to(self.device)
+
+            orig_mol = Chem.MolFromSmiles(original_smiles)
+
+            pred_hdc = model(fp).squeeze(0)
+            cos_sim = float(F.cosine_similarity(pred_hdc, gt_hdc, dim=-1))
+            cosines.append(cos_sim)
+
+            pred_cpu = pred_hdc.detach().cpu()
+            edge_term = pred_cpu[:self.hv_dim].to(self._decode_device).as_subclass(self._vsa_cls)
+            graph_term = pred_cpu[self.hv_dim:].to(self._decode_device).as_subclass(self._vsa_cls)
+
+            recon_mol = None
+            recon_smi = None
+            try:
+                result = self.hypernet.decode_graph_greedy(
+                    edge_term=edge_term,
+                    graph_term=graph_term,
+                    decoder_settings=self.decoder_settings,
+                )
+                if result.nx_graphs:
+                    recon_mol = reconstruct_for_eval(result.nx_graphs[0], dataset=self.dataset)
+                    recon_smi = get_canonical_smiles(recon_mol)
+            except Exception:
+                pass
+
+            is_valid = is_valid_mol(recon_mol)
+
+            orig_canonical = None
+            if orig_mol is not None:
+                try:
+                    orig_canonical = Chem.MolToSmiles(Chem.RemoveAllHs(orig_mol), canonical=True)
+                except Exception:
+                    orig_canonical = get_canonical_smiles(orig_mol)
+            is_exact = (
+                is_valid
+                and recon_smi is not None
+                and orig_canonical is not None
+                and recon_smi == orig_canonical
+            )
+
+            tan = compute_tanimoto_similarity(orig_mol, recon_mol)
+            if is_valid:
+                n_valid += 1
+            if is_exact:
+                n_exact += 1
+            tanimoto_sims.append(tan)
+
+            mol_pairs.append((orig_mol, recon_mol, cos_sim, is_exact, original_smiles, recon_smi))
+
+        validity = 100.0 * n_valid / n
+        exact_match = 100.0 * n_exact / n
+        mean_tan = float(np.mean(tanimoto_sims)) if tanimoto_sims else 0.0
+        mean_cos = float(np.mean(cosines)) if cosines else 0.0
+
+        self.experiment.log(
+            f"[ReconEval] Epoch {epoch}: validity={validity:.1f}%, "
+            f"exact={exact_match:.1f}%, tanimoto={mean_tan:.3f}, "
+            f"cos(pred,gt)={mean_cos:.3f}"
+        )
+
+        self.experiment.track("recon_validity", validity)
+        self.experiment.track("recon_exact_match", exact_match)
+        self.experiment.track("recon_tanimoto", mean_tan)
+        self.experiment.track("recon_pred_gt_cosine", mean_cos)
+
+        # Side-by-side grid figure
+        self._save_grid(epoch, mol_pairs, validity, exact_match, mean_tan, AllChem, Draw)
+
+        if was_training:
+            model.train()
+
+    def _save_grid(
+        self,
+        epoch: int,
+        mol_pairs: list,
+        validity: float,
+        exact_match: float,
+        mean_tan: float,
+        AllChem,
+        Draw,
+    ) -> None:
+        n_grid = min(self.max_grid_pairs, len(mol_pairs))
+        if n_grid == 0:
+            return
+
+        fig, axes = plt.subplots(n_grid, 2, figsize=(8, 3 * n_grid))
+        if n_grid == 1:
+            axes = axes.reshape(1, 2)
+
+        fig.suptitle(
+            f"Epoch {epoch} — Validity: {validity:.1f}%, "
+            f"Exact: {exact_match:.1f}%, Tanimoto: {mean_tan:.3f}",
+            fontsize=12, fontweight="bold",
+        )
+
+        for i in range(n_grid):
+            orig_mol, recon_mol, cs, is_exact, orig_smi, recon_smi = mol_pairs[i]
+            ax_o, ax_r = axes[i, 0], axes[i, 1]
+            for ax in (ax_o, ax_r):
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+            # Original
+            if orig_mol is not None:
+                try:
+                    AllChem.Compute2DCoords(orig_mol)
+                    ax_o.imshow(Draw.MolToImage(orig_mol, size=(250, 250)))
+                except Exception:
+                    ax_o.text(0.5, 0.5, "Draw failed", ha="center", va="center",
+                              transform=ax_o.transAxes, fontsize=10, color="orange")
+            else:
+                ax_o.text(0.5, 0.5, "No original", ha="center", va="center",
+                          transform=ax_o.transAxes, fontsize=10, color="gray")
+            ax_o.set_title(f"Original: {orig_smi[:40]}", fontsize=7, color="black")
+
+            # Reconstructed
+            if recon_mol is not None:
+                try:
+                    AllChem.Compute2DCoords(recon_mol)
+                    ax_r.imshow(Draw.MolToImage(recon_mol, size=(250, 250)))
+                except Exception:
+                    ax_r.text(0.5, 0.5, "Draw failed", ha="center", va="center",
+                              transform=ax_r.transAxes, fontsize=10, color="orange")
+                color = "green" if is_exact else "blue"
+                label = "EXACT" if is_exact else f"cos={cs:+.3f}"
+                title = f"Recon ({label}): {(recon_smi or 'N/A')[:35]}"
+            else:
+                ax_r.text(0.5, 0.5, "Decode failed", ha="center", va="center",
+                          transform=ax_r.transAxes, fontsize=10, color="red")
+                color = "red"
+                title = "Recon: N/A"
+            ax_r.set_title(title, fontsize=7, color=color)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        self.experiment.track("reconstructions_grid", fig)
         plt.close(fig)
 
 
@@ -698,12 +905,11 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
     e.log(f"CSV:            {e.CSV_PATH}")
     e.log(f"HDC encoder:    {e.HYPERNET_PATH}")
-    e.log(f"Decoder ckpt:   {e.FLOW_EDGE_DECODER_PATH}")
+    e.log(f"Dataset key:    {e.DATASET}")
     e.log(f"FP radius={e.FP_RADIUS}, bits={e.FP_NBITS}")
     e.log(f"Hidden dims:    {e.HIDDEN_DIMS}")
     e.log(f"Epochs:         {e.EPOCHS}, batch={e.BATCH_SIZE}")
-    e.log(f"Loss weights:   cosine={e.COSINE_LOSS_WEIGHT}, mse={e.MSE_LOSS_WEIGHT}, "
-          f"infonce={e.INFONCE_LOSS_WEIGHT} (tau={e.INFONCE_TEMPERATURE})")
+    e.log(f"Resblock depth: {e.RESBLOCK_DEPTH}, BerHu c_fraction={e.BERHU_C_FRACTION}")
     e.log("=" * 60)
 
     # ── device ──
@@ -724,8 +930,8 @@ def experiment(e: Experiment) -> None:
     e["config/epochs"] = e.EPOCHS
     e["config/batch_size"] = e.BATCH_SIZE
     e["config/lr"] = e.LEARNING_RATE
-    e["config/cosine_weight"] = e.COSINE_LOSS_WEIGHT
-    e["config/mse_weight"] = e.MSE_LOSS_WEIGHT
+    e["config/resblock_depth"] = e.RESBLOCK_DEPTH
+    e["config/berhu_c_fraction"] = e.BERHU_C_FRACTION
 
     # =====================================================================
     # Load HyperNet Encoder
@@ -820,23 +1026,24 @@ def experiment(e: Experiment) -> None:
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        hypernet=hypernet,
+        test_data=test_data,
+        device=device,
+        actual_hdc_dim=actual_hdc_dim,
     )
 
     # =====================================================================
     # Evaluate (hook)
     # =====================================================================
 
-    if e.FLOW_EDGE_DECODER_PATH:
-        metrics = e.apply_hook(
-            "evaluate",
-            model=model,
-            hypernet=hypernet,
-            test_data=test_data,
-            device=device,
-            actual_hdc_dim=actual_hdc_dim,
-        )
-    else:
-        e.log("\nNo FLOW_EDGE_DECODER_PATH provided — skipping reconstruction evaluation.")
+    e.apply_hook(
+        "evaluate",
+        model=model,
+        hypernet=hypernet,
+        test_data=test_data,
+        device=device,
+        actual_hdc_dim=actual_hdc_dim,
+    )
 
     e.log("\n" + "=" * 60)
     e.log("Experiment completed!")
@@ -889,6 +1096,89 @@ def clean_data(
     return cleaned
 
 
+@experiment.hook("encode_molecules", default=True)
+def encode_molecules(
+    e: Experiment,
+    smiles_list: List[str],
+    hypernet,
+    device: torch.device,
+) -> List[Dict[str, Any]]:
+    """
+    Compute Morgan fingerprints and ground-truth HDC vectors for a list of
+    cleaned canonical SMILES. Molecules that fail any step (fingerprinting,
+    mol_to_data conversion, HDC preprocessing) are silently skipped.
+
+    Override this hook to swap the fingerprint type or HDC encoding pipeline.
+
+    Returns
+    -------
+    list[dict]
+        Each dict has keys: smiles, fingerprint (Tensor), hdc_vector (Tensor).
+    """
+    from torch_geometric.data import Batch as PyGBatch
+
+    needs_rw = (
+        hasattr(hypernet, "rw_config")
+        and hypernet.rw_config is not None
+        and getattr(hypernet.rw_config, "enabled", False)
+    )
+    if needs_rw:
+        from graph_hdc.utils.rw_features import augment_data_with_rw
+
+    e.log("Computing fingerprints and HDC vectors...")
+    out: list[dict] = []
+    skipped = 0
+    for i, smi in enumerate(smiles_list):
+        if (i + 1) % 5000 == 0:
+            e.log(f"  processed {i + 1}/{len(smiles_list)}...")
+
+        fp_arr = smiles_to_fingerprint(smi, radius=e.FP_RADIUS, n_bits=e.FP_NBITS)
+        if fp_arr is None:
+            skipped += 1
+            continue
+
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            skipped += 1
+            continue
+
+        try:
+            pyg_data = mol_to_zinc_data(mol)
+        except (ValueError, Exception):
+            skipped += 1
+            continue
+
+        if pyg_data.edge_index.numel() == 0:
+            # Greedy decoder requires edges; skip single-atom molecules.
+            skipped += 1
+            continue
+
+        if needs_rw:
+            pyg_data = augment_data_with_rw(
+                pyg_data,
+                k_values=hypernet.rw_config.k_values,
+                num_bins=hypernet.rw_config.num_bins,
+                bin_boundaries=hypernet.rw_config.bin_boundaries,
+                clip_range=hypernet.rw_config.clip_range,
+            )
+
+        batch = PyGBatch.from_data_list([pyg_data]).to(device)
+        with torch.no_grad():
+            hdc_out = hypernet.forward(batch)
+            edge_terms = hdc_out["edge_terms"].detach().cpu().float().view(-1)
+            graph_terms = hdc_out["graph_embedding"].detach().cpu().float().view(-1)
+        hdc_vec = torch.cat([edge_terms, graph_terms], dim=-1)
+
+        out.append({
+            "smiles": Chem.MolToSmiles(mol, canonical=True),
+            "fingerprint": torch.from_numpy(fp_arr),
+            "hdc_vector": hdc_vec,
+        })
+
+    e.log(f"Successfully processed {len(out)} molecules (skipped {skipped})")
+    return out
+
+
 @experiment.hook("load_data", default=True)
 def load_data(
     e: Experiment,
@@ -911,6 +1201,16 @@ def load_data(
     if not csv_path:
         raise ValueError("CSV_PATH is required.")
 
+    # Resolve a relative CSV_PATH against the repo root (two levels up from
+    # this file), so the experiment works regardless of CWD — in particular
+    # when launched via a YAML config from another directory.
+    p = Path(csv_path)
+    if not p.is_absolute() and not p.exists():
+        repo_root = Path(__file__).resolve().parents[2]
+        candidate = repo_root / p
+        if candidate.exists():
+            csv_path = str(candidate)
+
     e.log(f"\nLoading SMILES from {csv_path}...")
     smiles_list: list[str] = []
     with open(csv_path, newline="") as f:
@@ -926,61 +1226,46 @@ def load_data(
         smiles_list = smiles_list[:50]
         e.log(f"TESTING mode: using {len(smiles_list)} molecules")
 
-    # ── compute fingerprints + HDC vectors (with caching) ──
-
-    def _encode_all(smiles_to_encode):
-        """Clean, fingerprint, and HDC-encode a list of SMILES."""
-        cleaned = e.apply_hook("clean_data", smiles_list=smiles_to_encode)
-
-        e.log("Computing fingerprints and HDC vectors...")
-        out: list[dict] = []
-        skipped = 0
-        for i, smi in enumerate(cleaned):
-            if (i + 1) % 5000 == 0:
-                e.log(f"  processed {i + 1}/{len(cleaned)}...")
-
-            fp_arr = smiles_to_fingerprint(smi, radius=e.FP_RADIUS, n_bits=e.FP_NBITS)
-            if fp_arr is None:
-                skipped += 1
-                continue
-
-            mol = Chem.MolFromSmiles(smi)
-            if mol is None:
-                skipped += 1
-                continue
-
-            try:
-                pyg_data = mol_to_zinc_data(mol)
-            except (ValueError, Exception):
-                skipped += 1
-                continue
-
-            processed = preprocess_for_flow_edge_decoder(pyg_data, hypernet, device=device)
-            if processed is None:
-                skipped += 1
-                continue
-
-            hdc_vec = processed.hdc_vector.squeeze(0)  # (concat_hdc_dim,)
-
-            out.append({
-                "smiles": Chem.MolToSmiles(mol, canonical=True),
-                "fingerprint": torch.from_numpy(fp_arr),
-                "hdc_vector": hdc_vec,
-            })
-
-        e.log(f"Successfully processed {len(out)} molecules (skipped {skipped})")
-        return out
+    # ── cleaning + encoding (two-level caching) ──
 
     def _pack_records(records_list):
-        """Pack records into compact arrays for efficient cache serialization."""
-        return {
-            "smiles": [r["smiles"] for r in records_list],
-            "fingerprints": torch.stack([r["fingerprint"] for r in records_list]).numpy(),
-            "hdc_vectors": torch.stack([r["hdc_vector"] for r in records_list]).numpy(),
-        }
+        """Pack records into compact numpy arrays for cache serialization.
+
+        Streams row-by-row into preallocated arrays and nulls out each source
+        record as it's copied, so the peak RSS during packing is ~one copy of
+        the data, not two. For 1M mols (GDB13) this drops the peak from
+        ~32 GB (torch.stack twice over a live list of 1M tensors) to ~16 GB.
+        """
+        n = len(records_list)
+        if n == 0:
+            return {
+                "smiles": [],
+                "fingerprints": np.zeros((0, 0), dtype=np.float32),
+                "hdc_vectors": np.zeros((0, 0), dtype=np.float32),
+            }
+        fp_dim = records_list[0]["fingerprint"].shape[0]
+        hdc_dim = records_list[0]["hdc_vector"].shape[0]
+        fps = np.empty((n, fp_dim), dtype=np.float32)
+        hdcs = np.empty((n, hdc_dim), dtype=np.float32)
+        smiles = []
+        for i in range(n):
+            r = records_list[i]
+            fps[i] = r["fingerprint"].numpy()
+            hdcs[i] = r["hdc_vector"].numpy()
+            smiles.append(r["smiles"])
+            # Drop the per-record tensors immediately so GC can reclaim their
+            # storage while we still have n-i entries to process.
+            records_list[i] = None
+        return {"smiles": smiles, "fingerprints": fps, "hdc_vectors": hdcs}
 
     def _unpack_records(packed):
-        """Unpack cached arrays back into list of record dicts."""
+        """Unpack cached arrays back into list of record dicts.
+
+        The per-sample fingerprint / hdc_vector tensors are views into the
+        shared packed arrays — they keep the arrays alive. Callers that hold
+        these records long-term should clone the per-sample tensors (and
+        drop the packed dict) to avoid keeping the full ~16 GB resident.
+        """
         fps = torch.from_numpy(packed["fingerprints"])
         hdcs = torch.from_numpy(packed["hdc_vectors"])
         return [
@@ -991,6 +1276,16 @@ def load_data(
     if not e.__TESTING__:
         hp = Path(e.HYPERNET_PATH)
 
+        # Cache 1: cleaned SMILES — depends only on the raw CSV.
+        @e.cache.cached(
+            name="cleaned_smiles",
+            scope=lambda _e: ("cleaned_smiles", Path(_e.CSV_PATH).stem),
+        )
+        def cleaned_smiles_cached():
+            return e.apply_hook("clean_data", smiles_list=smiles_list)
+
+        # Cache 2: fingerprint + HDC records — depends on the hypernet and
+        # fingerprint parameters in addition to the cleaned SMILES.
         @e.cache.cached(
             name="records",
             scope=lambda _e: (
@@ -1000,15 +1295,28 @@ def load_data(
                 f"fp_r{_e.FP_RADIUS}_b{_e.FP_NBITS}",
             ),
         )
-        def compute_records_cached():
-            return _pack_records(_encode_all(smiles_list))
+        def records_cached():
+            cleaned = cleaned_smiles_cached()
+            records_list = e.apply_hook(
+                "encode_molecules",
+                smiles_list=cleaned,
+                hypernet=hypernet,
+                device=device,
+            )
+            return _pack_records(records_list)
 
         t0 = time.time()
-        packed = compute_records_cached()
+        packed = records_cached()
         records = _unpack_records(packed)
         e.log(f"Data ready: {len(records)} records ({time.time() - t0:.1f}s)")
     else:
-        records = _encode_all(smiles_list)
+        cleaned = e.apply_hook("clean_data", smiles_list=smiles_list)
+        records = e.apply_hook(
+            "encode_molecules",
+            smiles_list=cleaned,
+            hypernet=hypernet,
+            device=device,
+        )
 
     if len(records) == 0:
         raise ValueError("No valid molecules after preprocessing!")
@@ -1051,7 +1359,22 @@ def load_data(
         pin_memory=(e.NUM_WORKERS > 0),
     )
 
-    test_data = [records[i] for i in test_idx]
+    # Clone per-sample tensors for test_data so it doesn't hold views into
+    # `packed`/`records` — then we can drop those and free ~16 GB of RSS.
+    test_data = [
+        {
+            "smiles": records[i]["smiles"],
+            "fingerprint": records[i]["fingerprint"].clone(),
+            "hdc_vector": records[i]["hdc_vector"].clone(),
+        }
+        for i in test_idx
+    ]
+
+    # Explicitly release the shared packed arrays and the views list: train/val
+    # tensors and test_data now own all their data.
+    del records
+    if not e.__TESTING__:
+        del packed
 
     # ── export test SMILES for standalone evaluation ──
     test_csv_path = Path(e.path) / "test_smiles.csv"
@@ -1082,20 +1405,16 @@ def create_model(
     pl.LightningModule
         Model with forward(fingerprint) → predicted_hdc_vector
     """
-    e.log(f"\nCreating TranslatorMLP: {input_dim} → {e.HIDDEN_DIMS} → {output_dim}")
+    e.log(f"\nCreating TranslatorMLP: {input_dim} → {e.HIDDEN_DIMS} "
+          f"(resblock_depth={e.RESBLOCK_DEPTH}) → {output_dim}")
     return TranslatorMLP(
         input_dim=input_dim,
         output_dim=output_dim,
         hidden_dims=e.HIDDEN_DIMS,
-        activation=e.ACTIVATION,
-        norm=e.NORM,
-        dropout=e.DROPOUT,
+        resblock_depth=e.RESBLOCK_DEPTH,
+        berhu_c_fraction=e.BERHU_C_FRACTION,
         lr=e.LEARNING_RATE,
         weight_decay=e.WEIGHT_DECAY,
-        cosine_loss_weight=e.COSINE_LOSS_WEIGHT,
-        mse_loss_weight=e.MSE_LOSS_WEIGHT,
-        infonce_loss_weight=e.INFONCE_LOSS_WEIGHT,
-        infonce_temperature=e.INFONCE_TEMPERATURE,
         warmup_epochs=e.WARMUP_EPOCHS,
         total_epochs=e.EPOCHS,
     )
@@ -1107,6 +1426,10 @@ def train_model(
     model: pl.LightningModule,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    hypernet,
+    test_data: List[Dict[str, Any]],
+    device: torch.device,
+    actual_hdc_dim: int,
 ) -> pl.LightningModule:
     """
     Train the translation model with PyTorch Lightning.
@@ -1129,6 +1452,27 @@ def train_model(
 
     metrics_callback = TrainingMetricsCallback(experiment=e)
     callbacks = [best_ckpt_callback, metrics_callback]
+
+    if e.RECON_EVAL_EVERY_N_EPOCHS > 0 and len(test_data) > 0:
+        recon_callback = ReconstructionEvalCallback(
+            experiment=e,
+            hypernet=hypernet,
+            test_data=test_data,
+            device=device,
+            actual_hdc_dim=actual_hdc_dim,
+            dataset=e.DATASET.lower(),
+            n_samples=e.RECON_EVAL_N_SAMPLES,
+            every_n_epochs=e.RECON_EVAL_EVERY_N_EPOCHS,
+            beam_size=e.RECON_EVAL_BEAM_SIZE,
+            limit=e.RECON_EVAL_LIMIT,
+            top_k=e.TOP_K,
+        )
+        callbacks.append(recon_callback)
+        e.log(
+            f"ReconEval: every {e.RECON_EVAL_EVERY_N_EPOCHS} epochs on "
+            f"{min(e.RECON_EVAL_N_SAMPLES, len(test_data))} test molecules "
+            f"(beam={e.RECON_EVAL_BEAM_SIZE}, limit={e.RECON_EVAL_LIMIT})"
+        )
 
     log_dir = Path(e.path) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1199,51 +1543,51 @@ def evaluate(
     actual_hdc_dim: int,
 ) -> Dict[str, Any]:
     """
-    End-to-end reconstruction evaluation.
+    End-to-end reconstruction evaluation using the HyperNet's greedy decoder.
 
     For each test molecule:
-    1. Fingerprint → MLP → predicted HDC
-    2. decode_nodes_from_hdc → node tuples
-    3. FlowEdgeDecoder.sample() → generated graph
-    4. Compare with original molecule
+        fingerprint → TranslatorMLP → predicted [edge_terms | graph_embedding]
+                    → hypernet.decode_graph_greedy
+                    → reconstruct_for_eval(..., dataset=DATASET)
+                    → RDKit mol for comparison against the original.
     """
     e.log("\n" + "=" * 60)
-    e.log("Reconstruction Evaluation")
+    e.log("Reconstruction Evaluation (greedy decoder)")
     e.log("=" * 60)
+    e.log(f"Decoder settings: beam_size={e.BEAM_SIZE}, limit={e.LIMIT}, top_k={e.TOP_K}")
 
-    # ── load decoder ──
-    decoder_path = e.FLOW_EDGE_DECODER_PATH
-    e.log(f"Loading FlowEdgeDecoder from {decoder_path}...")
+    decoder_settings = FallbackDecoderSettings(
+        beam_size=e.BEAM_SIZE,
+        limit=e.LIMIT,
+        top_k=e.TOP_K,
+    )
 
-    decoder = FlowEdgeDecoder.load(decoder_path, device=device)
-    decoder.eval()
-    e.log("FlowEdgeDecoder loaded.")
+    hv_dim = actual_hdc_dim
+    decode_device = hypernet.nodes_codebook.device
+    vsa_cls = hypernet.vsa.tensor_class
 
-    # ── get feature bins for node decoding ──
-    rw_config = getattr(hypernet, "rw_config", None)
-    feature_bins = get_node_feature_bins(rw_config)
-
-    # ── select test samples ──
     num_samples = min(e.NUM_TEST_SAMPLES, len(test_data))
     e.log(f"Evaluating {num_samples} test molecules...")
 
     model.to(device)
     model.eval()
 
-    # ── phase 1: predict HDC + decode nodes ──
-    e.log("Phase 1: predicting HDC vectors and decoding nodes...")
-    sampling_start = time.time()
-    prepared: list[dict] = []
+    recon_dir = Path(e.path) / "reconstructions"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+
     results: list[dict] = []
-    node_decode_correct = 0
+    valid_count = 0
+    match_count = 0
+    tanimoto_scores: list[float] = []
+    per_sample_cosines: list[float] = []
+
+    decode_start = time.time()
 
     for idx in range(num_samples):
-        if (idx + 1) % 10 == 0 or idx == 0:
-            e.log(f"  decoding nodes {idx + 1}/{num_samples}...")
         item = test_data[idx]
         original_smiles = item["smiles"]
         fp_tensor = item["fingerprint"].unsqueeze(0).to(device)
-        gt_hdc = item["hdc_vector"]
+        gt_hdc = item["hdc_vector"].to(device)
 
         original_mol = Chem.MolFromSmiles(original_smiles)
         if original_mol is None:
@@ -1254,108 +1598,47 @@ def evaluate(
             })
             continue
 
-        # predict HDC from fingerprint
+        # Predict HDC from fingerprint.
         with torch.no_grad():
-            pred_hdc = model(fp_tensor).squeeze(0).cpu()
+            pred_hdc = model(fp_tensor).squeeze(0)
+        cos_sim = float(F.cosine_similarity(pred_hdc, gt_hdc, dim=-1))
+        per_sample_cosines.append(cos_sim)
 
-        # decode nodes from predicted HDC
+        # Split [edge_terms | graph_embedding] and cast to the VSA tensor class.
+        pred_hdc_cpu = pred_hdc.detach().cpu()
+        edge_term = pred_hdc_cpu[:hv_dim].to(decode_device).as_subclass(vsa_cls)
+        graph_term = pred_hdc_cpu[hv_dim:].to(decode_device).as_subclass(vsa_cls)
+
+        # Greedy decode.
+        generated_mol = None
+        generated_smiles = None
         try:
-            node_tuples, num_nodes = decode_nodes_from_hdc(
-                hypernet, pred_hdc.unsqueeze(0), actual_hdc_dim
+            result = hypernet.decode_graph_greedy(
+                edge_term=edge_term,
+                graph_term=graph_term,
+                decoder_settings=decoder_settings,
             )
+            if result.nx_graphs:
+                generated_mol = reconstruct_for_eval(
+                    result.nx_graphs[0], dataset=e.DATASET.lower(),
+                )
+                generated_smiles = get_canonical_smiles(generated_mol)
         except Exception as ex:
             results.append({
                 "idx": idx,
                 "original_smiles": original_smiles,
-                "error": f"Node decode failed: {ex}",
+                "error": f"Greedy decode failed: {ex}",
             })
             continue
 
-        if num_nodes == 0:
-            results.append({
-                "idx": idx,
-                "original_smiles": original_smiles,
-                "error": "No nodes decoded",
-            })
-            continue
-
-        # check node decode accuracy
-        original_num_atoms = original_mol.GetNumAtoms()
-        if num_nodes == original_num_atoms:
-            node_decode_correct += 1
-
-        node_features = node_tuples_to_onehot(
-            node_tuples, device=device, feature_bins=feature_bins
-        )
-
-        prepared.append({
-            "idx": idx,
-            "original_smiles": original_smiles,
-            "original_mol": original_mol,
-            "pred_hdc": pred_hdc,
-            "node_features": node_features,
-            "num_nodes": num_nodes,
-        })
-
-    # ── phase 2: generate, evaluate, and plot per molecule ──
-    num_reps = e.NUM_REPETITIONS
-    e.log(f"Generating edges for {len(prepared)} molecules "
-          f"(best-of-{num_reps}, {e.SAMPLE_STEPS} steps)...")
-
-    sample_kwargs = dict(
-        sample_steps=e.SAMPLE_STEPS,
-        eta=e.ETA,
-        time_distortion=e.SAMPLE_TIME_DISTORTION,
-        show_progress=False,
-        device=device,
-    )
-
-    recon_dir = Path(e.path) / "reconstructions"
-    recon_dir.mkdir(parents=True, exist_ok=True)
-
-    valid_count = 0
-    match_count = 0
-    plot_count = 0
-    tanimoto_scores: list[float] = []
-
-    for i, item in enumerate(prepared):
-        idx = item["idx"]
-        original_smiles = item["original_smiles"]
-        original_mol = item["original_mol"]
-
-        # ── generate edges (best-of-N) ──
-        hdc_vec = item["pred_hdc"].unsqueeze(0).to(device)
-        n = item["num_nodes"]
-        nf = item["node_features"].unsqueeze(0).to(device)
-        mask = torch.ones(1, n, dtype=torch.bool, device=device)
-
-        def score_fn(s, _orig=hdc_vec, _dim=actual_hdc_dim):
-            return compute_hdc_distance(
-                s, _orig, _dim, hypernet, device,
-            )
-
-        with torch.no_grad():
-            best_sample, best_dist, avg_dist = decoder.sample_best_of_n(
-                hdc_vectors=hdc_vec,
-                node_features=nf,
-                node_mask=mask,
-                num_repetitions=num_reps,
-                score_fn=score_fn,
-                **sample_kwargs,
-            )
-
-        # ── evaluate ──
-        generated_mol = pyg_to_mol(best_sample)
-        generated_smiles = get_canonical_smiles(generated_mol)
         is_valid = is_valid_mol(generated_mol)
 
         original_canonical = None
-        if original_mol is not None:
-            try:
-                original_mol_no_h = Chem.RemoveAllHs(original_mol)
-                original_canonical = Chem.MolToSmiles(original_mol_no_h, canonical=True)
-            except Exception:
-                original_canonical = get_canonical_smiles(original_mol)
+        try:
+            original_mol_no_h = Chem.RemoveAllHs(original_mol)
+            original_canonical = Chem.MolToSmiles(original_mol_no_h, canonical=True)
+        except Exception:
+            original_canonical = get_canonical_smiles(original_mol)
 
         is_match = (
             is_valid
@@ -1373,8 +1656,8 @@ def evaluate(
         tanimoto_scores.append(tanimoto)
 
         status = "MATCH" if is_match else ("Valid" if is_valid else "Invalid")
-        e.log(f"  * molecule {i + 1}/{len(prepared)} - {status} - "
-              f"dist: {best_dist:.4f} - tanimoto: {tanimoto:.3f} - "
+        e.log(f"  * molecule {idx + 1}/{num_samples} - {status} - "
+              f"cos(pred,gt): {cos_sim:+.3f} - tanimoto: {tanimoto:.3f} - "
               f"{original_smiles} -> {generated_smiles or 'N/A'}")
 
         results.append({
@@ -1384,11 +1667,10 @@ def evaluate(
             "is_valid": is_valid,
             "is_match": is_match,
             "tanimoto": tanimoto,
-            "hdc_distance": best_dist,
+            "pred_gt_cosine": cos_sim,
         })
 
-        # ── plot immediately ──
-        plot_path = recon_dir / f"reconstruction_{plot_count + 1:03d}.png"
+        plot_path = recon_dir / f"reconstruction_{idx + 1:03d}.png"
         create_reconstruction_plot(
             original_mol=original_mol,
             generated_mol=generated_mol,
@@ -1399,40 +1681,33 @@ def evaluate(
             sample_idx=idx,
             save_path=plot_path,
         )
-        plot_count += 1
 
-    if plot_count > 0:
-        e.log(f"Saved {plot_count} reconstruction plots to {recon_dir}")
-
-    # ── summary ──
-    total_sampling_time = time.time() - sampling_start
+    total_decode_time = time.time() - decode_start
     mean_tanimoto = float(np.mean(tanimoto_scores)) if tanimoto_scores else 0.0
     median_tanimoto = float(np.median(tanimoto_scores)) if tanimoto_scores else 0.0
+    mean_cos = float(np.mean(per_sample_cosines)) if per_sample_cosines else 0.0
 
     e.log("\n" + "-" * 40)
     e.log("Reconstruction Summary:")
     e.log(f"  Total samples:          {num_samples}")
     e.log(f"  Valid molecules:        {valid_count} ({100 * valid_count / num_samples:.1f}%)")
     e.log(f"  Exact matches:          {match_count} ({100 * match_count / num_samples:.1f}%)")
-    e.log(f"  Node count accuracy:    {node_decode_correct}/{num_samples} "
-          f"({100 * node_decode_correct / num_samples:.1f}%)")
     e.log(f"  Mean Tanimoto:          {mean_tanimoto:.4f}")
     e.log(f"  Median Tanimoto:        {median_tanimoto:.4f}")
-    e.log(f"  Sampling time:          {total_sampling_time:.2f}s")
+    e.log(f"  Mean cos(pred,gt):      {mean_cos:.4f}")
+    e.log(f"  Decode time:            {total_decode_time:.2f}s")
     e.log("-" * 40)
 
-    # ── store metrics ──
     metrics = {
         "num_samples": num_samples,
         "valid_count": valid_count,
         "match_count": match_count,
         "valid_rate": valid_count / num_samples if num_samples > 0 else 0,
         "match_rate": match_count / num_samples if num_samples > 0 else 0,
-        "node_decode_correct": node_decode_correct,
-        "node_decode_accuracy": node_decode_correct / num_samples if num_samples > 0 else 0,
         "mean_tanimoto": mean_tanimoto,
         "median_tanimoto": median_tanimoto,
-        "total_sampling_time_seconds": total_sampling_time,
+        "mean_pred_gt_cosine": mean_cos,
+        "total_decode_time_seconds": total_decode_time,
         "results": results,
     }
 
@@ -1441,10 +1716,10 @@ def evaluate(
     e["evaluation/match_count"] = match_count
     e["evaluation/valid_rate"] = metrics["valid_rate"]
     e["evaluation/match_rate"] = metrics["match_rate"]
-    e["evaluation/node_decode_accuracy"] = metrics["node_decode_accuracy"]
     e["evaluation/mean_tanimoto"] = mean_tanimoto
     e["evaluation/median_tanimoto"] = median_tanimoto
-    e["evaluation/total_sampling_time_seconds"] = total_sampling_time
+    e["evaluation/mean_pred_gt_cosine"] = mean_cos
+    e["evaluation/total_decode_time_seconds"] = total_decode_time
 
     e.commit_json("evaluation_results.json", metrics)
 

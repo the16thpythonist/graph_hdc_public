@@ -221,3 +221,237 @@ def order_leftovers_by_degree_distinct(ctr: Counter) -> list[tuple[int, int, int
     uniq = list(ctr.keys())
     uniq.sort(key=lambda t: (t[1] + 1, t))
     return uniq
+
+
+def valence_satisfiable(
+    G: nx.Graph,
+    remaining_ctr: Counter,
+    node_counter: Counter,
+) -> bool:
+    """Return True iff completion MIGHT still be possible from this partial graph.
+
+    Necessary-only conditions: a return of False is a proof of infeasibility,
+    but True does not imply feasibility (false positives are allowed). Intended
+    as a cheap sanity check inside search loops.
+
+    Applies four checks:
+
+    1. **No overfilled atom** — every placed atom has ``residual_degree >= 0``.
+    2. **Terminal fit** — if ``remaining_ctr`` is empty, every placed atom must
+       have residual 0 and no unplaced atoms may remain.
+    3. **Per-atom Hall-like condition** — for each placed atom ``u`` with
+       residual ``r > 0``, count distinct candidate partners (placed atoms
+       with residual > 0 not already adjacent to ``u``, plus unplaced atoms)
+       whose type pairs with ``u`` in ``remaining_ctr``. If fewer than ``r``
+       candidates exist, completion is impossible. This is the check that
+       uses each atom's decoded target_degree directly (via ``residual_degree``).
+    4. **Aggregate pairability** — for each remaining edge type ``(a, b)`` with
+       physical count ``k_phys``, enough atoms of types ``a`` and ``b`` must
+       exist under simple-graph capacity (``avail_a * avail_b`` for ``a != b``,
+       ``C(avail_a, 2)`` for ``a == b``).
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Partial graph; each node must carry a ``type`` attribute (the raw
+        feature tuple) and a ``target_degree`` attribute.
+    remaining_ctr : Counter
+        Directed/bidirectional typed-edge multiset still to be placed. Using
+        the same convention as the A*/greedy decoders: a non-self edge type
+        ``(a, b)`` with ``a != b`` has matching counts under both orientations;
+        a self-type edge ``(a, a)`` has count 2 per physical edge.
+    node_counter : Counter
+        Target multiset of atom types (from Phase 0 decoding).
+
+    Returns
+    -------
+    bool
+        False iff completion is provably impossible.
+    """
+    # (1) No overfilled atoms
+    for n in G.nodes:
+        if residual_degree(G, n) < 0:
+            return False
+
+    leftover = leftover_features(node_counter, G)
+
+    # (2) Terminal fit
+    if remaining_ctr.total() == 0:
+        if any(residual_degree(G, n) > 0 for n in G.nodes):
+            return False
+        if leftover.total() > 0:
+            return False
+        return True
+
+    # (3) Per-atom Hall-like condition
+    for u in G.nodes:
+        r_u = residual_degree(G, u)
+        if r_u <= 0:
+            continue
+        u_t = G.nodes[u]["type"]
+        partners = 0
+        for v in G.nodes:
+            if v == u:
+                continue
+            if G.has_edge(u, v):
+                continue
+            if residual_degree(G, v) <= 0:
+                continue
+            v_t = G.nodes[v]["type"]
+            if remaining_ctr[(u_t, v_t)] > 0:
+                partners += 1
+                if partners >= r_u:
+                    break
+        if partners < r_u:
+            for t, cnt in leftover.items():
+                if cnt <= 0:
+                    continue
+                if remaining_ctr[(u_t, t)] > 0:
+                    partners += cnt
+                    if partners >= r_u:
+                        break
+        if partners < r_u:
+            return False
+
+    # (4) Aggregate pairability by edge type
+    placed_avail: Counter = Counter()
+    for n in G.nodes:
+        if residual_degree(G, n) > 0:
+            placed_avail[G.nodes[n]["type"]] += 1
+
+    def _avail(t: tuple) -> int:
+        return placed_avail.get(t, 0) + leftover.get(t, 0)
+
+    checked: set = set()
+    for (a, b), k in remaining_ctr.items():
+        if k <= 0:
+            continue
+        unord = (a, b) if (a == b or a <= b) else (b, a)
+        if unord in checked:
+            continue
+        checked.add(unord)
+        if a == b:
+            k_phys = k // 2
+            ava = _avail(a)
+            if ava < 2 or k_phys > ava * (ava - 1) // 2:
+                return False
+        else:
+            k_phys = k
+            ava, avb = _avail(a), _avail(b)
+            if ava < 1 or avb < 1 or k_phys > ava * avb:
+                return False
+
+    return True
+
+
+def _on_cycle_vertex_set(G: nx.Graph) -> set:
+    """Return the set of vertices lying on at least one cycle in G.
+
+    A vertex is on a cycle iff it belongs to a biconnected component with
+    three or more vertices (a 2-vertex biconnected component is a bridge
+    edge, which is not part of any cycle).
+    """
+    on_cycle: set = set()
+    for comp in nx.biconnected_components(G):
+        if len(comp) >= 3:
+            on_cycle.update(comp)
+    return on_cycle
+
+
+def ring_membership_consistent(
+    G: nx.Graph,
+    remaining_ctr: Counter,
+    node_counter: Counter,
+    ring_feature_index: int,
+) -> bool:
+    """Return False only when ring-membership constraints are provably unsatisfiable.
+
+    The decoded feature tuple carries an ``is_in_ring`` bit at
+    ``ring_feature_index`` (typically 4 for ZINC/PubChem; <0 or None for
+    QM9 means "no ring information available"). The search must ensure
+    that every atom with ``t[idx] == 1`` ends up on a cycle in the final
+    molecule and every atom with ``t[idx] == 0`` does NOT. Both are
+    topological constraints that can be partially checked on a partial graph.
+
+    Necessary-only conditions (a False return is a proof of infeasibility):
+
+    1. **No non-ring atom on a current cycle.** Every cycle in the final
+       molecule is entirely contained within the ring-atom subgraph; if any
+       ``t[idx] == 0`` atom currently lies on a cycle, the partial cannot
+       complete consistently.
+    2. **Pending ring-atoms must fit the remaining intra-edge budget.** For
+       any connected graph, ``cyclomatic = |E| - |V| + 1`` equals the number
+       of intra-edges (cycle closures). The search's remaining intra-edge
+       budget is therefore ``remaining_edges_undirected - leftover_count``
+       (attachments consume one edge each). If there are still ring-atoms
+       not on any cycle (placed or unplaced) and the remaining intra-edge
+       budget is <=0, no future cycle can form and the partial is dead.
+
+    When ``ring_feature_index < 0`` the check is a no-op (returns True).
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Partial graph. Each node must carry a ``type`` attribute holding
+        the raw feature tuple.
+    remaining_ctr : Counter
+        Bidirectional typed-edge multiset still to place (A*-style).
+    node_counter : Counter
+        Target multiset of atom types from Phase 0.
+    ring_feature_index : int
+        Position of the in-ring bit in the feature tuple, or <0 for no-op.
+
+    Returns
+    -------
+    bool
+        False iff ring-membership constraints are provably unsatisfiable.
+    """
+    if ring_feature_index < 0:
+        return True
+
+    on_cycle = _on_cycle_vertex_set(G)
+
+    # (1) No non-ring atom on a cycle
+    for n in G.nodes:
+        if G.nodes[n]["type"][ring_feature_index] == 0 and n in on_cycle:
+            return False
+
+    # (2) Forward-feasibility on pending ring-atoms
+    leftover = leftover_features(node_counter, G)
+    placed_R_not_on_cycle = sum(
+        1 for n in G.nodes
+        if G.nodes[n]["type"][ring_feature_index] == 1 and n not in on_cycle
+    )
+    unplaced_R = sum(
+        cnt for t, cnt in leftover.items()
+        if t[ring_feature_index] == 1
+    )
+    pending_R = placed_R_not_on_cycle + unplaced_R
+
+    # cyclomatic identity: remaining_intra = remaining_undirected - leftover_count
+    remaining_undirected = remaining_ctr.total() // 2
+    remaining_intra = remaining_undirected - leftover.total()
+
+    if pending_R > 0 and remaining_intra <= 0:
+        return False
+
+    return True
+
+
+def count_ring_mismatches(G: nx.Graph, ring_feature_index: int) -> int:
+    """Count atoms whose declared ring-membership disagrees with actual topology.
+
+    For every node, compare ``t[ring_feature_index]`` (1 iff declared in-ring)
+    against the topological fact of whether the node lies on a cycle in G.
+    Returns 0 when ``ring_feature_index < 0`` (no ring info).
+    """
+    if ring_feature_index < 0:
+        return 0
+    on_cycle = _on_cycle_vertex_set(G)
+    mismatches = 0
+    for n in G.nodes:
+        declared = G.nodes[n]["type"][ring_feature_index] == 1
+        actual = n in on_cycle
+        if declared != actual:
+            mismatches += 1
+    return mismatches

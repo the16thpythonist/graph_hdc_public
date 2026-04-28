@@ -6,7 +6,9 @@ Vector Symbolic Architectures (VSA) with message passing.
 """
 
 import enum
+import heapq
 import itertools
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +27,7 @@ from tqdm import tqdm
 
 from graph_hdc.datasets.utils import DatasetInfo, get_dataset_info
 from graph_hdc.hypernet.configs import (
+    AStarDecoderSettings,
     BaseDataset,
     DecoderSettings,
     DSHDCConfig,
@@ -56,14 +59,18 @@ from graph_hdc.utils.helpers import (
     scatter_hd,
 )
 from graph_hdc.utils.nx_utils import (
+    add_edge_if_possible,
     add_node_and_connect,
     add_node_with_feat,
     anchors,
     connect_all_if_possible,
+    count_ring_mismatches,
     leftover_features,
     order_leftovers_by_degree_distinct,
     powerset,
     residual_degree,
+    ring_membership_consistent,
+    valence_satisfiable,
 )
 from graph_hdc.utils.nx_utils import (
     graph_hash as _hash,
@@ -94,6 +101,45 @@ class CorrectionLevel(str, enum.Enum):
 
 
 @dataclass
+class AStarSearchStats:
+    """Per-decode statistics collected by ``decode_graph_astar``.
+
+    Counters are cumulative across the whole search. Populated on a
+    ``DecodingResult`` via the optional ``search_stats`` field — other
+    decoders (greedy, main) leave it as ``None``.
+    """
+    # Loop control
+    pops: int = 0                      # total heap pops over the main loop
+    early_exit: bool = False           # broke out because sim >= 1 - eps
+    budget_exhausted: bool = False     # wall-clock budget fired
+
+    # Pop-level outcomes
+    completes: int = 0                 # popped states that were complete
+    dead_end_pops: int = 0             # popped but had no valid expansion
+
+    # Child-level counts (accumulated across all pops)
+    children_generated: int = 0        # total children enumerated by expansion
+    rule_a_rejected: int = 0           # Rule A: non-ring on would-be cycle
+    dedup_rejected: int = 0            # WL-hash duplicate
+    ring_bc_rejected: int = 0          # Rules B + C
+    children_scored: int = 0           # pushed onto heap after all filters
+
+    # Encoder usage
+    encoder_forwards: int = 0          # number of self._batched_forward calls
+    encoder_graphs_scored: int = 0     # total graphs passed through the encoder
+
+    # Search tree / heap
+    seeds_pushed: int = 0              # seeds that made it onto the heap
+    unique_states_seen: int = 0        # size of the dedup set at the end
+    heap_peak: int = 0                 # max heap size observed
+    heap_final: int = 0                # heap size at loop exit
+
+    # Timing (seconds)
+    seconds_phase0: float = 0.0        # edge unbinding + node-counter derivation
+    seconds_search: float = 0.0        # main best-first loop
+
+
+@dataclass
 class DecodingResult:
     """Result of graph decoding."""
     nx_graphs: list[nx.Graph] = field(default_factory=list)
@@ -101,6 +147,7 @@ class DecodingResult:
     target_reached: bool = False
     cos_similarities: list[float] = field(default_factory=lambda: [0.0])
     correction_level: CorrectionLevel = CorrectionLevel.ZERO
+    search_stats: AStarSearchStats | None = None
 
 
 class HyperNet(pl.LightningModule):
@@ -471,6 +518,50 @@ class HyperNet(pl.LightningModule):
 
         self.prune_codebook = False
 
+    def extend_node_codebook(self, missing_tuples: list[tuple]) -> int:
+        """Append fresh random hypervectors for feature tuples not yet in the codebook.
+
+        When a HyperNet is loaded with a pruned codebook, encoding a molecule
+        that contains a feature tuple absent from the indexer raises. This
+        method adds the missing tuples (deduplicated) by sampling fresh random
+        hypervectors of the correct VSA type and concatenating them onto the
+        nodes codebook, so encode/decode round-trips continue to work for
+        previously-unseen feature combinations.
+        """
+        seen: set[tuple] = set()
+        unique: list[tuple] = []
+        for t in missing_tuples:
+            t = tuple(int(x) for x in t)
+            if t in seen or t in self.nodes_indexer.tuple_to_idx:
+                continue
+            seen.add(t)
+            unique.append(t)
+        if not unique:
+            return 0
+
+        cb = self.nodes_codebook
+        new_hvs = torchhd.random(
+            len(unique),
+            self.hv_dim,
+            vsa=self.vsa.value,
+            device=cb.device,
+            dtype=cb.dtype,
+        )
+        self.nodes_codebook = torch.cat([cb, new_hvs.to(cb.dtype)], dim=0).as_subclass(type(cb))
+        self.nodes_indexer.extend(unique)
+
+        for enc, _ in self.node_encoder_map.values():
+            enc.codebook = self.nodes_codebook
+            if hasattr(enc, "indexer") and enc.indexer is not None:
+                enc.indexer = self.nodes_indexer
+
+        self._edges_codebook = None
+        self._edges_indexer = None
+        if hasattr(self, "_min_node_delta"):
+            del self._min_node_delta
+
+        return len(unique)
+
 
     def _build_codebooks(
         self,
@@ -627,9 +718,20 @@ class HyperNet(pl.LightningModule):
         if tensor.dim() == 1:
             tensor = tensor.unsqueeze(-1)
 
+        is_node_map = encoder_map is self.node_encoder_map
         slices = []
         for encoder, (start, end) in encoder_map.values():
             feat = tensor[..., start:end]
+            if (
+                is_node_map
+                and isinstance(encoder, CombinatoricIntegerEncoder)
+                and feat.shape[-1] > 1
+            ):
+                tup_view = feat.squeeze(-1).long() - encoder.idx_offset
+                tup_list = list(map(tuple, tup_view.tolist()))
+                if any(encoder.indexer.get_idx(t) is None for t in tup_list):
+                    missing = [t for t in tup_list if encoder.indexer.get_idx(t) is None]
+                    self.extend_node_codebook(missing)
             slices.append(encoder.encode(feat))
 
         if not slices:
@@ -1828,6 +1930,409 @@ class HyperNet(pl.LightningModule):
             cos_similarities=top_k_sims,
             target_reached=target_reached(decoded_edges_list),
             correction_level=CorrectionLevel.FAIL,
+        )
+
+    def decode_graph_astar(
+        self,
+        edge_term: torch.Tensor,
+        graph_term: torch.Tensor,
+        node_counter: Counter | None = None,
+        decoder_settings: AStarDecoderSettings | None = None,
+    ) -> DecodingResult:
+        """
+        A*-style best-first decoder for graph reconstruction.
+
+        Alternative to ``decode_graph_greedy``. Each tree node is a partial
+        graph; expansion produces children by either (i) adding an intra-graph
+        edge between two existing atoms that still have open valence, or
+        (ii) attaching a new atom to an existing anchor via a decoded edge
+        type. At every step the highest-cosine-similarity frontier node is
+        popped and expanded. Children are scored by encoding each partial
+        graph through the HyperNet and computing cosine similarity against
+        ``graph_term``. Search stops when a complete graph with
+        ``cos_sim >= 1 - similarity_eps`` is reached or when the wall-clock
+        ``budget_seconds`` is exhausted — whichever comes first.
+
+        Parameters
+        ----------
+        edge_term : torch.Tensor
+            Hypervector for edge unbinding (same shape as in greedy decoder).
+        graph_term : torch.Tensor
+            Full-graph hypervector used to score candidates.
+        node_counter : Counter, optional
+            Pre-decoded node multiset. Derived from edges if omitted.
+        decoder_settings : AStarDecoderSettings, optional
+            Search configuration (budget, batch cap, etc).
+
+        Returns
+        -------
+        DecodingResult
+            Same fields as ``decode_graph_greedy``. ``correction_level`` is
+            always ``CorrectionLevel.FAIL`` (fallback-style output). If any
+            complete candidate is found, it is ranked ahead of partials; on
+            budget exhaustion with no complete candidate, the best partials
+            seen are returned.
+        """
+        settings = decoder_settings or AStarDecoderSettings()
+        eps = settings.similarity_eps
+        top_k = settings.top_k
+        max_bs = max(1, settings.max_batch_size)
+        stats = AStarSearchStats()
+
+        # ── Phase 0: decode edge multiset (mirrors greedy) ──────────
+        # Phase 0 is a fixed preprocessing cost; `budget_seconds` applies to
+        # the search loop only. t0 is therefore taken AFTER Phase 0.
+        t_phase0_start = time.monotonic()
+        if node_counter:
+            decoded_edges = self.decode_order_one(edge_term=edge_term, node_counter=node_counter)
+        else:
+            decoded_edges = self.decode_order_one_no_node_terms(edge_term=edge_term.clone())
+            if not decoded_edges:
+                stats.seconds_phase0 = time.monotonic() - t_phase0_start
+                return DecodingResult(correction_level=CorrectionLevel.FAIL, search_stats=stats)
+            node_counter = get_node_counter(decoded_edges, method="ceil")
+            if not target_reached(decoded_edges):
+                decoded_edges = self.decode_order_one(edge_term=edge_term.clone(), node_counter=node_counter)
+        stats.seconds_phase0 = time.monotonic() - t_phase0_start
+
+        if self.base_dataset == "qm9":
+            node_limit = MAX_ALLOWED_DECODING_NODES_QM9
+        elif self.base_dataset in _PUBCHEM_DECODING_LIMITS:
+            node_limit = _PUBCHEM_DECODING_LIMITS[self.base_dataset][0]
+        else:
+            node_limit = MAX_ALLOWED_DECODING_NODES_ZINC
+        if node_counter.total() > node_limit:
+            return DecodingResult(correction_level=CorrectionLevel.FAIL, search_stats=stats)
+
+        target_nodes = node_counter.total()
+        if target_nodes == 0 or not decoded_edges:
+            return DecodingResult(correction_level=CorrectionLevel.FAIL, search_stats=stats)
+
+        edge_count = len(decoded_edges) // 2  # decoded_edges holds both directions
+        decoded_edges_counter: Counter = Counter(decoded_edges)
+        decoded_edges_list = [e for e, c in decoded_edges_counter.items() for _ in range(c)]
+
+        # Search-budget timer starts AFTER Phase 0 preprocessing.
+        t0 = time.monotonic()
+
+        # Ring feature index: auto-detect from tuple length when not set.
+        # ZINC/PubChem have 5-feature tuples with the in-ring bit at position 4;
+        # QM9 has 4-feature tuples with no ring info (ring_idx = -1 → no-op).
+        if settings.ring_feature_index is not None:
+            ring_idx = settings.ring_feature_index
+        else:
+            sample_tuple = next(iter(node_counter))
+            ring_idx = 4 if len(sample_tuple) >= 5 else -1
+        ring_hard_prune = settings.ring_hard_prune and ring_idx >= 0
+        ring_penalty = settings.ring_penalty if ring_idx >= 0 else 0.0
+
+        # ── Batched scoring with OOM-safe chunking ──────────────────
+        def batch_score(graphs: list[nx.Graph]) -> list[float]:
+            sims_out: list[float] = []
+            for i in range(0, len(graphs), max_bs):
+                chunk = graphs[i : i + max_bs]
+                enc_out = self._batched_forward(chunk)
+                stats.encoder_forwards += 1
+                stats.encoder_graphs_scored += len(chunk)
+                gt = enc_out["graph_embedding"]
+                if settings.use_g3_instead_of_h3:
+                    gt = enc_out["node_terms"] + enc_out["edge_terms"] + gt
+                sims = torchhd.cos(graph_term, gt)
+                sims_out.extend(sims.cpu().tolist())
+            return sims_out
+
+        # ── Phase 1: seed frontier with every distinct decoded edge ─
+        seq = itertools.count()
+        global_seen: set = set()
+        heap: list = []
+
+        # Seed selection — ordered by confidence.
+        # `decoded_edges` from decode_order_one* is produced by iterative
+        # argmax-unbinding, so entries 0, 2, 4, ... are the distinct edges in
+        # DESCENDING unbinding-confidence order (entries 1, 3, 5, ... are the
+        # reverse orientations of the same edges). We preserve that order so
+        # that the top seed is the highest-confidence edge, and if the caller
+        # allows more than one seed we add them in confidence-order.
+        ordered_unique: list[tuple[tuple, tuple]] = []
+        seen_unordered: set[frozenset] = set()
+        for (u_t, v_t) in decoded_edges:
+            key = frozenset((u_t, v_t)) if u_t != v_t else frozenset({(u_t, v_t)})
+            if key in seen_unordered:
+                continue
+            seen_unordered.add(key)
+            ordered_unique.append((u_t, v_t))
+
+        # `num_seeds <= 0` means "use every distinct edge as a seed"
+        seed_limit = len(ordered_unique) if settings.num_seeds <= 0 else settings.num_seeds
+
+        seed_graphs: list[nx.Graph] = []
+        seed_remaining: list[Counter] = []
+        for (u_t, v_t) in ordered_unique[:seed_limit]:
+            G = nx.Graph()
+            uid = add_node_with_feat(G, Feat.from_tuple(u_t), raw_type=u_t)
+            if add_node_and_connect(
+                G, Feat.from_tuple(v_t), connect_to=[uid],
+                total_nodes=target_nodes, raw_type=v_t,
+            ) is None:
+                continue
+            h = _hash(G)
+            if h in global_seen:
+                continue
+            global_seen.add(h)
+            remaining = decoded_edges_counter.copy()
+            remaining[(u_t, v_t)] -= 1
+            remaining[(v_t, u_t)] -= 1
+            seed_graphs.append(G)
+            seed_remaining.append(remaining)
+
+        if not seed_graphs:
+            return DecodingResult(correction_level=CorrectionLevel.FAIL, search_stats=stats)
+
+        def priority(sim: float, n_nodes: int) -> float:
+            # Lower = popped first. Higher sim and larger n_nodes both lower priority.
+            return -(sim + settings.depth_bias * (n_nodes / max(target_nodes, 1)))
+
+        def adjusted_sim(raw_sim: float, G: nx.Graph, remaining: Counter) -> float:
+            """Apply a constant valence-feasibility penalty to the raw sim when
+            completion is provably impossible from this partial graph."""
+            if settings.valence_penalty <= 0.0:
+                return raw_sim
+            if valence_satisfiable(G, remaining, node_counter):
+                return raw_sim
+            return raw_sim - settings.valence_penalty
+
+        seed_sims = batch_score(seed_graphs)
+        for G, rem, raw_s in zip(seed_graphs, seed_remaining, seed_sims, strict=True):
+            # Seeds should also satisfy Rules B+C when ring_hard_prune is on
+            # (a 2-atom seed can't violate Rule B, but Rule C could still
+            # fire if the decoded edge budget is degenerate).
+            if ring_hard_prune and not ring_membership_consistent(
+                G, rem, node_counter, ring_idx,
+            ):
+                stats.ring_bc_rejected += 1
+                continue
+            s = adjusted_sim(raw_s, G, rem)
+            heapq.heappush(heap, (priority(s, G.number_of_nodes()), next(seq), s, G, rem))
+            stats.seeds_pushed += 1
+        stats.heap_peak = max(stats.heap_peak, len(heap))
+
+        # ── Main best-first loop ─────────────────────────────────────
+        completes: list[tuple[float, nx.Graph]] = []
+        # best_popped holds only EXPANDABLE pops — dead-ends and completes are
+        # excluded so they can't poison the fallback ranking.
+        best_popped: list[tuple[float, nx.Graph]] = []
+        early_found = False
+
+        while heap:
+            _prio, _, sim, G, remaining = heapq.heappop(heap)
+            stats.pops += 1
+
+            n_here = G.number_of_nodes()
+            all_edges_used = remaining.total() == 0
+            at_target_n = n_here == target_nodes
+
+            if at_target_n and all_edges_used:
+                # Rule D: soft leaf-time ring-membership mismatch penalty.
+                # Counts atoms whose declared in-ring bit disagrees with the
+                # actual topology of the completed graph. Rules A/B/C already
+                # forbid non-ring atoms on cycles, so in practice this only
+                # fires for ring atoms that failed to end up on a cycle.
+                final_sim = sim
+                if ring_penalty > 0.0:
+                    final_sim -= ring_penalty * count_ring_mismatches(G, ring_idx)
+                completes.append((final_sim, G))
+                stats.completes += 1
+                if final_sim >= 1.0 - eps:
+                    early_found = True
+                    stats.early_exit = True
+                    break
+                continue
+
+            # Dead-ends we can't expand out of
+            if all_edges_used and not at_target_n:
+                stats.dead_end_pops += 1
+                continue  # no edges left to place remaining atoms
+
+            # Only record genuinely expandable partials for the fallback pool
+            best_popped.append((sim, G))
+
+            children: list[tuple[nx.Graph, Counter]] = []
+
+            # (c-i) intra-graph edge additions between existing atoms
+            if settings.allow_intra_edges:
+                nodes_list = list(G.nodes)
+                for i_a in range(len(nodes_list)):
+                    u = nodes_list[i_a]
+                    if residual_degree(G, u) <= 0:
+                        continue
+                    u_t = G.nodes[u]["type"]
+                    for i_b in range(i_a + 1, len(nodes_list)):
+                        v = nodes_list[i_b]
+                        if residual_degree(G, v) <= 0:
+                            continue
+                        if G.has_edge(u, v):
+                            continue
+                        v_t = G.nodes[v]["type"]
+                        if remaining[(u_t, v_t)] <= 0:
+                            continue
+                        # Rule A: reject intra-edges whose new cycle would
+                        # contain a declared non-ring atom. The new cycle's
+                        # vertices are exactly the u-v path in G plus {u, v}.
+                        if ring_hard_prune:
+                            try:
+                                path = nx.shortest_path(G, source=u, target=v)
+                            except nx.NetworkXNoPath:
+                                path = []
+                            if any(
+                                G.nodes[n]["type"][ring_idx] == 0 for n in path
+                            ):
+                                stats.rule_a_rejected += 1
+                                continue
+                        C = nx.Graph(G)
+                        if not add_edge_if_possible(C, u, v, strict=True):
+                            continue
+                        if C.number_of_edges() > edge_count:
+                            continue
+                        new_rem = remaining.copy()
+                        new_rem[(u_t, v_t)] -= 1
+                        new_rem[(v_t, u_t)] -= 1
+                        children.append((C, new_rem))
+                        stats.children_generated += 1
+
+            # (c-ii) new-atom attachments (single-edge, like the greedy inner step)
+            if settings.allow_node_additions and not at_target_n:
+                leftovers_ctr = leftover_features(node_counter, G)
+                if leftovers_ctr:
+                    leftover_types = order_leftovers_by_degree_distinct(leftovers_ctr)
+                    for a in anchors(G):
+                        a_t = G.nodes[a]["type"]
+                        for lo_t in leftover_types:
+                            if remaining[(a_t, lo_t)] <= 0:
+                                continue
+                            C = nx.Graph(G)
+                            nid = add_node_and_connect(
+                                C, Feat.from_tuple(lo_t), connect_to=[a],
+                                total_nodes=target_nodes, raw_type=lo_t,
+                            )
+                            if nid is None:
+                                continue
+                            if C.number_of_edges() > edge_count:
+                                continue
+                            new_rem = remaining.copy()
+                            new_rem[(a_t, lo_t)] -= 1
+                            new_rem[(lo_t, a_t)] -= 1
+                            children.append((C, new_rem))
+                            stats.children_generated += 1
+
+            if not children:
+                continue
+
+            # Dedup by WL-hash across the whole search
+            if settings.dedupe:
+                fresh: list[tuple[nx.Graph, Counter]] = []
+                for C, rem in children:
+                    h = _hash(C)
+                    if h in global_seen:
+                        stats.dedup_rejected += 1
+                        continue
+                    global_seen.add(h)
+                    fresh.append((C, rem))
+            else:
+                fresh = children
+
+            # Rules B+C: drop children whose ring-membership constraints are
+            # provably unsatisfiable (non-ring atom currently on cycle, or
+            # pending ring-atoms with no remaining intra-edge budget).
+            if ring_hard_prune:
+                pre_ring = len(fresh)
+                fresh = [
+                    (C, rem) for C, rem in fresh
+                    if ring_membership_consistent(C, rem, node_counter, ring_idx)
+                ]
+                stats.ring_bc_rejected += pre_ring - len(fresh)
+
+            if not fresh:
+                continue
+
+            fresh_graphs = [c[0] for c in fresh]
+            fresh_sims = batch_score(fresh_graphs)
+
+            for (C, rem), raw_s in zip(fresh, fresh_sims, strict=True):
+                s = adjusted_sim(raw_s, C, rem)
+                heapq.heappush(heap, (priority(s, C.number_of_nodes()), next(seq), s, C, rem))
+                stats.children_scored += 1
+
+            if len(heap) > stats.heap_peak:
+                stats.heap_peak = len(heap)
+
+            # Optional safety valve: cap frontier size
+            if settings.max_frontier_size is not None and len(heap) > settings.max_frontier_size:
+                heap = heapq.nsmallest(settings.max_frontier_size, heap)
+                heapq.heapify(heap)
+
+            # Budget check at END of loop: guarantees at least one pop+expansion
+            # happens per call, even if seeding consumed most of the budget.
+            if time.monotonic() - t0 > settings.budget_seconds:
+                stats.budget_exhausted = True
+                break
+
+        # ── Build result ─────────────────────────────────────────────
+        if completes:
+            completes.sort(key=lambda x: x[0], reverse=True)
+            top = completes[:top_k]
+            nx_graphs = [g for _, g in top]
+            sims_out = [s for s, _ in top]
+            final_flags = [True] * len(top)
+        else:
+            # No complete candidate reached — fall back to best partials seen.
+            # Merge heap-remainder with popped history, dedup by graph hash.
+            # Rank by (proximity to target_nodes, sim) so a partial with more
+            # atoms outranks a shallower one with a slightly higher sim — this
+            # prevents returning a 2-atom seed when we never made it to target.
+            pool: dict[Any, tuple[float, nx.Graph]] = {}
+            for _prio, _, s, G, remaining in heap:
+                h = _hash(G)
+                prev = pool.get(h)
+                if prev is None or s > prev[0]:
+                    pool[h] = (s, G)
+            for s, G in best_popped:
+                h = _hash(G)
+                prev = pool.get(h)
+                if prev is None or s > prev[0]:
+                    pool[h] = (s, G)
+
+            def _rank_key(item: tuple[float, nx.Graph]) -> tuple[int, float]:
+                s, G = item
+                # Prefer partials whose node count is closest to target; break
+                # ties by higher cosine sim.
+                return (-abs(G.number_of_nodes() - target_nodes), s)
+
+            candidates = sorted(pool.values(), key=_rank_key, reverse=True)[:top_k]
+            if not candidates:
+                stats.seconds_search = time.monotonic() - t0
+                stats.heap_final = len(heap)
+                stats.unique_states_seen = len(global_seen)
+                return DecodingResult(
+                    correction_level=CorrectionLevel.FAIL, search_stats=stats,
+                )
+            nx_graphs = [g for _, g in candidates]
+            sims_out = [s for s, _ in candidates]
+            # A partial is only "final" if it consumed all decoded edges AND
+            # hit target node count (i.e. a complete). Fallback candidates by
+            # construction do not meet both; flag accordingly.
+            final_flags = [False] * len(candidates)
+
+        _ = early_found  # retained for potential future logging hooks
+        stats.seconds_search = time.monotonic() - t0
+        stats.heap_final = len(heap)
+        stats.unique_states_seen = len(global_seen)
+        return DecodingResult(
+            nx_graphs=nx_graphs,
+            final_flags=final_flags,
+            cos_similarities=sims_out,
+            target_reached=target_reached(decoded_edges_list),
+            correction_level=CorrectionLevel.FAIL,
+            search_stats=stats,
         )
 
     # ─────────────────────────── Distance ───────────────────────────

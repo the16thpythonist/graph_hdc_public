@@ -12,8 +12,9 @@ Loss:
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import pytorch_lightning as pl
 import torch
@@ -23,17 +24,33 @@ from torch import Tensor
 
 
 class SwiGLUResidualBlock(nn.Module):
-    """Pre-norm SwiGLU residual block: ``x + SiLU(W_g LN(x)) * (W_v LN(x))``."""
+    """Pre-norm SwiGLU residual block (canonical LLaMA/PaLM form):
 
-    def __init__(self, dim: int):
+        ``x + Dropout( W_out( SiLU(W_gate LN(x)) * W_value LN(x) ) )``
+
+    ``ffn_mult`` widens the gate/value matrices internally (canonical
+    SwiGLU uses 8/3 ≈ 2.67). ``W_out`` is zero-initialized so the block
+    starts as identity, which helps stable training of deep stacks.
+    Dropout is applied to the residual delta (after ``W_out``, before the
+    skip-add); since ``W_out`` is zero at init the dropped tensor is also
+    zero, so dropout's effect ramps in monotonically as the block wakes up.
+    """
+
+    def __init__(self, dim: int, ffn_mult: float = 8 / 3, dropout: float = 0.0):
         super().__init__()
+        ffn_dim = int(round(ffn_mult * dim))
+        ffn_dim = ((ffn_dim + 63) // 64) * 64  # round up to multiple of 64
         self.norm = nn.LayerNorm(dim)
-        self.w_gate = nn.Linear(dim, dim)
-        self.w_value = nn.Linear(dim, dim)
+        self.w_gate = nn.Linear(dim, ffn_dim, bias=False)
+        self.w_value = nn.Linear(dim, ffn_dim, bias=False)
+        self.w_out = nn.Linear(ffn_dim, dim, bias=False)
+        nn.init.zeros_(self.w_out.weight)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.norm(x)
-        return x + F.silu(self.w_gate(h)) * self.w_value(h)
+        delta = self.w_out(F.silu(self.w_gate(h)) * self.w_value(h))
+        return x + self.dropout(delta)
 
 
 class ProjectionBlock(nn.Module):
@@ -43,11 +60,21 @@ class ProjectionBlock(nn.Module):
     layers -- the class is agnostic to the direction.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, num_blocks: int = 2):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        num_blocks: int = 2,
+        ffn_mult: float = 8 / 3,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.proj = nn.Linear(in_dim, out_dim)
         self.blocks = nn.ModuleList(
-            [SwiGLUResidualBlock(out_dim) for _ in range(num_blocks)]
+            [
+                SwiGLUResidualBlock(out_dim, ffn_mult=ffn_mult, dropout=dropout)
+                for _ in range(num_blocks)
+            ]
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -110,13 +137,31 @@ class BerHuReconstructionLoss(ReconstructionLoss):
 class HDCAutoencoder(pl.LightningModule):
     """(Variational) Autoencoder for HDC molecular graph vectors.
 
+    Architecture is a constant-width "trunk":
+        encoder: Linear(data_dim → trunk_dim)
+                 → [SwiGLUResidualBlock(trunk_dim)] * n_encoder_blocks
+                 → Linear(trunk_dim → latent_dim)        (mu/logvar if VAE)
+        decoder: Linear(latent_dim → trunk_dim)
+                 → [SwiGLUResidualBlock(trunk_dim)] * n_decoder_blocks
+                 → Linear(trunk_dim → data_dim)
+
+    All residual mixing happens at a single fixed width; only the stem and
+    head change dimensionality. This is the design used by ResNets and
+    modern Transformers and tends to be easier to train and more
+    parameter-efficient than a geometric funnel.
+
     Args:
         data_dim: Input/output dimension (typically 2 * hv_dim).
         latent_dim: Bottleneck dimension.
-        encoder_hidden_dims: Hidden layer sizes for the encoder.
-        decoder_hidden_dims: Hidden layer sizes for the decoder.
-            If None, uses reversed encoder_hidden_dims.
-        resblock_depth: Number of SwiGLU residual blocks per projection layer.
+        trunk_dim: Width of the residual trunk. Both encoder and decoder
+            do all their nonlinear mixing at this width. Recommended:
+            ``trunk_dim ≥ data_dim`` so the stem isn't an aggressive
+            lossy compressor.
+        n_encoder_blocks: Number of SwiGLU residual blocks in the encoder
+            trunk.
+        n_decoder_blocks: Number of SwiGLU residual blocks in the decoder
+            trunk.
+        ffn_mult: Internal width multiplier for the SwiGLU residual blocks.
         training_target: Which HDC components to reconstruct.
             ``"both"`` (default) uses ``[edge_terms | graph_terms]``,
             ``"edge"`` uses only edge_terms, ``"graph"`` uses only graph_terms.
@@ -127,21 +172,38 @@ class HDCAutoencoder(pl.LightningModule):
         cosine_weight: Weight for cosine similarity loss component.
         kl_weight: Maximum beta for KL divergence (VAE only).
         kl_warmup_epochs: Epochs to linearly ramp beta from 0 to kl_weight.
+        free_bits: Per-dimension KL floor in nats (VAE only). If > 0, each
+            latent dim's batch-averaged KL is clamped at this value before
+            being summed into the loss — dims with KL below ``free_bits``
+            pay no penalty. Prevents posterior collapse. Typical values:
+            0.1–0.5. ``0.0`` (default) disables the feature.
         loss_clamp: If set, clamp per-sample reconstruction loss to this
             maximum before averaging. Prevents outlier samples from causing
             gradient explosions. None means no clamping.
-        lr: Learning rate for AdamW.
+        lr: Peak learning rate for AdamW (reached at end of warmup).
         weight_decay: Weight decay for AdamW.
+        adam_eps: Epsilon for AdamW numerical stability.
         warmup_epochs: Number of linear LR warmup epochs.
+        max_epochs: Total training epochs — used to schedule the cosine
+            decay from ``lr`` (at end of warmup) down to ``min_lr``.
+        min_lr: Floor learning rate at the end of cosine decay.
+        latent_stats_ema_decay: EMA decay for the running per-dim mean/std
+            of the encoder's latent (``mu`` for VAE, ``z`` otherwise).
+            Stored as buffers so downstream code (e.g. a flow trained on
+            this latent) can fetch ``ae.latent_mean_ema`` /
+            ``ae.latent_std_ema`` straight from the loaded checkpoint and
+            train on whitened latents.
     """
 
     def __init__(
         self,
         data_dim: int,
         latent_dim: int,
-        encoder_hidden_dims: List[int],
-        decoder_hidden_dims: Optional[List[int]] = None,
-        resblock_depth: int = 2,
+        trunk_dim: int = 1024,
+        n_encoder_blocks: int = 8,
+        n_decoder_blocks: int = 8,
+        ffn_mult: float = 8 / 3,
+        dropout: float = 0.0,
         training_target: str = "both",
         recon_loss_type: str = "mse",
         berhu_c_fraction: float = 0.2,
@@ -150,10 +212,15 @@ class HDCAutoencoder(pl.LightningModule):
         cosine_weight: float = 1.0,
         kl_weight: float = 1.0,
         kl_warmup_epochs: int = 20,
+        free_bits: float = 0.0,
         loss_clamp: Optional[float] = None,
         lr: float = 1e-3,
         weight_decay: float = 0.0,
+        adam_eps: float = 1e-8,
         warmup_epochs: int = 5,
+        max_epochs: int = 250,
+        min_lr: float = 1e-7,
+        latent_stats_ema_decay: float = 0.99,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -180,38 +247,62 @@ class HDCAutoencoder(pl.LightningModule):
         self.cosine_weight = cosine_weight
         self.kl_weight = kl_weight
         self.kl_warmup_epochs = kl_warmup_epochs
+        self.free_bits = free_bits
         self.loss_clamp = loss_clamp
+        self.trunk_dim = trunk_dim
+        self.n_encoder_blocks = n_encoder_blocks
+        self.n_decoder_blocks = n_decoder_blocks
+        self.ffn_mult = ffn_mult
+        self.dropout = dropout
         self.lr = lr
         self.weight_decay = weight_decay
+        self.adam_eps = adam_eps
         self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.min_lr = min_lr
+        self.latent_stats_ema_decay = latent_stats_ema_decay
 
-        # ----- Encoder -----
-        enc_layers: list[nn.Module] = []
-        in_dim = data_dim
-        for h in encoder_hidden_dims:
-            enc_layers.append(ProjectionBlock(in_dim, h, resblock_depth))
-            in_dim = h
-        self.encoder_backbone = nn.Sequential(*enc_layers)
+        # ----- Encoder: stem + constant-width trunk -----
+        self.encoder_stem = nn.Linear(data_dim, trunk_dim)
+        self.encoder_backbone = nn.Sequential(*[
+            SwiGLUResidualBlock(trunk_dim, ffn_mult=ffn_mult, dropout=dropout)
+            for _ in range(n_encoder_blocks)
+        ])
+
+        # LayerNorm before the latent heads decouples the encoder's content
+        # from its scale. Without this, drift in trunk activations leaks into
+        # mu/logvar magnitudes (and especially into exp(logvar)) and can
+        # destabilize the KL term during warmup.
+        self.latent_norm = nn.LayerNorm(trunk_dim)
 
         if variational:
-            self.fc_mu = nn.Linear(in_dim, latent_dim)
-            self.fc_logvar = nn.Linear(in_dim, latent_dim)
+            self.fc_mu = nn.Linear(trunk_dim, latent_dim)
+            self.fc_logvar = nn.Linear(trunk_dim, latent_dim)
+            # Zero-init fc_logvar so logvar ≈ 0 (std ≈ 1) at start of training,
+            # regardless of which direction `latent_norm` outputs. Without
+            # this, exp(logvar) can swing wildly during the first epochs as
+            # the trunk blocks wake up and rotate the post-LN direction.
+            nn.init.zeros_(self.fc_logvar.weight)
+            nn.init.zeros_(self.fc_logvar.bias)
         else:
-            self.fc_latent = nn.Linear(in_dim, latent_dim)
+            self.fc_latent = nn.Linear(trunk_dim, latent_dim)
 
-        # ----- Decoder -----
-        dec_dims = (
-            decoder_hidden_dims
-            if decoder_hidden_dims is not None
-            else list(reversed(encoder_hidden_dims))
+        # ----- Decoder: head + constant-width trunk + un-projection -----
+        self.decoder_head = nn.Linear(latent_dim, trunk_dim)
+        self.decoder_trunk = nn.Sequential(*[
+            SwiGLUResidualBlock(trunk_dim, ffn_mult=ffn_mult, dropout=dropout)
+            for _ in range(n_decoder_blocks)
+        ])
+        self.decoder_out = nn.Linear(trunk_dim, data_dim)
+
+        # Running per-dim stats of the latent (mu for VAE, z otherwise).
+        # Saved with state_dict so a downstream flow can whiten latents
+        # using these without a separate fitting pass over the dataset.
+        self.register_buffer("latent_mean_ema", torch.zeros(latent_dim))
+        self.register_buffer("latent_std_ema", torch.ones(latent_dim))
+        self.register_buffer(
+            "latent_stats_initialized", torch.tensor(False)
         )
-        dec_layers: list[nn.Module] = []
-        in_dim = latent_dim
-        for h in dec_dims:
-            dec_layers.append(ProjectionBlock(in_dim, h, resblock_depth))
-            in_dim = h
-        dec_layers.append(nn.Linear(in_dim, data_dim))
-        self.decoder = nn.Sequential(*dec_layers)
 
         # Validation latent stats accumulator
         self._val_z_norm_sum: float = 0.0
@@ -225,9 +316,16 @@ class HDCAutoencoder(pl.LightningModule):
 
     def encode(self, x: Tensor) -> dict:
         """Encode input to latent space."""
-        h = self.encoder_backbone(x)
+        h = self.encoder_backbone(self.encoder_stem(x))
+        h = self.latent_norm(h)
         if self.variational:
-            return {"mu": self.fc_mu(h), "logvar": self.fc_logvar(h)}
+            # Clamp logvar to keep exp(logvar) in a numerically tame range
+            # (≈[4.5e-5, 403]). Bounds the per-dim KL contribution at ~200
+            # nats even if fc_logvar overshoots — prevents the runaway-KL
+            # spikes seen at the LR warmup boundary. Zero gradient inside
+            # the saturated region only.
+            logvar = self.fc_logvar(h).clamp(min=-10.0, max=6.0)
+            return {"mu": self.fc_mu(h), "logvar": logvar}
         return {"z": self.fc_latent(h)}
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
@@ -238,7 +336,7 @@ class HDCAutoencoder(pl.LightningModule):
 
     def decode(self, z: Tensor) -> Tensor:
         """Decode latent vector to reconstruction."""
-        return self.decoder(z)
+        return self.decoder_out(self.decoder_trunk(self.decoder_head(z)))
 
     def forward(self, x: Tensor) -> dict:
         """Full forward pass.
@@ -313,16 +411,32 @@ class HDCAutoencoder(pl.LightningModule):
         self.log(f"{prefix}/recon_loss", recon_loss, on_step=False, on_epoch=True, batch_size=bs)
 
         if self.variational:
-            kl = -0.5 * torch.mean(
-                torch.sum(
-                    1 + output["logvar"] - output["mu"].pow(2) - output["logvar"].exp(),
-                    dim=-1,
-                )
+            # Per-sample, per-dim KL  [B, D]
+            kl_per_sample_per_dim = -0.5 * (
+                1 + output["logvar"] - output["mu"].pow(2) - output["logvar"].exp()
             )
+            # Batch-mean per dim, then sum. Free bits clamps per dim before the
+            # sum so dims with KL below the floor contribute a constant (zero
+            # gradient) instead of being pushed further down toward collapse.
+            kl_per_dim = kl_per_sample_per_dim.mean(dim=0)          # [D]
+            kl_raw = kl_per_dim.sum()                                # scalar
+            if self.free_bits > 0.0:
+                kl_loss = kl_per_dim.clamp(min=self.free_bits).sum()
+            else:
+                kl_loss = kl_raw
+
             beta = self._get_beta(self.current_epoch)
-            loss = recon_loss + beta * kl
-            self.log(f"{prefix}/kl", kl, on_step=False, on_epoch=True, batch_size=bs)
+            loss = recon_loss + beta * kl_loss
+
+            self.log(f"{prefix}/kl", kl_raw, on_step=False, on_epoch=True, batch_size=bs)
+            self.log(f"{prefix}/kl_free", kl_loss, on_step=False, on_epoch=True, batch_size=bs)
             self.log(f"{prefix}/beta", beta, on_step=False, on_epoch=True, batch_size=bs)
+            # Diagnostics: active dims (KL > 0.01 nats) and dims pinned at the floor.
+            n_active = (kl_per_dim > 0.01).float().sum()
+            self.log(f"{prefix}/n_active_dims", n_active, on_step=False, on_epoch=True, batch_size=bs)
+            if self.free_bits > 0.0:
+                n_at_floor = (kl_per_dim < self.free_bits).float().sum()
+                self.log(f"{prefix}/n_at_floor", n_at_floor, on_step=False, on_epoch=True, batch_size=bs)
         else:
             loss = recon_loss
 
@@ -369,7 +483,28 @@ class HDCAutoencoder(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x = self._extract_vectors(batch)
         output = self(x)
-        return self._compute_loss(x, output, "train")
+        loss = self._compute_loss(x, output, "train")
+        self._update_latent_stats_ema(output)
+        return loss
+
+    def _update_latent_stats_ema(self, output: dict) -> None:
+        """Update running per-dim mean/std of the latent for downstream whitening.
+
+        For VAE we track ``mu`` (deterministic, what the flow consumes); for
+        plain AE we track ``z``. Initial batch seeds the EMA exactly so the
+        warm-up isn't dragged down by the zeros-init.
+        """
+        z = (output["mu"] if self.variational else output["z"]).detach()
+        batch_mean = z.mean(dim=0)
+        batch_std = z.std(dim=0) + 1e-6
+        if not bool(self.latent_stats_initialized):
+            self.latent_mean_ema.copy_(batch_mean)
+            self.latent_std_ema.copy_(batch_std)
+            self.latent_stats_initialized.fill_(True)
+        else:
+            m = self.latent_stats_ema_decay
+            self.latent_mean_ema.mul_(m).add_(batch_mean, alpha=1 - m)
+            self.latent_std_ema.mul_(m).add_(batch_std, alpha=1 - m)
 
     def validation_step(self, batch, batch_idx):
         x = self._extract_vectors(batch)
@@ -416,11 +551,22 @@ class HDCAutoencoder(pl.LightningModule):
             self.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay,
+            eps=self.adam_eps,
         )
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lambda epoch: min(1.0, (epoch + 1) / max(1, self.warmup_epochs)),
-        )
+
+        warmup = max(1, self.warmup_epochs)
+        total = max(warmup + 1, self.max_epochs)
+        min_ratio = self.min_lr / self.lr if self.lr > 0 else 0.0
+
+        def lr_lambda(epoch: int) -> float:
+            if epoch < warmup:
+                return (epoch + 1) / warmup
+            progress = (epoch - warmup) / max(1, total - warmup)
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
 
     # -----------------------------------------------------------------

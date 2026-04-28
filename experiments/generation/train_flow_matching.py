@@ -302,6 +302,18 @@ GEN_EVAL_EVERY_N_EPOCHS: int = 10
 #     Number of molecules to sample and decode for generation tracking.
 GEN_EVAL_N_SAMPLES: int = 100
 
+# :param NUM_FINAL_SAMPLES:
+#     Number of molecules to sample for the final post-training evaluation
+#     (NUV, internal diversity, FCD, per-property KL divergences, and the
+#     3x3 distribution grid).  Larger values improve FCD stability but
+#     decoding is serial so this scales roughly linearly in wall time.
+NUM_FINAL_SAMPLES: int = 500
+
+# :param COMPUTE_FCD:
+#     Whether to compute Fréchet ChemNet Distance at final evaluation.
+#     Requires ``fcd_torch`` and downloads ChemNet weights on first use.
+COMPUTE_FCD: bool = True
+
 # -----------------------------------------------------------------------------
 # System
 # -----------------------------------------------------------------------------
@@ -555,7 +567,7 @@ class GenerationTrackingCallback(pl.Callback):
         import networkx as nx
         from graph_hdc.hypernet.configs import FallbackDecoderSettings
         from graph_hdc.hypernet.encoder import CorrectionLevel
-        from graph_hdc.utils.chem import reconstruct_for_eval
+        from graph_hdc.utils.chem import reconstruct_for_eval, sanitize_mol_final
         from rdkit import Chem
         from rdkit.Chem import AllChem, Draw
 
@@ -568,22 +580,28 @@ class GenerationTrackingCallback(pl.Callback):
         with torch.no_grad():
             samples = pl_module.sample(self.n_samples, device=device).cpu()
 
+        # Allow child experiments to transform samples before decoding
+        # (e.g. decode AE latent vectors back to HDC space).
+        samples = self.experiment.apply_hook(
+            "transform_flow_samples", samples=samples, default=samples,
+        )
+
         # ── Split into edge/node terms + graph terms ──
         decode_device = self.hypernet.nodes_codebook.device
         vsa_cls = self.hypernet.vsa.tensor_class
+        sample_dim = samples.shape[-1]
 
-        if self.vector_part == "both":
+        if sample_dim == 2 * self.hv_dim:
             # Model produces [node_terms | graph_terms] but for __edge_graph
             # the node_terms slot contains edge_terms.  Either way, the first
             # half is what the decoder needs as edge_term.
             edge_terms = samples[:, :self.hv_dim].to(decode_device).as_subclass(vsa_cls)
             graph_terms = samples[:, self.hv_dim:].to(decode_device).as_subclass(vsa_cls)
-        elif self.vector_part == "graph_terms":
-            # Graph-only model — no edge terms to decode with
-            self.experiment.log("[GenEval] Skipped: vector_part='graph_terms' cannot decode standalone")
-            return
-        elif self.vector_part == "node_terms":
-            self.experiment.log("[GenEval] Skipped: vector_part='node_terms' cannot decode standalone")
+        elif self.vector_part in ("graph_terms", "node_terms"):
+            self.experiment.log(
+                f"[GenEval] Skipped: vector_part='{self.vector_part}' "
+                f"cannot decode standalone (sample_dim={sample_dim})"
+            )
             return
         else:
             return
@@ -600,8 +618,19 @@ class GenerationTrackingCallback(pl.Callback):
         sims: list[float] = []
         correction_levels: list[CorrectionLevel] = []
         mols: list["Chem.Mol | None"] = []
+        edge_term_edge_counts: list[int] = []
 
         for i in range(self.n_samples):
+            # Count edges recovered from the edge_term by direct unbinding
+            # (independent of the beam-search graph assembly).
+            try:
+                decoded_et = self.hypernet.decode_order_one_no_node_terms(
+                    edge_terms[i].clone()
+                )
+                edge_term_edge_counts.append(len(decoded_et) // 2)
+            except Exception:
+                edge_term_edge_counts.append(-1)
+
             try:
                 result = self.hypernet.decode_graph_greedy(
                     edge_term=edge_terms[i],
@@ -615,7 +644,8 @@ class GenerationTrackingCallback(pl.Callback):
                     sims.append(result.cos_similarities[0] if result.cos_similarities else 0.0)
                     correction_levels.append(result.correction_level)
                     try:
-                        mols.append(reconstruct_for_eval(g, dataset=self.dataset))
+                        m = reconstruct_for_eval(g, dataset=self.dataset)
+                        mols.append(sanitize_mol_final(m))
                     except Exception:
                         mols.append(None)
                 else:
@@ -660,8 +690,8 @@ class GenerationTrackingCallback(pl.Callback):
         )
 
         # ── Molecule grid (5x5, first 25 samples) ──
-        grid_mols = mols[:25]
-        img_size = (250, 250)
+        grid_n = 25
+        img_size = (300, 300)
         fig, axes = plt.subplots(5, 5, figsize=(15, 15))
         fig.suptitle(
             f"Epoch {epoch} — Validity: {validity:.1f}%, NUV: {nuv:.1f}%",
@@ -671,28 +701,78 @@ class GenerationTrackingCallback(pl.Callback):
         for idx, ax in enumerate(axes.flat):
             ax.set_xticks([])
             ax.set_yticks([])
-            if idx < len(grid_mols):
-                mol = grid_mols[idx]
-                if mol is not None:
-                    try:
-                        if mol.GetNumConformers() == 0:
-                            AllChem.Compute2DCoords(mol)
-                        img = Draw.MolToImage(mol, size=img_size)
-                        ax.imshow(img)
-                        smiles = Chem.MolToSmiles(mol, canonical=True)
-                        ax.set_title(smiles[:30], fontsize=7, color="green")
-                    except Exception:
-                        ax.text(0.5, 0.5, "Draw\nfailed", ha="center", va="center",
-                                fontsize=10, color="orange", transform=ax.transAxes)
-                        ax.set_facecolor("#fff3e0")
-                else:
-                    # Invalid molecule — red X
-                    ax.plot([0, 1], [0, 1], "r-", lw=3, transform=ax.transAxes)
-                    ax.plot([0, 1], [1, 0], "r-", lw=3, transform=ax.transAxes)
-                    ax.set_title("invalid", fontsize=7, color="red")
-                    ax.set_facecolor("#ffebee")
-            else:
+            if idx >= grid_n or idx >= len(mols):
                 ax.set_visible(False)
+                continue
+
+            mol = mols[idx]
+            nx_g = nx_graphs[idx] if idx < len(nx_graphs) else nx.Graph()
+            sim = sims[idx] if idx < len(sims) else 0.0
+            et_edges = (
+                edge_term_edge_counts[idx]
+                if idx < len(edge_term_edge_counts) else -1
+            )
+
+            if mol is not None:
+                try:
+                    if mol.GetNumConformers() == 0:
+                        AllChem.Compute2DCoords(mol)
+
+                    # Map in-ring node flags from the decoded nx_graph onto
+                    # RDKit atom indices. nx_to_mol assigns atom idx =
+                    # position in sorted(G.nodes), so we iterate in that
+                    # order. The in-ring bit lives at position 4 of the
+                    # node's type tuple (ZINC/PubChem); shorter tuples
+                    # (e.g. QM9) have no ring info and yield no highlights.
+                    in_ring_idxs: list[int] = []
+                    sorted_nodes = sorted(nx_g.nodes)
+                    for atom_i, node_id in enumerate(sorted_nodes):
+                        if atom_i >= mol.GetNumAtoms():
+                            break
+                        nd = nx_g.nodes[node_id]
+                        t = nd.get("type")
+                        if t is None and "feat" in nd:
+                            f = nd["feat"]
+                            t = f.to_tuple() if hasattr(f, "to_tuple") else tuple(f)
+                        if t is not None and len(t) >= 5 and int(t[4]) == 1:
+                            in_ring_idxs.append(atom_i)
+
+                    halo_color = (1.0, 0.82, 0.82)  # very light red
+                    draw_kwargs = {"size": img_size}
+                    if in_ring_idxs:
+                        draw_kwargs["highlightAtoms"] = in_ring_idxs
+                        draw_kwargs["highlightAtomColors"] = {
+                            i: halo_color for i in in_ring_idxs
+                        }
+                        draw_kwargs["highlightAtomRadii"] = {
+                            i: 0.35 for i in in_ring_idxs
+                        }
+                    img = Draw.MolToImage(mol, **draw_kwargs)
+                    ax.imshow(img)
+                    smiles = Chem.MolToSmiles(mol, canonical=True)
+                    n_bonds = mol.GetNumBonds()
+                    title = (
+                        f"{smiles[:35]}\n"
+                        f"cos={sim:.3f} | et_edges={et_edges} | "
+                        f"graph_edges={n_bonds}"
+                    )
+                    ax.set_title(title, fontsize=6, color="green")
+                except Exception:
+                    ax.text(0.5, 0.5, "Draw\nfailed", ha="center", va="center",
+                            fontsize=10, color="orange", transform=ax.transAxes)
+                    ax.set_facecolor("#fff3e0")
+            else:
+                # Invalid molecule — red X
+                ax.plot([0, 1], [0, 1], "r-", lw=3, transform=ax.transAxes)
+                ax.plot([0, 1], [1, 0], "r-", lw=3, transform=ax.transAxes)
+                nx_edges = nx_g.number_of_edges()
+                title = (
+                    f"invalid\n"
+                    f"cos={sim:.3f} | et_edges={et_edges} | "
+                    f"graph_edges={nx_edges}"
+                )
+                ax.set_title(title, fontsize=6, color="red")
+                ax.set_facecolor("#ffebee")
 
         plt.tight_layout()
         self.experiment.track("gen_molecule_grid", fig)
@@ -1623,6 +1703,14 @@ def experiment(e: Experiment) -> None:
         condition_dim = hv_dim
         e.log(f"Graph-terms stage: conditioning on node_terms (dim={hv_dim})")
 
+    # :hook override_data_dim:
+    #       Override the flow model's data dimensionality.  Receives the
+    #       ``data_dim`` computed from ``hv_dim`` and ``VECTOR_PART`` and may
+    #       return a different value (e.g. an autoencoder's latent_dim).
+    data_dim = e.apply_hook(
+        "override_data_dim", data_dim=data_dim, hv_dim=hv_dim, default=data_dim,
+    )
+
     e["config/hv_dim"] = hv_dim
     e["config/data_dim"] = data_dim
 
@@ -1782,10 +1870,7 @@ def experiment(e: Experiment) -> None:
     callbacks.extend([
         ModelCheckpoint(
             dirpath=e.path,
-            filename="best-{epoch:03d}-{val/loss:.6f}",
-            monitor="val/loss",
-            mode="min",
-            save_top_k=1,
+            save_top_k=0,
             save_last=True,
         ),
         LearningRateMonitor(logging_interval="epoch"),
@@ -1838,6 +1923,7 @@ def experiment(e: Experiment) -> None:
         model=model,
         train_encoded=train_encoded,
         device=device,
+        hypernet=hypernet,
     )
 
     e.log("\n" + "=" * 60)
@@ -1996,55 +2082,262 @@ def compute_validation_nll(
     e["results/val_bpd"] = bpd
 
 
+@experiment.hook("compute_reference_properties", default=True)
+def compute_reference_properties(e: Experiment) -> dict[str, list[float]]:
+    """Compute the 9 grid properties for the training set.
+
+    Runs at final-evaluation time (not during data loading) and is cached
+    via ``e.cache.cached`` — subsequent runs with the same dataset reuse
+    the cached distribution without re-walking every training SMILES.
+
+    Returns:
+        Dict with one entry per key in ``PROPERTY_GRID_CONFIG``, each a
+        list of per-training-molecule scalars.
+    """
+    from rdkit import Chem
+
+    from graph_hdc.datasets.utils import get_split
+    from graph_hdc.utils.evaluator import compute_property_dict
+
+    @e.cache.cached(
+        name="reference_properties",
+        scope=lambda _e: ("reference_properties", _e.DATASET.lower()),
+    )
+    def _compute():
+        ds = get_split("train", dataset=e.DATASET.lower())
+        mols: list[Chem.Mol] = []
+        for d in ds:
+            m = Chem.MolFromSmiles(d.smiles)
+            if m is not None:
+                mols.append(m)
+        e.log(f"[RefProps] Computing 9 properties over {len(mols)} training molecules...")
+        props = compute_property_dict(mols)
+        e.log(f"[RefProps] Done ({len(next(iter(props.values())))} values per property)")
+        return props
+
+    return _compute()
+
+
 @experiment.hook("evaluate_samples", default=True)
 def evaluate_samples(
     e: Experiment,
     model: FlowMatchingModel,
     train_encoded,
     device: torch.device,
+    hypernet=None,
 ):
-    """Generate samples and compare distribution statistics to training data."""
+    """Final post-training evaluation.
+
+    Generates ``NUM_FINAL_SAMPLES`` molecules, runs them through the full
+    evaluation pipeline (NUV, internal diversity, FCD, per-property KL
+    divergences), renders the 3x3 distribution grid, and saves generated
+    SMILES to ``gen_samples.smi`` in the experiment directory.
+
+    Child experiments that need to transform latent samples before
+    decoding (e.g. AE → HDC) should register a ``transform_flow_samples``
+    hook; it is applied automatically.
+    """
+    import time
+    from pathlib import Path
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import networkx as nx
+    from rdkit import Chem
+
+    from graph_hdc.hypernet.configs import FallbackDecoderSettings
+    from graph_hdc.hypernet.encoder import CorrectionLevel
+    from graph_hdc.utils.chem import reconstruct_for_eval, sanitize_mol_final
+    from graph_hdc.utils.evaluator import (
+        GenerationEvaluator,
+        PROPERTY_GRID_CONFIG,
+        plot_property_grid,
+    )
+
     model.eval()
     model.to(device)
 
-    num_gen = 1000
+    num_gen = int(e.NUM_FINAL_SAMPLES)
+    e.log(f"\nFinal evaluation: sampling {num_gen} molecules...")
+
+    # ── Sample vectors from flow ─────────────────────────────────────
     with torch.no_grad():
-        generated = model.sample(num_gen, device=device)
+        samples = model.sample(num_gen, device=device).cpu()
 
-    gen_mean = generated.mean(dim=0)
-    gen_std = generated.std(dim=0)
-
-    # Training data statistics (subsample for speed)
+    # ── Latent-space statistics (kept from prior eval) ──────────────
     train_vectors = []
     for d in train_encoded[: min(5000, len(train_encoded))]:
         train_vectors.append(_extract_vector_from_data(d, e.VECTOR_PART))
     train_vectors = torch.stack(train_vectors)
 
-    train_mean = train_vectors.mean(dim=0)
-    train_std = train_vectors.std(dim=0)
-
-    mean_mae = (gen_mean.cpu() - train_mean).abs().mean().item()
-    std_mae = (gen_std.cpu() - train_std).abs().mean().item()
-
-    e.log(f"Generated {num_gen} samples")
-    e.log(f"Mean MAE (gen vs train): {mean_mae:.6f}")
-    e.log(f"Std MAE (gen vs train): {std_mae:.6f}")
-
+    mean_mae = (samples.mean(dim=0) - train_vectors.mean(dim=0)).abs().mean().item()
+    std_mae = (samples.std(dim=0) - train_vectors.std(dim=0)).abs().mean().item()
+    e.log(f"Sample mean MAE (gen vs train): {mean_mae:.6f}")
+    e.log(f"Sample std MAE (gen vs train):  {std_mae:.6f}")
     e["results/sample_mean_mae"] = mean_mae
     e["results/sample_std_mae"] = std_mae
 
-    # Inter-sample cosine similarity
-    gen_normed = F.normalize(generated[:500].cpu(), dim=-1)
-    cos_sim = gen_normed @ gen_normed.T
-    cos_sim.fill_diagonal_(0)
-    triu_mask = torch.triu(torch.ones_like(cos_sim), diagonal=1).bool()
-    cos_values = cos_sim[triu_mask]
-
-    e.log(
-        f"Inter-sample cosine sim: {cos_values.mean():.4f} +/- {cos_values.std():.4f}"
+    # ── Children can inject a latent→HDC transform here ─────────────
+    samples = e.apply_hook(
+        "transform_flow_samples", samples=samples, default=samples,
     )
-    e["results/inter_sample_cos_mean"] = cos_values.mean().item()
-    e["results/inter_sample_cos_std"] = cos_values.std().item()
+
+    if hypernet is None:
+        e.log(
+            "[FinalEval] No hypernet provided; skipping molecule decoding and "
+            "metric evaluation (latent-space stats above only)."
+        )
+        return
+
+    # ── Split into edge + graph hypervectors ────────────────────────
+    hv_dim = hypernet.hv_dim
+    decode_device = hypernet.nodes_codebook.device
+    vsa_cls = hypernet.vsa.tensor_class
+    sample_dim = samples.shape[-1]
+
+    if sample_dim != 2 * hv_dim:
+        e.log(
+            f"[FinalEval] sample_dim={sample_dim} does not match 2*hv_dim="
+            f"{2*hv_dim}; cannot decode. Skipping molecule-level evaluation."
+        )
+        return
+
+    edge_terms = samples[:, :hv_dim].to(decode_device).as_subclass(vsa_cls)
+    graph_terms = samples[:, hv_dim:].to(decode_device).as_subclass(vsa_cls)
+
+    # ── Decode molecules ────────────────────────────────────────────
+    e.log("Decoding molecules via HyperNet...")
+    t_start = time.time()
+    decoder_settings = FallbackDecoderSettings(beam_size=8, limit=1024, top_k=1)
+
+    nx_graphs: list[nx.Graph] = []
+    final_flags: list[bool] = []
+    sims: list[float] = []
+    correction_levels: list[CorrectionLevel] = []
+    mols: list[Chem.Mol | None] = []
+
+    for i in range(num_gen):
+        try:
+            result = hypernet.decode_graph_greedy(
+                edge_term=edge_terms[i],
+                graph_term=graph_terms[i],
+                decoder_settings=decoder_settings,
+            )
+            if result.nx_graphs:
+                g = result.nx_graphs[0]
+                nx_graphs.append(g)
+                final_flags.append(True)
+                sims.append(
+                    result.cos_similarities[0]
+                    if result.cos_similarities else 0.0
+                )
+                correction_levels.append(result.correction_level)
+                try:
+                    m = reconstruct_for_eval(g, dataset=e.DATASET)
+                    mols.append(sanitize_mol_final(m))
+                except Exception:
+                    mols.append(None)
+            else:
+                nx_graphs.append(nx.Graph())
+                final_flags.append(False)
+                sims.append(0.0)
+                correction_levels.append(result.correction_level)
+                mols.append(None)
+        except Exception:
+            nx_graphs.append(nx.Graph())
+            final_flags.append(False)
+            sims.append(0.0)
+            correction_levels.append(CorrectionLevel.FAIL)
+            mols.append(None)
+
+    decode_time = time.time() - t_start
+    e.log(f"Decoded {num_gen} molecules in {decode_time:.1f}s")
+
+    # ── Reference property distribution (cached hook) ───────────────
+    e.log("Loading reference property distributions for KL...")
+    ref_props = e.apply_hook("compute_reference_properties")
+
+    # ── Build evaluator and compute all metrics ─────────────────────
+    e.log("Computing metrics (NUV, diversity, FCD, KL)...")
+    evaluator = GenerationEvaluator(base_dataset=e.DATASET.lower())
+    evaluator.set_reference_properties(ref_props)
+
+    fcd_device = "cuda" if torch.cuda.is_available() else "cpu"
+    metrics = evaluator.evaluate(
+        n_samples=num_gen,
+        samples=nx_graphs,
+        final_flags=final_flags,
+        sims=sims,
+        correction_levels=correction_levels,
+        compute_kl=True,
+        compute_fcd=bool(e.COMPUTE_FCD),
+        fcd_device=fcd_device,
+    )
+    gen_props = metrics.pop("_gen_properties", None)
+
+    # ── Pretty-print summary ────────────────────────────────────────
+    kl_keys = [f"kl_{k}" for k, _, _, _ in PROPERTY_GRID_CONFIG]
+    fcd_val = metrics.get("fcd", float("nan"))
+
+    e.log("\n" + "=" * 60)
+    e.log(f"Final evaluation — {num_gen} samples, dataset={e.DATASET}")
+    e.log("=" * 60)
+    e.log(f"  Validity:             {metrics['validity']:6.2f}%")
+    e.log(f"  Uniqueness:           {metrics['uniqueness']:6.2f}%")
+    e.log(f"  Novelty:              {metrics['novelty']:6.2f}%")
+    e.log(f"  NUV:                  {metrics['nuv']:6.2f}%")
+    e.log(f"  Internal diversity 1: {metrics['internal_diversity_p1']:6.2f}%")
+    e.log(f"  Internal diversity 2: {metrics['internal_diversity_p2']:6.2f}%")
+    e.log(f"  FCD:                  {fcd_val:.4f}")
+    e.log("  Property means (gen):")
+    e.log(f"    logP: {metrics.get('logp_mean', float('nan')):.3f} ± "
+          f"{metrics.get('logp_std', float('nan')):.3f}")
+    e.log(f"    QED:  {metrics.get('qed_mean', float('nan')):.3f} ± "
+          f"{metrics.get('qed_std', float('nan')):.3f}")
+    e.log(f"    SA:   {metrics.get('sa_score_mean', float('nan')):.3f} ± "
+          f"{metrics.get('sa_score_std', float('nan')):.3f}")
+    e.log("  KL divergences (gen || train):")
+    for key, label, _, _ in PROPERTY_GRID_CONFIG:
+        kl_val = metrics.get(f"kl_{key}", float("nan"))
+        e.log(f"    {label:22s} {kl_val:.4f}")
+    e.log("=" * 60)
+
+    # ── Persist scalar metrics ──────────────────────────────────────
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)):
+            e[f"results/{k}"] = v
+
+    # ── Save generated SMILES ───────────────────────────────────────
+    valid_mols = [m for m in mols if m is not None]
+    gen_smiles = []
+    for m in valid_mols:
+        try:
+            gen_smiles.append(Chem.MolToSmiles(m, canonical=True))
+        except Exception:
+            pass
+    smi_path = Path(e.path) / "gen_samples.smi"
+    smi_path.write_text("\n".join(gen_smiles) + "\n")
+    e.log(f"Saved {len(gen_smiles)} SMILES to {smi_path}")
+
+    # ── 3x3 property distribution grid ──────────────────────────────
+    if gen_props is not None and ref_props is not None:
+        kl_values = {
+            key: metrics.get(f"kl_{key}", float("nan"))
+            for key, _, _, _ in PROPERTY_GRID_CONFIG
+        }
+        fig = plot_property_grid(
+            gen_props=gen_props,
+            ref_props=ref_props,
+            kl_values=kl_values,
+            title=(
+                f"Final eval — {len(valid_mols)}/{num_gen} valid, "
+                f"FCD={fcd_val:.3f}"
+            ),
+        )
+        e.track("gen_property_grid", fig)
+        plt.close(fig)
+        e.log("Saved 3x3 property distribution grid.")
 
 
 experiment.run_if_main()

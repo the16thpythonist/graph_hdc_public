@@ -111,6 +111,72 @@ class FallbackDecoderSettings:
 
 
 @dataclass
+class AStarDecoderSettings:
+    """Settings for the A*-style best-first fallback decoder.
+
+    Drives ``HyperNet.decode_graph_astar``. Each tree node is a partial graph
+    and children are produced by (i) adding an intra-graph edge between two
+    existing atoms that still have open valence, or (ii) attaching a new atom
+    to an existing anchor. At every step the highest-cosine-similarity
+    frontier node is expanded. Search stops when a complete graph with
+    ``cos_sim >= 1 - similarity_eps`` is found, or when the wall-clock
+    ``budget_seconds`` is exceeded.
+
+    ``depth_bias`` biases the priority toward deeper (closer-to-target)
+    partials. Cosine similarity of partial HDC graphs is not monotonic in
+    depth, so pure best-first search (``depth_bias=0``) can stall on shallow
+    high-similarity partials on large molecules. With ``depth_bias > 0`` the
+    priority becomes ``sim + depth_bias * (n_nodes / target_nodes)`` so that
+    each atom added is worth ``depth_bias / target_nodes`` of "fake" sim — a
+    modest nudge toward completion. Typical useful values are in ``[0.02, 0.1]``.
+    """
+    budget_seconds: float = 30.0
+    similarity_eps: float = 1e-6
+    top_k: int = 10
+    max_batch_size: int = 256
+    max_frontier_size: int | None = None
+    allow_intra_edges: bool = True
+    allow_node_additions: bool = True
+    use_g3_instead_of_h3: bool = False
+    dedupe: bool = True
+    depth_bias: float = 0.0
+    # Number of 2-atom seeds to start from. 1 commits the search to a single
+    # root (highest-confidence decoded edge); useful when the user wants a
+    # proper A*-style tree rooted at one point. 0 means "use every distinct
+    # decoded edge as a separate seed" (previous behavior).
+    num_seeds: int = 1
+    # Constant penalty subtracted from a graph's cosine similarity when the
+    # valence-feasibility check (see ``nx_utils.valence_satisfiable``) proves
+    # that completion is impossible from that state. Both the heap priority
+    # and the final reported ``cos_similarities`` use the penalized value.
+    # 0.0 disables the feasibility penalty entirely.
+    valence_penalty: float = 0.2
+
+    # Ring-membership pruning driven by the decoded in-ring bit at
+    # ``ring_feature_index`` (typically 4 for ZINC/PubChem; no-op for QM9).
+    #
+    # ``ring_hard_prune`` activates three hard-prune rules: (A) reject any
+    # intra-edge expansion whose new cycle would include a declared non-ring
+    # atom; (B) reject any child where a declared non-ring atom is already
+    # on a cycle; (C) reject any partial where ring-atoms still need cycles
+    # but no intra-edge budget remains. These rules are topologically
+    # conclusive — a reject is a proof of infeasibility.
+    #
+    # ``ring_penalty`` is a soft leaf-time deduction: when a completed graph
+    # has atoms whose declared in-ring status doesn't match the actual
+    # topology, subtract ``ring_penalty * n_mismatches`` from its similarity.
+    #
+    # ``ring_feature_index`` is auto-detected from the feature tuple length
+    # when ``None`` (len >= 5 → index 4, else no-op).
+    ring_hard_prune: bool = True
+    ring_penalty: float = 0.0
+    ring_feature_index: int | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class DecoderSettings:
     """Main decoder settings for graph decoding."""
     iteration_budget: int = 3

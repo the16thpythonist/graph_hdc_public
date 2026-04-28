@@ -90,6 +90,16 @@ graph_embedding = output["graph_embedding"]  # [1, 256]
 
 Core: PyTorch, PyTorch Geometric, RDKit, TorchHD, Normflows, PyTorch Lightning
 
+## Gotchas
+
+- **Clone tensor slices before storing them.** `pickle.dump` does NOT deduplicate
+  shared torch storage across different view objects — each view serializes its
+  full underlying storage. Assigning `d.field = big_tensor[i, :k]` on many Data
+  objects explodes cache files by ~batch_size (e.g. ~1 GB → 55 GB). Always
+  `.clone()` per-sample slices before attaching them to objects that will be
+  pickled. (`tensor.clone()` also re-materializes contiguous storage of just
+  the view's data.)
+
 ## Experiment Framework
 
 This project uses **PyComex** for experiment management. See [PYCOMEX.md](PYCOMEX.md) for detailed usage including:

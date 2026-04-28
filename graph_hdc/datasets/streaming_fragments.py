@@ -28,11 +28,12 @@ from tqdm.auto import tqdm
 logger = logging.getLogger(__name__)
 
 # BRICS compatibility rules: which isotope labels can connect
-# Based on RDKit BRICS.py environsTable
-# Label 0 is a universal wildcard used for enumerated attachment points
-# (positions added by enumerate_attachment_positions, not from BRICS cuts).
+# Based on RDKit BRICS.py environsTable.
+# ``BRICS_STRICT_PAIRS`` contains only the canonical BRICS label pairs (1-16).
+# ``BRICS_COMPATIBLE_PAIRS`` extends this with universal wildcard pairs
+# (label 0 ↔ any label) used by enumerated attachment points.
 _BRICS_LABELS = range(0, 17)
-BRICS_COMPATIBLE_PAIRS = {
+BRICS_STRICT_PAIRS = {
     (1, 3), (1, 5), (1, 10),
     (2, 12), (2, 14), (2, 16),
     (3, 1), (3, 4), (3, 13), (3, 14), (3, 15), (3, 16),
@@ -50,15 +51,23 @@ BRICS_COMPATIBLE_PAIRS = {
     (15, 3), (15, 5), (15, 6), (15, 8), (15, 9), (15, 10), (15, 11), (15, 13), (15, 14), (15, 15), (15, 16),
     (16, 2), (16, 3), (16, 5), (16, 6), (16, 8), (16, 9), (16, 10), (16, 11), (16, 13), (16, 14), (16, 15), (16, 16),
 }
+BRICS_COMPATIBLE_PAIRS = set(BRICS_STRICT_PAIRS)
 # Add universal wildcard pairs: label 0 is compatible with every label (both directions)
 for _label in _BRICS_LABELS:
     BRICS_COMPATIBLE_PAIRS.add((0, _label))
     BRICS_COMPATIBLE_PAIRS.add((_label, 0))
 
 
-def _brics_compatible(iso1: int, iso2: int) -> bool:
-    """Check if two BRICS attachment points are compatible."""
-    return (iso1, iso2) in BRICS_COMPATIBLE_PAIRS
+def _brics_compatible(iso1: int, iso2: int, allow_wildcard: bool = True) -> bool:
+    """Check if two BRICS attachment points are compatible.
+
+    Args:
+        iso1, iso2: BRICS isotope labels.
+        allow_wildcard: When False, only the canonical BRICS pairs (1-16) are
+            allowed; the universal wildcard label 0 will not match anything.
+    """
+    pairs = BRICS_COMPATIBLE_PAIRS if allow_wildcard else BRICS_STRICT_PAIRS
+    return (iso1, iso2) in pairs
 
 
 def strip_dummy_atoms(mol: Chem.Mol) -> Optional[Chem.Mol]:
@@ -201,7 +210,11 @@ def _get_attachment_points(mol: Chem.Mol) -> List[Tuple[int, int, int]]:
     return points
 
 
-def fast_combine_two_fragments(frag1: Chem.Mol, frag2: Chem.Mol) -> Optional[Chem.Mol]:
+def fast_combine_two_fragments(
+    frag1: Chem.Mol,
+    frag2: Chem.Mol,
+    allow_wildcard: bool = True,
+) -> Optional[Chem.Mol]:
     """
     Manually combine two BRICS fragments at compatible attachment points.
 
@@ -211,6 +224,8 @@ def fast_combine_two_fragments(frag1: Chem.Mol, frag2: Chem.Mol) -> Optional[Che
     Args:
         frag1: First fragment with BRICS attachment points
         frag2: Second fragment with BRICS attachment points
+        allow_wildcard: When False, only canonical BRICS label pairs are
+            considered compatible (the universal wildcard label 0 is rejected).
 
     Returns:
         Combined molecule or None if no compatible attachment points
@@ -226,7 +241,7 @@ def fast_combine_two_fragments(frag1: Chem.Mol, frag2: Chem.Mol) -> Optional[Che
     compatible_pairs = []
     for idx1, iso1, neighbor1 in points1:
         for idx2, iso2, neighbor2 in points2:
-            if _brics_compatible(iso1, iso2):
+            if _brics_compatible(iso1, iso2, allow_wildcard=allow_wildcard):
                 compatible_pairs.append((idx1, neighbor1, idx2, neighbor2))
 
     if not compatible_pairs:
@@ -431,6 +446,7 @@ class FragmentLibrary:
         remove_hydrogens: bool = True,
         remove_stereo: bool = True,
         remove_charges: bool = False,
+        use_generic_linking: bool = False,
     ):
         """
         Initialize fragment library.
@@ -442,12 +458,19 @@ class FragmentLibrary:
             remove_stereo: Remove all stereochemistry (chiral centers and E/Z)
             remove_charges: Remove formal charges; discard fragments that fail
                 sanitization after charge removal
+            use_generic_linking: When True, allow universal wildcard attachment
+                points (label 0) in fragments and during combination — this
+                enables ``expand_with_enumerated_positions`` and the
+                wildcard-compatible matching rules. When False (default), only
+                canonical BRICS labels (1-16) and their official compatibility
+                table are used; enumeration of new attachment points is a no-op.
         """
         self.min_atoms = min_atoms
         self.max_atoms = max_atoms
         self.remove_hydrogens = remove_hydrogens
         self.remove_stereo = remove_stereo
         self.remove_charges = remove_charges
+        self.use_generic_linking = use_generic_linking
         self.fragments: List[str] = []  # Store as SMILES for memory efficiency
         self._fragment_mols: Optional[List[Chem.Mol]] = None  # Lazy cache
 
@@ -549,6 +572,7 @@ class FragmentLibrary:
             "remove_hydrogens": self.remove_hydrogens,
             "remove_stereo": self.remove_stereo,
             "remove_charges": self.remove_charges,
+            "use_generic_linking": self.use_generic_linking,
             "fragments": self.fragments,
         }
         with open(path, "wb") as f:
@@ -567,6 +591,7 @@ class FragmentLibrary:
             remove_hydrogens=state.get("remove_hydrogens", True),
             remove_stereo=state.get("remove_stereo", True),
             remove_charges=state.get("remove_charges", True),
+            use_generic_linking=state.get("use_generic_linking", False),
         )
         library.fragments = state["fragments"]
         return library
@@ -585,6 +610,13 @@ class FragmentLibrary:
         Returns:
             Number of new fragments added.
         """
+        if not self.use_generic_linking:
+            logger.info(
+                "expand_with_enumerated_positions skipped: "
+                "use_generic_linking=False (strict BRICS labels only)"
+            )
+            return 0
+
         existing = set(self.fragments)
         new_fragments = []
 
@@ -655,12 +687,17 @@ class FragmentLibrary:
             return strip_dummy_atoms(fragments[0])
 
         # Sequentially combine fragments using fast manual approach
+        allow_wildcard = self.use_generic_linking
         result = fragments[0]
         for i in range(1, len(fragments)):
-            combined = fast_combine_two_fragments(result, fragments[i])
+            combined = fast_combine_two_fragments(
+                result, fragments[i], allow_wildcard=allow_wildcard,
+            )
             if combined is None:
                 # Try combining in different order as fallback
-                combined = fast_combine_two_fragments(fragments[i], result)
+                combined = fast_combine_two_fragments(
+                    fragments[i], result, allow_wildcard=allow_wildcard,
+                )
             if combined is None:
                 return None
             result = combined

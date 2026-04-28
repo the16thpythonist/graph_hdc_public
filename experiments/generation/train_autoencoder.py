@@ -20,8 +20,11 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -78,26 +81,40 @@ HDC_DEVICE: str = "cpu"
 
 # :param LATENT_DIM:
 #     Bottleneck / latent space dimension.
-LATENT_DIM: int = 256
+LATENT_DIM: int = 128
 
-# :param ENCODER_HIDDEN_DIMS:
-#     Hidden layer sizes for the encoder network.
-ENCODER_HIDDEN_DIMS: List[int] = [3000, 2000, 1000, 500]
+# :param TRUNK_DIM:
+#     Width of the constant-width residual trunk in encoder and decoder.
+#     Both stems do all their nonlinear mixing at this width; the only
+#     dimensionality changes happen in the small stem/head linear layers.
+#     Recommended: TRUNK_DIM >= data_dim so the input stem isn't lossy.
+TRUNK_DIM: int = 1024
 
-# :param DECODER_HIDDEN_DIMS:
-#     Hidden layer sizes for the decoder network.
-#     None means use reversed ENCODER_HIDDEN_DIMS.
-DECODER_HIDDEN_DIMS: Optional[List[int]] = None
+# :param N_ENCODER_BLOCKS:
+#     Number of SwiGLU residual blocks in the encoder trunk.
+N_ENCODER_BLOCKS: int = 8
 
-# :param RESBLOCK_DEPTH:
-#     Number of SwiGLU residual blocks per projection layer in the
-#     encoder and decoder networks.
-RESBLOCK_DEPTH: int = 2
+# :param N_DECODER_BLOCKS:
+#     Number of SwiGLU residual blocks in the decoder trunk.
+N_DECODER_BLOCKS: int = 8
+
+# :param FFN_MULT:
+#     Internal width multiplier for the SwiGLU residual blocks (canonical
+#     LLaMA/PaLM uses 8/3 ≈ 2.67). Larger values give the gated product
+#     more expressive room at the cost of more parameters per block.
+FFN_MULT: float = 8 / 3
+
+# :param DROPOUT:
+#     Dropout rate applied to each SwiGLU residual block's output (after
+#     ``W_out``, before the skip-add). Because ``W_out`` is zero-init the
+#     dropped tensor is zero at start of training, so dropout's effect
+#     ramps in monotonically as the block "wakes up". 0.0 disables it.
+DROPOUT: float = 0.025
 
 # :param TRAINING_TARGET:
 #     Which HDC components to reconstruct. Options: "both" (edge + graph),
 #     "edge" (edge terms only), "graph" (graph terms only).
-TRAINING_TARGET: str = "edge"
+TRAINING_TARGET: str = "both"
 
 # :param VARIATIONAL:
 #     Whether to use a variational autoencoder (VAE) with reparameterization
@@ -129,6 +146,14 @@ KL_WEIGHT: float = 1e-3
 #     Number of epochs to linearly ramp beta from 0 to KL_WEIGHT (VAE only).
 KL_WARMUP_EPOCHS: int = 20
 
+# :param FREE_BITS:
+#     Per-dimension KL floor in nats (VAE only). When > 0, each latent dim's
+#     batch-averaged KL is clamped at this value before being summed into the
+#     loss — dims whose KL falls below ``FREE_BITS`` contribute a constant
+#     (zero gradient) and stop being pushed toward the prior, which prevents
+#     posterior collapse. Typical values: 0.1–0.5. ``0.0`` disables free bits.
+FREE_BITS: float = 0.0
+
 # :param LOSS_CLAMP:
 #     If set, clamp per-sample reconstruction loss to this maximum before
 #     averaging. Prevents outlier samples from causing gradient explosions.
@@ -148,12 +173,25 @@ EPOCHS: int = 500
 BATCH_SIZE: int = 128
 
 # :param LEARNING_RATE:
-#     Learning rate for AdamW optimizer.
-LEARNING_RATE: float = 1e-4
+#     Peak learning rate for AdamW optimizer (reached at end of warmup,
+#     then cosine-decayed to MIN_LR over the remaining epochs).
+LEARNING_RATE: float = 1e-3
+
+# :param MIN_LR:
+#     Floor learning rate at the end of cosine decay.
+MIN_LR: float = 1e-7
 
 # :param WEIGHT_DECAY:
 #     Weight decay for AdamW.
 WEIGHT_DECAY: float = 1e-5
+
+# :param ADAM_EPS:
+#     Epsilon for AdamW numerical stability. Larger values (1e-6 instead of
+#     the PyTorch default 1e-8) cap the maximum effective per-parameter
+#     update at ~lr/eps, which guards against post-warmup blow-ups where
+#     AdamW's small `v` second-moment makes a single high-curvature batch
+#     produce a gigantic step. BERT/T5 use 1e-6.
+ADAM_EPS: float = 1e-6
 
 # :param WARMUP_EPOCHS:
 #     Number of linear warmup epochs for learning rate.
@@ -165,7 +203,7 @@ GRADIENT_CLIP_VAL: float = 1.0
 
 # :param USE_EMA:
 #     Whether to use Exponential Moving Average of model weights.
-USE_EMA: bool = False
+USE_EMA: bool = True
 
 # :param EMA_DECAY:
 #     EMA decay rate. Only used when USE_EMA is True.
@@ -186,6 +224,23 @@ RECON_EVAL_EVERY_N_EPOCHS: int = 10
 # :param RECON_EVAL_N_SAMPLES:
 #     Number of validation molecules to reconstruct per evaluation.
 RECON_EVAL_N_SAMPLES: int = 50
+
+# :param FINAL_RECON_N_EVAL:
+#     Number of validation molecules used for the high-budget molecular
+#     reconstruction evaluation run once at the end of training.  The
+#     resulting metrics (exact-match count/rate, validity, Tanimoto) are
+#     stored under ``e["results/final_recon_*"]``.
+FINAL_RECON_N_EVAL: int = 250
+
+# :param FINAL_RECON_BEAM_SIZE:
+#     Beam width for the final reconstruction evaluation.  Larger values
+#     recover more graphs but scale decode cost roughly linearly.
+FINAL_RECON_BEAM_SIZE: int = 32
+
+# :param FINAL_RECON_LIMIT:
+#     Population limit for the final reconstruction evaluation's greedy
+#     beam search.
+FINAL_RECON_LIMIT: int = 2048
 
 # :param SCATTER_EVERY_N_EPOCHS:
 #     How often (in epochs) to compute input-vs-output per-dim scatter plot.
@@ -219,6 +274,13 @@ __DEBUG__: bool = True
 #     Testing mode - minimal iterations for validation.
 __TESTING__: bool = False
 
+# :param VERBOSE:
+#     When True, show the Lightning training progress bar and track the
+#     training-metrics figure grid every epoch.  When False, disable the
+#     progress bar and only regenerate the figure grid every 5 epochs —
+#     useful for non-interactive runs (e.g. SLURM on a remote node).
+VERBOSE: bool = True
+
 
 # =============================================================================
 # HELPERS
@@ -239,6 +301,20 @@ def _extract_vector_from_data(d, training_target: str = "both") -> torch.Tensor:
     if training_target == "graph":
         return graph.float().as_subclass(torch.Tensor)
     return torch.cat([node, graph]).float().as_subclass(torch.Tensor)
+
+
+def _encoder_config_hash_from_ckpt(encoder_path: str) -> str:
+    """Compute a short deterministic hash from an encoder checkpoint's config.
+
+    Loads only the ``config`` dict from the checkpoint (same structure
+    that ``HyperNet.save()`` writes) and hashes its JSON representation.
+    Returns a 16-char hex string that changes whenever the encoder
+    architecture or seed changes, but is independent of the file path.
+    """
+    state = torch.load(encoder_path, map_location="cpu", weights_only=False)
+    config = state["config"]
+    raw = json.dumps(config, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 # =============================================================================
@@ -269,6 +345,7 @@ class AutoencoderTrackingCallback(pl.Callback):
         scatter_every_n_epochs: int = 5,
         smoothing_window: int = 5,
         hv_dim: Optional[int] = None,
+        plot_every_n_epochs: int = 1,
     ):
         super().__init__()
         self.experiment = experiment
@@ -277,6 +354,7 @@ class AutoencoderTrackingCallback(pl.Callback):
         self.scatter_every_n_epochs = scatter_every_n_epochs
         self.smoothing_window = smoothing_window
         self.hv_dim = hv_dim
+        self.plot_every_n_epochs = plot_every_n_epochs
 
         # Per-epoch histories
         self.epochs: list[int] = []
@@ -542,13 +620,14 @@ class AutoencoderTrackingCallback(pl.Callback):
         # Update-to-weight ratio: aggregate epoch stats
         self._aggregate_update_to_weight_ratios()
 
-        # Generate plot
-        try:
-            fig = self._create_metrics_plot(epoch)
-            self.experiment.track("ae_training_metrics", fig)
-            plt.close(fig)
-        except Exception as ex:
-            self.experiment.log(f"Warning: Failed to create metrics plot: {ex}")
+        # Generate plot (respect plot_every_n_epochs cadence)
+        if epoch % self.plot_every_n_epochs == 0:
+            try:
+                fig = self._create_metrics_plot(epoch)
+                self.experiment.track("ae_training_metrics", fig)
+                plt.close(fig)
+            except Exception as ex:
+                self.experiment.log(f"Warning: Failed to create metrics plot: {ex}")
 
     @torch.no_grad()
     def _compute_scatter(self, model: HDCAutoencoder):
@@ -1084,6 +1163,190 @@ class AutoencoderTrackingCallback(pl.Callback):
 
 
 # =============================================================================
+# RECONSTRUCTION EVALUATION HELPER
+# =============================================================================
+
+
+@torch.no_grad()
+def _evaluate_reconstruction(
+    model: HDCAutoencoder,
+    hypernet: HyperNet,
+    eval_data: list,
+    *,
+    hv_dim: int,
+    training_target: str,
+    dataset: str,
+    beam_size: int,
+    limit: int,
+    top_k: int = 1,
+) -> dict:
+    """Run AE reconstruction + HyperNet decode over a list of encoded Data objects.
+
+    Drives both the per-epoch ``ReconstructionEvalCallback`` and the
+    final high-budget evaluation in ``experiment()``.  Returns aggregate
+    metrics and per-sample pairs (for plotting); the caller is responsible
+    for ``track()`` / ``e[]`` side effects.
+
+    Parameters
+    ----------
+    model
+        Pre-fit autoencoder in eval mode.
+    hypernet
+        HyperNet used for edge/graph unbinding and greedy decoding.
+    eval_data
+        List of PyG ``Data`` objects carrying ``node_terms`` (edge_terms
+        slot), ``graph_terms``, ``x``, ``edge_index``, and ``smiles``.
+    hv_dim
+        Hypervector dimensionality used to split ``[edge | graph]``
+        reconstructions when ``training_target == "both"``.
+    beam_size, limit, top_k
+        Passed through to ``FallbackDecoderSettings`` — the knobs that
+        let callers pay more per-sample for a higher-fidelity final eval.
+    """
+    import time
+
+    from graph_hdc.hypernet.configs import FallbackDecoderSettings
+    from graph_hdc.utils.chem import reconstruct_for_eval
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, DataStructs
+
+    t0 = time.time()
+    device = next(model.parameters()).device
+    original_smiles = [d.smiles for d in eval_data]
+
+    vectors = torch.stack([
+        _extract_vector_from_data(d, training_target) for d in eval_data
+    ]).to(device)
+
+    reconstructed = model.reconstruct(vectors)
+
+    per_sample_cos = F.cosine_similarity(reconstructed, vectors, dim=-1)
+    hdc_mse = F.mse_loss(reconstructed, vectors).item()
+    hdc_cos_sim = per_sample_cos.mean().item()
+
+    reconstructed = reconstructed.cpu()
+    decode_device = hypernet.nodes_codebook.device
+    vsa_cls = hypernet.vsa.tensor_class
+
+    decoder_settings = FallbackDecoderSettings(
+        beam_size=beam_size,
+        limit=limit,
+        top_k=top_k,
+    )
+
+    n_valid = 0
+    n_exact = 0
+    tanimoto_sims: list[float] = []
+    mol_pairs: list[tuple] = []
+
+    for i in range(len(eval_data)):
+        d = eval_data[i]
+        if training_target == "edge":
+            edge_term = reconstructed[i].to(decode_device).as_subclass(vsa_cls)
+            graph_term = d.graph_terms.view(-1).to(decode_device).as_subclass(vsa_cls)
+        elif training_target == "graph":
+            edge_term = d.node_terms.view(-1).to(decode_device).as_subclass(vsa_cls)
+            graph_term = reconstructed[i].to(decode_device).as_subclass(vsa_cls)
+        else:
+            edge_term = (
+                reconstructed[i, :hv_dim]
+                .to(decode_device)
+                .as_subclass(vsa_cls)
+            )
+            graph_term = (
+                reconstructed[i, hv_dim:]
+                .to(decode_device)
+                .as_subclass(vsa_cls)
+            )
+
+        orig_edge_set: set[tuple[tuple, tuple]] = set()
+        if hasattr(d, "x") and hasattr(d, "edge_index") and d.edge_index.numel() > 0:
+            node_feats = d.x.int()
+            for u, v in d.edge_index.t().tolist():
+                pair = tuple(sorted((
+                    tuple(node_feats[u].tolist()),
+                    tuple(node_feats[v].tolist()),
+                )))
+                orig_edge_set.add(pair)
+
+        decoded_edge_set: set[tuple[tuple, tuple]] = set()
+        try:
+            raw_decoded = hypernet.decode_order_one_no_node_terms(edge_term.clone())
+            for a, b in raw_decoded:
+                decoded_edge_set.add(tuple(sorted((a, b))))
+        except Exception:
+            pass
+
+        edge_match = orig_edge_set == decoded_edge_set
+        edge_delta = len(orig_edge_set.symmetric_difference(decoded_edge_set))
+
+        orig_mol = Chem.MolFromSmiles(original_smiles[i])
+        recon_mol = None
+        is_exact = False
+        cs = per_sample_cos[i].item()
+
+        try:
+            result = hypernet.decode_graph_greedy(
+                edge_term=edge_term,
+                graph_term=graph_term,
+                decoder_settings=decoder_settings,
+            )
+            if result.nx_graphs:
+                g = result.nx_graphs[0]
+                recon_mol = reconstruct_for_eval(g, dataset=dataset)
+
+                if recon_mol is not None and orig_mol is not None:
+                    n_valid += 1
+
+                    # Compare without stereochemistry — HDC encoding
+                    # does not preserve E/Z or chirality information.
+                    orig_nosmi = Chem.RWMol(orig_mol)
+                    Chem.RemoveStereochemistry(orig_nosmi)
+                    recon_nosmi = Chem.RWMol(recon_mol)
+                    Chem.RemoveStereochemistry(recon_nosmi)
+                    orig_smi = Chem.MolToSmiles(orig_nosmi, canonical=True)
+                    recon_smi = Chem.MolToSmiles(recon_nosmi, canonical=True)
+
+                    if recon_smi == orig_smi:
+                        n_exact += 1
+                        is_exact = True
+
+                    fp_orig = AllChem.GetMorganFingerprintAsBitVect(
+                        orig_mol, 2, nBits=2048,
+                    )
+                    fp_recon = AllChem.GetMorganFingerprintAsBitVect(
+                        recon_mol, 2, nBits=2048,
+                    )
+                    tanimoto_sims.append(
+                        DataStructs.TanimotoSimilarity(fp_orig, fp_recon)
+                    )
+        except Exception:
+            pass
+
+        mol_pairs.append((orig_mol, recon_mol, cs, is_exact, edge_match, edge_delta))
+
+    n_total = len(eval_data)
+    validity = 100.0 * n_valid / max(1, n_total)
+    exact_match = 100.0 * n_exact / max(1, n_total)
+    mean_tanimoto = (
+        sum(tanimoto_sims) / len(tanimoto_sims) if tanimoto_sims else 0.0
+    )
+
+    return {
+        "n_total": n_total,
+        "n_valid": n_valid,
+        "n_exact": n_exact,
+        "validity": validity,
+        "exact_match": exact_match,
+        "tanimoto": mean_tanimoto,
+        "hdc_cos_sim": hdc_cos_sim,
+        "hdc_mse": hdc_mse,
+        "decode_time_s": time.time() - t0,
+        "mol_pairs": mol_pairs,
+    }
+
+
+# =============================================================================
 # RECONSTRUCTION EVALUATION CALLBACK
 # =============================================================================
 
@@ -1128,6 +1391,10 @@ class ReconstructionEvalCallback(pl.Callback):
         self.training_target = training_target
         self.every_n_epochs = every_n_epochs
         self.n_eval = n_eval
+        # Best-checkpoint tracking (graph exact-match accuracy, higher = better)
+        self.best_exact_match: float = -float("inf")
+        self.best_epoch: int = -1
+        self.best_ckpt_path: Path = Path(experiment.path) / "best.ckpt"
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -1139,127 +1406,34 @@ class ReconstructionEvalCallback(pl.Callback):
 
     @torch.no_grad()
     def _evaluate(self, model: HDCAutoencoder, epoch: int):
-        import time
-
-        from graph_hdc.hypernet.configs import FallbackDecoderSettings
-        from graph_hdc.utils.chem import reconstruct_for_eval
         from rdkit import Chem
-        from rdkit.Chem import AllChem, DataStructs, Draw
+        from rdkit.Chem import AllChem, Draw
 
         self.experiment.log(
             f"[ReconEval] Epoch {epoch}: evaluating {self.n_eval} molecules..."
         )
-        t0 = time.time()
 
-        device = next(model.parameters()).device
         model.eval()
-
         subset = self.eval_data[: self.n_eval]
-        original_smiles = [d.smiles for d in subset]
 
-        # Build input tensor
-        vectors = torch.stack([
-            _extract_vector_from_data(d, self.training_target) for d in subset
-        ])
-        vectors = vectors.to(device)
-
-        # Deterministic reconstruction
-        reconstructed = model.reconstruct(vectors)
-
-        # HDC-space metrics
-        per_sample_cos = F.cosine_similarity(reconstructed, vectors, dim=-1)
-        hdc_mse = F.mse_loss(reconstructed, vectors).item()
-        hdc_cos_sim = per_sample_cos.mean().item()
-
-        # Decode to molecules
-        reconstructed = reconstructed.cpu()
-        decode_device = self.hypernet.nodes_codebook.device
-        vsa_cls = self.hypernet.vsa.tensor_class
-
-        decoder_settings = FallbackDecoderSettings(
+        metrics = _evaluate_reconstruction(
+            model,
+            self.hypernet,
+            subset,
+            hv_dim=self.hv_dim,
+            training_target=self.training_target,
+            dataset=self.dataset,
             beam_size=8,
             limit=1024,
             top_k=1,
         )
 
-        n_valid = 0
-        n_exact = 0
-        tanimoto_sims: list[float] = []
-
-        # Collect pairs for the molecule grid: (orig_mol, recon_mol, cos_sim, is_exact)
-        mol_pairs: list[tuple] = []
-
-        for i in range(len(subset)):
-            d = subset[i]
-            if self.training_target == "edge":
-                edge_term = reconstructed[i].to(decode_device).as_subclass(vsa_cls)
-                graph_term = d.graph_terms.view(-1).to(decode_device).as_subclass(vsa_cls)
-            elif self.training_target == "graph":
-                edge_term = d.node_terms.view(-1).to(decode_device).as_subclass(vsa_cls)
-                graph_term = reconstructed[i].to(decode_device).as_subclass(vsa_cls)
-            else:
-                edge_term = (
-                    reconstructed[i, : self.hv_dim]
-                    .to(decode_device)
-                    .as_subclass(vsa_cls)
-                )
-                graph_term = (
-                    reconstructed[i, self.hv_dim :]
-                    .to(decode_device)
-                    .as_subclass(vsa_cls)
-                )
-
-            orig_mol = Chem.MolFromSmiles(original_smiles[i])
-            recon_mol = None
-            is_exact = False
-            cs = per_sample_cos[i].item()
-
-            try:
-                result = self.hypernet.decode_graph_greedy(
-                    edge_term=edge_term,
-                    graph_term=graph_term,
-                    decoder_settings=decoder_settings,
-                )
-                if result.nx_graphs:
-                    g = result.nx_graphs[0]
-                    recon_mol = reconstruct_for_eval(g, dataset=self.dataset)
-
-                    if recon_mol is not None and orig_mol is not None:
-                        n_valid += 1
-
-                        # Compare without stereochemistry — HDC encoding
-                        # does not preserve E/Z or chirality information.
-                        orig_nosmi = Chem.RWMol(orig_mol)
-                        Chem.RemoveStereochemistry(orig_nosmi)
-                        recon_nosmi = Chem.RWMol(recon_mol)
-                        Chem.RemoveStereochemistry(recon_nosmi)
-                        orig_smi = Chem.MolToSmiles(orig_nosmi, canonical=True)
-                        recon_smi = Chem.MolToSmiles(recon_nosmi, canonical=True)
-
-                        if recon_smi == orig_smi:
-                            n_exact += 1
-                            is_exact = True
-
-                        fp_orig = AllChem.GetMorganFingerprintAsBitVect(
-                            orig_mol, 2, nBits=2048,
-                        )
-                        fp_recon = AllChem.GetMorganFingerprintAsBitVect(
-                            recon_mol, 2, nBits=2048,
-                        )
-                        tanimoto_sims.append(
-                            DataStructs.TanimotoSimilarity(fp_orig, fp_recon)
-                        )
-            except Exception:
-                pass
-
-            mol_pairs.append((orig_mol, recon_mol, cs, is_exact))
-
-        n_total = len(subset)
-        validity = 100.0 * n_valid / max(1, n_total)
-        exact_match = 100.0 * n_exact / max(1, n_total)
-        mean_tanimoto = (
-            sum(tanimoto_sims) / len(tanimoto_sims) if tanimoto_sims else 0.0
-        )
+        validity = metrics["validity"]
+        exact_match = metrics["exact_match"]
+        mean_tanimoto = metrics["tanimoto"]
+        hdc_cos_sim = metrics["hdc_cos_sim"]
+        hdc_mse = metrics["hdc_mse"]
+        mol_pairs = metrics["mol_pairs"]
 
         self.experiment.track("recon_validity", validity)
         self.experiment.track("recon_exact_match", exact_match)
@@ -1276,6 +1450,20 @@ class ReconstructionEvalCallback(pl.Callback):
             hdc_cos_sim=hdc_cos_sim,
         )
 
+        # Track best checkpoint by graph exact-match accuracy.
+        # Ties go to the later epoch (>=).
+        if exact_match >= self.best_exact_match:
+            self.best_exact_match = exact_match
+            self.best_epoch = epoch
+            model.save(self.best_ckpt_path)
+            self.experiment["results/best_recon_exact_match"] = exact_match
+            self.experiment["results/best_recon_epoch"] = epoch
+            self.experiment["results/best_ckpt_path"] = str(self.best_ckpt_path)
+            self.experiment.log(
+                f"[ReconEval] New best at epoch {epoch}: "
+                f"exact_match={exact_match:.2f}% — saved {self.best_ckpt_path.name}"
+            )
+
         # ── Molecule comparison grid (original vs reconstructed) ──
         # Show up to 10 pairs as 2 columns (original | reconstructed)
         n_grid = min(10, len(mol_pairs))
@@ -1291,7 +1479,7 @@ class ReconstructionEvalCallback(pl.Callback):
             )
 
             for idx in range(n_grid):
-                orig_mol, recon_mol, cs, is_exact = mol_pairs[idx]
+                orig_mol, recon_mol, cs, is_exact, edge_match, edge_delta = mol_pairs[idx]
                 ax_orig = axes[idx, 0]
                 ax_recon = axes[idx, 1]
 
@@ -1321,6 +1509,7 @@ class ReconstructionEvalCallback(pl.Callback):
                 # Reconstructed molecule
                 ax_recon.set_xticks([])
                 ax_recon.set_yticks([])
+                edge_info = "edges=\u2713" if edge_match else f"edges \u0394={edge_delta}"
                 if recon_mol is not None:
                     try:
                         AllChem.Compute2DCoords(recon_mol)
@@ -1330,7 +1519,7 @@ class ReconstructionEvalCallback(pl.Callback):
                         color = "green" if is_exact else "blue"
                         label = "EXACT" if is_exact else f"cos={cs:.3f}"
                         ax_recon.set_title(
-                            f"Recon ({label}): {smi[:35]}",
+                            f"Recon ({label}): {smi[:35]}\n{edge_info}",
                             fontsize=7, color=color,
                         )
                     except Exception:
@@ -1347,7 +1536,7 @@ class ReconstructionEvalCallback(pl.Callback):
                         [0, 1], [1, 0], "r-", lw=3, transform=ax_recon.transAxes,
                     )
                     ax_recon.set_title(
-                        f"Failed (cos={cs:.3f})", fontsize=7, color="red",
+                        f"Failed (cos={cs:.3f})\n{edge_info}", fontsize=7, color="red",
                     )
                     ax_recon.set_facecolor("#ffebee")
 
@@ -1359,11 +1548,11 @@ class ReconstructionEvalCallback(pl.Callback):
             self.experiment.track("recon_molecule_grid", fig)
             plt.close(fig)
 
-        elapsed = time.time() - t0
         self.experiment.log(
             f"[ReconEval] Epoch {epoch}: validity={validity:.1f}%, "
             f"exact_match={exact_match:.1f}%, tanimoto={mean_tanimoto:.3f}, "
-            f"cos_sim={hdc_cos_sim:.4f}, mse={hdc_mse:.6f} ({elapsed:.1f}s)"
+            f"cos_sim={hdc_cos_sim:.4f}, mse={hdc_mse:.6f} "
+            f"({metrics['decode_time_s']:.1f}s)"
         )
 
 
@@ -1393,10 +1582,15 @@ def experiment(e: Experiment) -> None:
     e.log("=" * 60)
     e.log(f"Dataset: {e.DATASET}")
     e.log(f"Encoder: {e.ENCODER_PATH or '(auto-created for testing)'}")
-    e.log(f"Architecture: encoder={e.ENCODER_HIDDEN_DIMS}, latent={e.LATENT_DIM}")
+    e.log(
+        f"Architecture: trunk_dim={e.TRUNK_DIM}, "
+        f"n_encoder_blocks={e.N_ENCODER_BLOCKS}, "
+        f"n_decoder_blocks={e.N_DECODER_BLOCKS}, "
+        f"latent={e.LATENT_DIM}"
+    )
     e.log(f"Variational: {e.VARIATIONAL}")
     if e.VARIATIONAL:
-        e.log(f"  KL weight: {e.KL_WEIGHT}, warmup: {e.KL_WARMUP_EPOCHS} epochs")
+        e.log(f"  KL weight: {e.KL_WEIGHT}, warmup: {e.KL_WARMUP_EPOCHS} epochs, free_bits: {e.FREE_BITS}")
     e.log(f"Loss weights: mse={e.MSE_WEIGHT}, cosine={e.COSINE_WEIGHT}")
     # In testing mode, reduce epochs and eval frequency for speed
     epochs = e.EPOCHS
@@ -1460,9 +1654,11 @@ def experiment(e: Experiment) -> None:
     model = HDCAutoencoder(
         data_dim=data_dim,
         latent_dim=e.LATENT_DIM,
-        encoder_hidden_dims=e.ENCODER_HIDDEN_DIMS,
-        decoder_hidden_dims=e.DECODER_HIDDEN_DIMS,
-        resblock_depth=e.RESBLOCK_DEPTH,
+        trunk_dim=e.TRUNK_DIM,
+        n_encoder_blocks=e.N_ENCODER_BLOCKS,
+        n_decoder_blocks=e.N_DECODER_BLOCKS,
+        ffn_mult=e.FFN_MULT,
+        dropout=e.DROPOUT,
         training_target=e.TRAINING_TARGET,
         recon_loss_type=e.RECON_LOSS_TYPE,
         variational=e.VARIATIONAL,
@@ -1470,10 +1666,14 @@ def experiment(e: Experiment) -> None:
         cosine_weight=e.COSINE_WEIGHT,
         kl_weight=e.KL_WEIGHT,
         kl_warmup_epochs=e.KL_WARMUP_EPOCHS,
+        free_bits=e.FREE_BITS,
         loss_clamp=e.LOSS_CLAMP,
         lr=e.LEARNING_RATE,
         weight_decay=e.WEIGHT_DECAY,
+        adam_eps=e.ADAM_EPS,
         warmup_epochs=e.WARMUP_EPOCHS,
+        max_epochs=e.EPOCHS,
+        min_lr=e.MIN_LR,
     )
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -1498,6 +1698,7 @@ def experiment(e: Experiment) -> None:
         val_vectors=val_vectors,
         scatter_every_n_epochs=e.SCATTER_EVERY_N_EPOCHS,
         hv_dim=hv_dim if e.TRAINING_TARGET == "both" else None,
+        plot_every_n_epochs=1 if e.VERBOSE else 5,
     )
 
     recon_callback = ReconstructionEvalCallback(
@@ -1517,10 +1718,7 @@ def experiment(e: Experiment) -> None:
         recon_callback,
         ModelCheckpoint(
             dirpath=e.path,
-            filename="best-{epoch:03d}-{val/loss:.6f}",
-            monitor="val/loss",
-            mode="min",
-            save_top_k=1,
+            save_top_k=0,
             save_last=True,
         ),
         LearningRateMonitor(logging_interval="epoch"),
@@ -1551,7 +1749,7 @@ def experiment(e: Experiment) -> None:
         default_root_dir=e.path,
         log_every_n_steps=10,
         gradient_clip_val=e.GRADIENT_CLIP_VAL,
-        enable_progress_bar=True,
+        enable_progress_bar=e.VERBOSE,
     )
 
     e.log("\nStarting training...")
@@ -1573,9 +1771,43 @@ def experiment(e: Experiment) -> None:
     # Final evaluation
     # =========================================================================
 
+    # If EMA is on, make sure the *averaged* weights are in `model` for final
+    # eval and save. Lightning's EMAWeightAveraging.on_train_end already does
+    # this on graceful completion — but if training was force-quit (raw
+    # KeyboardInterrupt) on_train_end never runs, so we do it explicitly. Safe
+    # to call twice.
+    if e.USE_EMA:
+        for cb in trainer.callbacks:
+            if isinstance(cb, EMAWeightAveraging) and cb._average_model is not None:
+                cb._copy_average_to_current(model)
+                e.log("Copied EMA weights into model for final eval/save.")
+                break
+
     e.log("\nFinal reconstruction evaluation...")
     model.eval()
     model.to(device)
+
+    # Save the *final* (last) weights regardless of best tracking.
+    final_path = Path(e.path) / "final.ckpt"
+    model.save(final_path)
+    e.log(f"Saved final (last-epoch) weights to: {final_path}")
+    e["results/final_ckpt_path"] = str(final_path)
+
+    # If a best checkpoint exists (recorded by ReconstructionEvalCallback),
+    # load it back into `model` so all subsequent evaluations use the
+    # best-graph-accuracy weights rather than the last-epoch weights.
+    best_path = Path(e.path) / "best.ckpt"
+    if best_path.is_file():
+        e.log(
+            f"Loading best checkpoint for final eval: {best_path.name} "
+            f"(epoch {recon_callback.best_epoch}, "
+            f"exact_match={recon_callback.best_exact_match:.2f}%)"
+        )
+        model = HDCAutoencoder.load(best_path, map_location=device)
+        model.to(device)
+        model.eval()
+    else:
+        e.log("No best checkpoint found — final eval will use last-epoch weights.")
 
     # HDC-space reconstruction on full validation set
     all_vectors = torch.stack([
@@ -1593,7 +1825,55 @@ def experiment(e: Experiment) -> None:
     e["results/final_val_mse"] = final_mse
     e["results/final_val_cos_sim"] = final_cos_sim
 
-    # Save final model
+    # -------------------------------------------------------------------------
+    # High-budget molecular reconstruction evaluation
+    # -------------------------------------------------------------------------
+    # Runs the full AE → HyperNet decode pipeline on a validation subset
+    # with a larger beam / population than the per-epoch callback, so the
+    # exact-match count we save is the "best achievable" reconstruction
+    # quality at this checkpoint rather than the mid-training proxy.
+    n_final = min(e.FINAL_RECON_N_EVAL, len(valid_encoded))
+    e.log(
+        f"\nHigh-budget molecular reconstruction eval: "
+        f"n={n_final}, beam_size={e.FINAL_RECON_BEAM_SIZE}, "
+        f"limit={e.FINAL_RECON_LIMIT}"
+    )
+
+    final_recon = _evaluate_reconstruction(
+        model,
+        hypernet,
+        valid_encoded[:n_final],
+        hv_dim=hv_dim,
+        training_target=e.TRAINING_TARGET,
+        dataset=e.DATASET.lower(),
+        beam_size=e.FINAL_RECON_BEAM_SIZE,
+        limit=e.FINAL_RECON_LIMIT,
+        top_k=1,
+    )
+
+    e.log(
+        f"Final recon: exact={final_recon['n_exact']}/{final_recon['n_total']} "
+        f"({final_recon['exact_match']:.1f}%), "
+        f"validity={final_recon['validity']:.1f}%, "
+        f"tanimoto={final_recon['tanimoto']:.3f} "
+        f"({final_recon['decode_time_s']:.1f}s)"
+    )
+
+    e["results/final_recon_n_eval"] = final_recon["n_total"]
+    e["results/final_recon_n_exact"] = final_recon["n_exact"]
+    e["results/final_recon_exact_match"] = final_recon["exact_match"]
+    e["results/final_recon_validity"] = final_recon["validity"]
+    e["results/final_recon_tanimoto"] = final_recon["tanimoto"]
+    e["results/final_recon_hdc_cos_sim"] = final_recon["hdc_cos_sim"]
+    e["results/final_recon_hdc_mse"] = final_recon["hdc_mse"]
+    e["results/final_recon_decode_time_s"] = final_recon["decode_time_s"]
+    e["results/final_recon_beam_size"] = e.FINAL_RECON_BEAM_SIZE
+    e["results/final_recon_limit"] = e.FINAL_RECON_LIMIT
+
+    # Save the model that downstream consumers should use by default. This
+    # is the *best* checkpoint (loaded above) if one exists, otherwise the
+    # final-epoch weights. ``final.ckpt`` and ``best.ckpt`` are also kept
+    # alongside it for explicit access.
     model_path = Path(e.path) / "autoencoder.ckpt"
     model.save(model_path)
     e.log(f"Saved autoencoder to: {model_path}")
@@ -1628,32 +1908,79 @@ def load_encoder(e: Experiment, device: torch.device):
             "Use --__TESTING__ True for quick tests without an encoder."
         )
 
-    # Prune edges codebook to observed edge pairs only
-    needs_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
-    if needs_rw:
-        from graph_hdc.datasets.utils import scan_features_with_rw
+    # Prune edges codebook to observed edge pairs only (cached)
+    enc_hash = e.apply_hook("encoder_config_hash")
+    e.log(f"Encoder config hash: {enc_hash}")
 
-        e.log("Scanning dataset for observed edge pairs (with RW augmentation)...")
-        _, observed_edges = scan_features_with_rw(e.DATASET.lower(), hypernet.rw_config)
-    else:
-        from graph_hdc.datasets.utils import get_dataset_info
-
-        e.log("Loading observed edge pairs from dataset info...")
-        observed_edges = get_dataset_info(e.DATASET.lower()).edge_features
+    t0 = time.time()
+    observed_edges = e.apply_hook(
+        "scan_observed_edges", hypernet=hypernet,
+    )
     hypernet.limit_edges_codebook(observed_edges)
-    e.log(f"Pruned edges codebook: {hypernet.edges_codebook.shape[0]} entries")
+    e.log(
+        f"Pruned edges codebook: {hypernet.edges_codebook.shape[0]} entries "
+        f"({time.time() - t0:.1f}s)"
+    )
 
     hypernet.eval()
     return hypernet
 
 
+@experiment.hook("encoder_config_hash", default=True)
+def encoder_config_hash(e: Experiment):
+    """Return a short hash of the encoder config for cache scoping."""
+    if e.ENCODER_PATH and Path(e.ENCODER_PATH).exists():
+        return _encoder_config_hash_from_ckpt(e.ENCODER_PATH)
+    return "testing"
+
+
+@experiment.hook("scan_observed_edges", default=True)
+@experiment.cache.cached(
+    name="observed_edges",
+    scope=lambda _e: (
+        "observed_edges",
+        _e.DATASET.lower(),
+        _e.apply_hook("encoder_config_hash"),
+    ),
+)
+def scan_observed_edges(e: Experiment, hypernet: HyperNet):
+    """Scan dataset for observed edge pairs (cached)."""
+    needs_rw = hasattr(hypernet, "rw_config") and hypernet.rw_config.enabled
+    if needs_rw:
+        from graph_hdc.datasets.utils import scan_features_with_rw
+
+        e.log("Scanning dataset for observed edge pairs (with RW augmentation)...")
+        max_samples = 200 if e.__TESTING__ else None
+        _, edges = scan_features_with_rw(
+            e.DATASET.lower(), hypernet.rw_config, max_samples=max_samples,
+        )
+        return edges
+    else:
+        from graph_hdc.datasets.utils import get_dataset_info
+
+        e.log("Loading observed edge pairs from dataset info...")
+        return get_dataset_info(e.DATASET.lower()).edge_features
+
+
 @experiment.hook("load_and_encode_data", default=True)
+@experiment.cache.cached(
+    name="encoded_data",
+    scope=lambda _e: (
+        "encoded_data",
+        _e.DATASET.lower(),
+        _e.apply_hook("encoder_config_hash"),
+        f"n_{_e.NUM_SUBSAMPLE or 'all'}",
+    ),
+)
 def load_and_encode_data(
     e: Experiment,
     hypernet: HyperNet,
     device: torch.device,
 ):
     """Load dataset, encode, then swap edge_terms into node_terms slot.
+
+    Cached via ``@experiment.cache.cached`` to skip expensive
+    recomputation on subsequent runs with the same encoder and dataset.
 
     After encoding, ``node_terms`` is overwritten with ``edge_terms`` so
     that ``_extract_vectors`` returns ``[edge_terms | graph_terms]``.
