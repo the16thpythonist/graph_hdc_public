@@ -57,7 +57,7 @@ from graph_hdc.utils.chemical_rules import (
 
 # :param ENCODER_PATH:
 #     Path to a saved HyperNet encoder checkpoint (.ckpt). Required.
-ENCODER_PATH: str = "/media/ssd2/Programming/_branch/graph_hdc_public/experiments/encoders/zinc_d1024_depth3_k6_10_14_b8.ckpt"
+ENCODER_PATH: str = "/media/ssd2/Programming/_branch/graph_hdc_public/experiments/encoders/zinc_d1024_depth5_k4_8_12_18_b8.zip"
 
 # -----------------------------------------------------------------------------
 # Streaming Configuration

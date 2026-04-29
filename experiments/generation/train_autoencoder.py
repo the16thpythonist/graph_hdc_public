@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from pycomex.functional.experiment import Experiment
 from pycomex.utils import file_namespace, folder_path
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import EMAWeightAveraging, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, EMAWeightAveraging, LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from torch_geometric.loader import DataLoader
 
@@ -65,7 +65,7 @@ DATASET: str = "zinc"
 
 # :param ENCODER_PATH:
 #     Path to a saved HyperNet encoder checkpoint (.ckpt). Required.
-ENCODER_PATH: str = "/media/ssd2/Programming/_branch/graph_hdc_public/experiments/encoders/zinc_d1024_depth3_k6_10_14_b8.ckpt"
+ENCODER_PATH: str = "/media/ssd2/Programming/_branch/graph_hdc_public/experiments/encoders/zinc_d1024_depth5_k4_8_12_18_b8.zip"
 
 # :param DEVICE:
 #     Device for model training. Options: "auto", "cpu", "cuda".
@@ -280,6 +280,29 @@ __TESTING__: bool = False
 #     progress bar and only regenerate the figure grid every 5 epochs —
 #     useful for non-interactive runs (e.g. SLURM on a remote node).
 VERBOSE: bool = True
+
+# -----------------------------------------------------------------------------
+# Early stopping
+# -----------------------------------------------------------------------------
+
+# :param EARLY_STOPPING:
+#     Whether to enable PyTorch Lightning EarlyStopping on ``val/loss``.
+#     Off by default so plain training runs the full ``EPOCHS``.  HPO
+#     trials enable this to skip plateaued configurations.
+EARLY_STOPPING: bool = False
+
+# :param EARLY_STOPPING_PATIENCE:
+#     Number of consecutive validation epochs (= training epochs, since
+#     val runs once per epoch) without improvement on ``val/loss`` before
+#     training is halted.  Conservative because the cosine LR schedule
+#     can still surface late-training gains as the LR decays.
+EARLY_STOPPING_PATIENCE: int = 25
+
+# :param EARLY_STOPPING_MIN_DELTA:
+#     Minimum change in ``val/loss`` to qualify as an improvement.  Set
+#     just above float-noise so a flat-with-jitter plateau actually
+#     triggers the patience counter.
+EARLY_STOPPING_MIN_DELTA: float = 1e-4
 
 
 # =============================================================================
@@ -1726,6 +1749,22 @@ def experiment(e: Experiment) -> None:
 
     if e.USE_EMA:
         callbacks.append(EMAWeightAveraging(decay=e.EMA_DECAY))
+
+    if e.EARLY_STOPPING:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val/loss",
+                mode="min",
+                patience=e.EARLY_STOPPING_PATIENCE,
+                min_delta=e.EARLY_STOPPING_MIN_DELTA,
+                strict=True,
+                verbose=True,
+            )
+        )
+        e.log(
+            f"EarlyStopping enabled: monitor=val/loss, patience="
+            f"{e.EARLY_STOPPING_PATIENCE}, min_delta={e.EARLY_STOPPING_MIN_DELTA}"
+        )
 
     # Allow child experiments to add/modify callbacks
     callbacks = e.apply_hook(

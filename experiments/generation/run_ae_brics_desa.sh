@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=ae_brics
+#SBATCH --job-name=ae_brics_strict
 #SBATCH --nodelist=desa
 #SBATCH --partition=general
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=50G
 #SBATCH --time=72:00:00
-#SBATCH --output=/media/ssd2/Programming/_branch/graph_hdc_public/experiments/generation/results/slurm_ae_brics_%j.out
-#SBATCH --error=/media/ssd2/Programming/_branch/graph_hdc_public/experiments/generation/results/slurm_ae_brics_%j.err
+#SBATCH --output=/media/ssd2/Programming/_branch/graph_hdc_public/experiments/generation/results/slurm_ae_brics_desa_%j.out
+#SBATCH --error=/media/ssd2/Programming/_branch/graph_hdc_public/experiments/generation/results/slurm_ae_brics_desa_%j.err
 
 set -euo pipefail
 
@@ -27,16 +27,25 @@ cd "${PROJECT_DIR}"
 python experiments/generation/train_autoencoder__brics.py \
     --__DEBUG__ False \
     --VERBOSE False \
-    --BATCH_SIZE 256 \
-    --LATENT_DIM 512 \
-    --TRUNK_DIM 1024 \
+    --BATCH_SIZE 64 \
+    --LATENT_DIM 256 \
+    --TRUNK_DIM 512 \
     --N_ENCODER_BLOCKS 8 \
     --N_DECODER_BLOCKS 8 \
     --FFN_MULT "8/3" \
     --TRAINING_TARGET "'both'" \
     --VARIATIONAL True \
-    --KL_WEIGHT 1e-4 \
+    --USE_EMA False \
+    --RECON_LOSS_TYPE "'mae'" \
+    --DROPOUT 0.05 \
+    --LEARNING_RATE 2e-4 \
+    --WARMUP_EPOCHS 5 \
+    --KL_WEIGHT 2e-4 \
     --KL_WARMUP_EPOCHS 50 \
-    --EPOCHS 250
+    --FREE_BITS 0.1 \
+    --WEIGHT_DECAY 5e-4 \
+    --EPOCHS 250 \
+    --USE_GENERIC_LINKING False \
+    --ENUMERATE_ATTACHMENTS False
 
 echo "=== Job completed at $(date) ==="
